@@ -29,6 +29,12 @@ jobs:
       - name: 缓存 Cargo
         uses: Swatinem/rust-cache@v2
 
+      - name: 安装 Linux 系统依赖
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libdbus-1-dev pkg-config
+
       - name: 检查格式
         if: matrix.os == 'ubuntu-latest'
         run: cargo fmt --all -- --check

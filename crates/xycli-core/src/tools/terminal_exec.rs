@@ -108,9 +108,12 @@ async fn resolve_safe_executable(command: &str, workspace: &Path) -> Option<Path
             Err(_) => continue,
         };
         let metadata = match tokio::fs::metadata(&real_candidate).await {
-            Ok(value) if value.is_file() => value,
+            Ok(value) => value,
             _ => continue,
         };
+        if !metadata.is_file() {
+            continue;
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

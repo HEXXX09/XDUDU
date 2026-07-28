@@ -188,8 +188,18 @@ pub async fn resolve_secret(
     if let Ok(value) = env::var(variable) {
         return Ok((SecretString::new(value)?, SecretSource::Environment));
     }
-    if let Some(value) = store.get(provider).await? {
-        return Ok((value, SecretSource::SystemStore));
+    match store.get(provider).await {
+        Ok(Some(value)) => return Ok((value, SecretSource::SystemStore)),
+        Ok(None) => {}
+        Err(error) => {
+            return Err(XduduError::new(
+                ErrorKind::ConfigError,
+                format!(
+                    "{variable} 未设置，且系统凭据存储不可用：{}。请设置环境变量或运行：xdudu auth login {provider}",
+                    error.message
+                ),
+            ));
+        }
     }
     Err(XduduError::new(
         ErrorKind::ConfigError,
@@ -207,6 +217,8 @@ mod tests {
 
     #[derive(Default)]
     struct MemoryStore(Mutex<HashMap<String, String>>);
+
+    struct FailingStore;
 
     #[async_trait]
     impl SecretStore for MemoryStore {
@@ -233,6 +245,24 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl SecretStore for FailingStore {
+        async fn get(&self, _provider: &str) -> XduduResult<Option<SecretString>> {
+            Err(XduduError::new(
+                ErrorKind::ConfigError,
+                "测试凭据后端不可用",
+            ))
+        }
+
+        async fn set(&self, _provider: &str, _value: SecretString) -> XduduResult<()> {
+            unreachable!()
+        }
+
+        async fn delete(&self, _provider: &str) -> XduduResult<bool> {
+            unreachable!()
+        }
+    }
+
     #[tokio::test]
     async fn 密钥显示始终脱敏且存储可读写删除() {
         let store = MemoryStore::default();
@@ -247,5 +277,13 @@ mod tests {
         );
         assert!(store.delete("deepseek").await.unwrap());
         assert!(store.get("deepseek").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn 凭据后端不可用时仍提供环境变量和登录指引() {
+        let error = resolve_secret("deepseek", &FailingStore).await.unwrap_err();
+        assert!(error.message.contains("DEEPSEEK_API_KEY"));
+        assert!(error.message.contains("xdudu auth login deepseek"));
+        assert!(error.message.contains("系统凭据存储不可用"));
     }
 }

@@ -234,11 +234,14 @@ async fn auto_safe_允许_pwd_并拒绝任意命令() {
     )
     .await;
     assert!(pwd.success);
-    assert!(
-        pwd.output.unwrap()["stdout"]
-            .as_str()
-            .unwrap()
-            .contains(dir.path().to_str().unwrap())
+    let stdout = pwd.output.unwrap()["stdout"]
+        .as_str()
+        .unwrap()
+        .trim()
+        .to_owned();
+    assert_eq!(
+        fs::canonicalize(stdout).unwrap(),
+        fs::canonicalize(dir.path()).unwrap()
     );
 
     let node = execute(

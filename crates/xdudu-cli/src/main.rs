@@ -19,10 +19,10 @@ use uuid::Uuid;
 use xdudu_core::{
     AgentRunConfig, AgentRunResult, AllowAllApprovalGate, ApprovalDecision, ApprovalGate,
     ApprovalMode, ApprovalRequest, ConfigOverrides, DefaultProviderFactory, DenyAllApprovalGate,
-    JsonChangeLedger, JsonSessionStore, KeyringSecretStore, PermissionMode, Provider,
-    ProviderFactory, ResolvedConfig, SecretSource, SecretStore, SecretString, ToolRegistry,
-    XduduError, config_paths, load_config, redact_text, redact_value, register_builtins,
-    resolve_secret, run_agent, write_config_value,
+    JsonChangeLedger, KeyringSecretStore, PermissionMode, Provider, ProviderFactory,
+    ResolvedConfig, SecretSource, SecretStore, SecretString, SessionStore, SqliteSessionStore,
+    ToolRegistry, WorkspaceLock, XduduError, config_paths, load_config, redact_text, redact_value,
+    register_builtins, resolve_secret, run_agent, write_config_value,
 };
 
 use crate::doctor::run_doctor;
@@ -100,6 +100,11 @@ enum Command {
     Doctor,
     /// 安全撤销最近一次或指定的 Agent 文件变更。
     Undo(UndoArgs),
+    /// 查询或恢复本地会话。
+    Session {
+        #[command(subcommand)]
+        command: SessionCommand,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -113,6 +118,20 @@ struct UndoArgs {
     /// 指定变更记录 ID；省略时撤销符合条件的最近一次变更。
     #[arg(long)]
     change: Option<Uuid>,
+}
+
+#[derive(Debug, Subcommand)]
+enum SessionCommand {
+    /// 按更新时间列出会话。
+    List {
+        /// 最多显示的会话数量。
+        #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u16).range(1..=200))]
+        limit: u16,
+    },
+    /// 显示一个会话的完整记录。
+    Show { id: Uuid },
+    /// 恢复一个会话；省略指令时进入交互模式。
+    Resume { id: Uuid, prompt: Option<String> },
 }
 
 #[derive(Debug, Subcommand)]
@@ -155,7 +174,7 @@ struct Runtime {
     permission_mode: PermissionMode,
     approval_mode: ApprovalMode,
     registry: ToolRegistry,
-    store: JsonSessionStore,
+    store: SqliteSessionStore,
     renderer: ConsoleRenderer,
     stream: bool,
 }
@@ -247,7 +266,7 @@ async fn create_runtime(
         permission_mode: resolved.config.agent.permission_mode()?,
         approval_mode,
         registry,
-        store: JsonSessionStore::new(&cwd),
+        store: SqliteSessionStore::new(&cwd)?,
         renderer: ConsoleRenderer::new(
             resolved.config.output.json,
             !resolved.config.output.no_stream,
@@ -504,6 +523,48 @@ async fn handle_auth(command: AuthCommand, resolved: &ResolvedConfig) -> Result<
     Ok(0)
 }
 
+async fn handle_session(command: SessionCommand, cwd: &std::path::Path) -> Result<u8, XduduError> {
+    let store = SqliteSessionStore::new(cwd)?;
+    match command {
+        SessionCommand::List { limit } => {
+            let sessions = store.list(limit as usize).await?;
+            if sessions.is_empty() {
+                println!("当前工作区还没有会话。");
+                return Ok(0);
+            }
+            println!(
+                "会话 ID                              状态               更新时间                 标题"
+            );
+            for session in sessions {
+                let status = serde_json::to_string(&session.status)
+                    .unwrap_or_else(|_| "\"unknown\"".into())
+                    .trim_matches('"')
+                    .to_owned();
+                println!(
+                    "{}  {:<18} {}  {}",
+                    session.id,
+                    status,
+                    session.updated_at.format("%Y-%m-%d %H:%M:%S"),
+                    session.title.replace(['\r', '\n'], " ")
+                );
+            }
+        }
+        SessionCommand::Show { id } => {
+            let session = store
+                .get(id)
+                .await?
+                .ok_or_else(|| XduduError::validation(format!("找不到会话：{id}")))?;
+            println!("{}", serde_json::to_string_pretty(&session)?);
+        }
+        SessionCommand::Resume { .. } => {
+            return Err(XduduError::validation(
+                "session resume 应由 Agent 运行入口处理。",
+            ));
+        }
+    }
+    Ok(0)
+}
+
 async fn run() -> Result<u8, XduduError> {
     let cli = Cli::parse();
     let cwd = env::current_dir().map_err(XduduError::from)?;
@@ -521,6 +582,7 @@ async fn run() -> Result<u8, XduduError> {
             return run_doctor(&cwd, cli_overrides, cli.json).await;
         }
         Some(Command::Undo(args)) => {
+            let _workspace_lock = WorkspaceLock::acquire(&cwd)?;
             let result = JsonChangeLedger::new(&cwd)
                 .undo(args.change, cli.session)
                 .await?;
@@ -536,12 +598,26 @@ async fn run() -> Result<u8, XduduError> {
             );
             return Ok(0);
         }
+        Some(Command::Session {
+            command: command @ (SessionCommand::List { .. } | SessionCommand::Show { .. }),
+        }) => {
+            return handle_session(command, &cwd).await;
+        }
         _ => {}
     }
 
     let command_prompt = match &cli.command {
         Some(Command::Run(args)) => args.prompt.clone(),
+        Some(Command::Session {
+            command: SessionCommand::Resume { prompt, .. },
+        }) => prompt.clone(),
         _ => None,
+    };
+    let requested_session = match &cli.command {
+        Some(Command::Session {
+            command: SessionCommand::Resume { id, .. },
+        }) => Some(*id),
+        _ => cli.session,
     };
     let resolved = load_config(&cwd, cli_overrides)?;
     let piped = !io::stdin().is_terminal();
@@ -557,7 +633,7 @@ async fn run() -> Result<u8, XduduError> {
         print_banner(&runtime, interactive);
     }
     if interactive {
-        return interactive_loop(runtime, prompt, cli.session).await;
+        return interactive_loop(runtime, prompt, requested_session).await;
     }
     let prompt = if let Some(prompt) = prompt {
         prompt
@@ -572,7 +648,7 @@ async fn run() -> Result<u8, XduduError> {
     if prompt.is_empty() {
         return Err(XduduError::validation("prompt 不能为空。"));
     }
-    let result = execute_prompt(&runtime, prompt, cli.session).await?;
+    let result = execute_prompt(&runtime, prompt, requested_session).await?;
     runtime.renderer.finish_run(&result)?;
     Ok(result.exit_code)
 }

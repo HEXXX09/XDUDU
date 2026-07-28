@@ -1,11 +1,11 @@
 # XDUDU 开发报告
 
 > 更新时间：2026-07-28
-> 当前版本：v0.4.0
+> 当前版本：v0.5.0
 
 ## 总结
 
-XDUDU 已完成 M4 安全治理阶段。仓库保持 Rust-only，并已从 XYCLI 正式改名；DeepSeek 成为默认 Provider，Anthropic 适配继续保留但不再扩展 Provider 范围。
+XDUDU 已完成 M5 会话可靠性与上下文管理阶段。仓库保持 Rust-only，并已从 XYCLI 正式改名；DeepSeek 成为默认 Provider，Anthropic 适配继续保留但不再扩展 Provider 范围。
 
 本阶段采用独立提交拆分结构重构与行为变更；旧 TypeScript 实现不再参与构建、测试或发布。
 
@@ -29,6 +29,10 @@ XDUDU 已完成 M4 安全治理阶段。仓库保持 Rust-only，并已从 XYCLI
 | 会话、事件、错误和审批提示统一脱敏 | 已完成 |
 | 文件变更账本、哈希冲突保护和安全撤销 | 已完成 |
 | XYCLI 旧配置/会话只读兼容与凭据一次性迁移 | 已完成 |
+| SQLite Schema、事务会话存储和旧 JSON 导入 | 已完成 |
+| session list/show/resume | 已完成 |
+| 工作区跨进程锁、崩溃恢复和工具防重放 | 已完成 |
+| Token 预算、上下文压缩和计划保留 | 已完成 |
 
 ## 当前架构
 
@@ -40,7 +44,8 @@ CLI 命令与 Renderer
         → Agent Loop + AgentEvent
           → PermissionMode + ApprovalGate + ToolRegistry
             → file_read / file_write / terminal_exec
-          → JsonSessionStore + JsonChangeLedger + Redaction
+          → SqliteSessionStore + WorkspaceLock + Context Compression
+          → JsonChangeLedger + Redaction
 ```
 
 ## 可靠性与安全不变量
@@ -55,6 +60,9 @@ CLI 命令与 Renderer
 - 文件写入与进程执行必须经过副作用审批，非交互 `ask` 默认拒绝；
 - 项目配置不能提升权限、自动批准或重定向 Provider Base URL；
 - Agent 文件写入可在哈希未变化时安全撤销；
+- 同一工作区只允许一个状态写入进程，崩溃后锁自动释放；
+- 结果未知的工具调用恢复为取消状态，不自动重放；
+- 长会话只压缩 Provider 输入窗口，不删除本地原始消息；
 - CI 和默认测试不需要真实 API Key，也不请求公网模型。
 
 ## 验收命令
@@ -73,11 +81,10 @@ cargo install --path crates/xdudu-cli --locked --force
 ## 当前边界
 
 - 当前主用 DeepSeek，Provider 扩展、熔断和 fallback 按产品决定暂缓；
-- JSON 会话尚无跨进程锁、查询命令和上下文压缩；
 - `undo` 当前只覆盖 `file_write`，无法通用撤销终端命令的外部副作用；
 - 尚未实现搜索、Web、Git 专用工具、Plan 模式、MCP 与插件；
 - Release 工作流已定义，实际各平台结果需在 GitHub Actions 运行后确认。
 
 ## 下一阶段建议
 
-按调整后的路线图进入 M5：先建立 SQLite Schema 与迁移机制，再实现会话查询、跨进程锁、崩溃恢复和上下文压缩。Provider 扩展继续冻结，不与可靠性基础并行推进。
+按调整后的路线图进入 M6：实现原生代码搜索、补丁、Git 专用工具和受限 Web。Provider 扩展继续冻结；所有新增工具继续进入统一权限、审批、脱敏、审计和恢复链。

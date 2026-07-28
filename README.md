@@ -4,7 +4,7 @@ XDUDU 是一个使用 Rust 实现的终端 AI 编程助手。它把自然语言�
 
 ## 当前状态
 
-当前版本为 Rust-only 的 `v0.4.0`：
+当前版本为 Rust-only 的 `v0.5.0`：
 
 - DeepSeek Chat Completions API 为当前主用 Provider，保留已验证的 Anthropic 适配；
 - 支持文本和工具调用的 SSE 流式响应；
@@ -19,6 +19,9 @@ XDUDU 是一个使用 Rust 实现的终端 AI 编程助手。它把自然语言�
 - Provider 指数退避、抖动、`Retry-After`、请求节流和取消；
 - `auth`、`config`、`doctor` 命令；
 - 会话级文件变更账本、哈希冲突保护和 `undo` 安全撤销；
+- SQLite 会话存储、旧 JSON 自动迁移、跨进程锁和崩溃恢复；
+- `session list/show/resume` 会话查询与恢复命令；
+- 长会话 Token 预算、上下文压缩和关键计划保留；
 - 密钥、Bearer Token、私钥和敏感结构字段的统一输出及会话脱敏；
 - macOS、Linux、Windows CI 与多平台 Release 归档工作流。
 
@@ -127,6 +130,22 @@ API Key 不属于普通配置。项目或用户 TOML 中出现 key、token、sec
 
 `v0.4.0` 改名兼容层会优先读取 `XDUDU_*`、`.xdudu` 和 `xdudu` 系统凭据；新位置不存在时，可继续读取原 `XYCLI_*` 环境变量、`.xycli` 配置/会话。首次读取旧 `xycli` 系统凭据时，macOS 可能要求确认一次，允许后会立即复制到新的 `xdudu` 钥匙串项，此后启动不再访问旧项。所有新增数据只写入新名称位置。
 
+`v0.5.0` 首次启动会在事务中把旧 `.xdudu/sessions/json` 和 `.xycli/sessions/json` 会话导入 `.xdudu/xdudu.db`。旧文件不会删除，可作为迁移备份。
+
+## 会话查询与恢复
+
+```bash
+xdudu session list
+xdudu session list --limit 50
+xdudu session show <会话UUID>
+xdudu session resume <会话UUID> "继续完成刚才的任务"
+xdudu session resume <会话UUID>  # 进入交互模式
+```
+
+同一工作区只允许一个会修改状态的 XDUDU 进程运行。进程异常退出后，操作系统会自动释放锁；下次启动会把遗留的运行中会话标记为 `interrupted`。执行前已经记录但结果未知的工具调用会标记为 `cancelled`，不会被自动重放。
+
+较长会话超过输入预算时，XDUDU 会压缩较早上下文并保留计划、关键消息和工具摘要。原始消息仍完整保存在 SQLite 中。
+
 ## 输出模式
 
 ```bash
@@ -205,7 +224,7 @@ xdudu-core
   ├── Provider：Anthropic / DeepSeek / Stream / Retry
   ├── PermissionMode + ApprovalGate + ToolRegistry
   ├── file_read / file_write / terminal_exec
-  ├── JsonSessionStore + Redaction
+  ├── SqliteSessionStore + WorkspaceLock + Context Compression
   └── JsonChangeLedger + Undo
 ```
 
@@ -215,6 +234,8 @@ xdudu-core
 - [详细设计](docs/DESIGN.md)
 - [v0.3.0 阶段设计与验收](docs/NEXT_PHASE_DESIGN.md)
 - [v0.4.0 安全治理设计与验收](docs/SAFETY_GOVERNANCE_DESIGN.md)
+- [v0.5.0 会话恢复与上下文设计](docs/M5_SESSION_RECOVERY_DESIGN.md)
+- [M5 技术难点与实现细节](docs/M5_TECHNICAL_IMPLEMENTATION.md)
 - [产品需求](docs/PRD.md)
 - [任务路线图](docs/TASKS.md)
 - [Rust 迁移记录](docs/RUST_MIGRATION.md)

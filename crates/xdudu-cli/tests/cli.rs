@@ -16,6 +16,43 @@ fn xdudu() -> Command {
     command
 }
 
+fn session_list(cwd: &std::path::Path) -> String {
+    let output = xdudu()
+        .current_dir(cwd)
+        .args(["session", "list"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
+fn first_session_id(cwd: &std::path::Path) -> String {
+    session_list(cwd)
+        .lines()
+        .skip(1)
+        .find_map(|line| line.split_whitespace().next())
+        .expect("应至少存在一个会话")
+        .to_owned()
+}
+
+fn session_show(cwd: &std::path::Path, id: &str) -> serde_json::Value {
+    let output = xdudu()
+        .current_dir(cwd)
+        .args(["session", "show", id])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
 fn read_http_request(stream: &mut std::net::TcpStream) {
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
@@ -91,6 +128,24 @@ fn two_turn_anthropic_server() -> String {
                 "content":[{"type":"text","text":"Rust CLI E2E 完成"}],
                 "stop_reason":"end_turn",
                 "usage":{"input_tokens":2,"output_tokens":2}
+            }),
+        );
+    });
+    format!("http://{address}")
+}
+
+fn one_turn_anthropic_server(text: &'static str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        read_http_request(&mut stream);
+        write_http_json(
+            &mut stream,
+            json!({
+                "content":[{"type":"text","text":text}],
+                "stop_reason":"end_turn",
+                "usage":{"input_tokens":1,"output_tokens":1}
             }),
         );
     });
@@ -293,18 +348,48 @@ fn rust_cli_真实进程完成工具循环并保存会话() {
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("Rust CLI E2E 完成"));
 
-    let sessions_dir = dir.path().join(".xdudu/sessions/json");
-    let session_file = fs::read_dir(sessions_dir)
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
-    let session: serde_json::Value =
-        serde_json::from_slice(&fs::read(session_file).unwrap()).unwrap();
+    assert!(dir.path().join(".xdudu/xdudu.db").exists());
+    let id = first_session_id(dir.path());
+    let session = session_show(dir.path(), &id);
     assert_eq!(session["status"], "completed");
     assert_eq!(session["toolCalls"][0]["toolName"], "file_read");
     assert_eq!(session["toolCalls"][0]["status"], "succeeded");
+}
+
+#[test]
+fn session_可以列出显示并恢复会话() {
+    let dir = tempdir().unwrap();
+    let first = xdudu()
+        .current_dir(dir.path())
+        .env("ANTHROPIC_API_KEY", "test-key")
+        .env(
+            "ANTHROPIC_BASE_URL",
+            one_turn_anthropic_server("第一轮完成"),
+        )
+        .args(["--no-stream", "创建会话"])
+        .output()
+        .unwrap();
+    assert!(first.status.success());
+
+    let id = first_session_id(dir.path());
+    let before = session_show(dir.path(), &id);
+    assert_eq!(before["messages"].as_array().unwrap().len(), 2);
+
+    let resumed = xdudu()
+        .current_dir(dir.path())
+        .env("ANTHROPIC_API_KEY", "test-key")
+        .env("ANTHROPIC_BASE_URL", one_turn_anthropic_server("恢复完成"))
+        .args(["--no-stream", "session", "resume", &id, "继续执行"])
+        .output()
+        .unwrap();
+    assert!(
+        resumed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    assert!(String::from_utf8_lossy(&resumed.stdout).contains("恢复完成"));
+    let after = session_show(dir.path(), &id);
+    assert_eq!(after["messages"].as_array().unwrap().len(), 4);
 }
 
 #[test]
@@ -377,14 +462,8 @@ fn 非交互默认拒绝写入且显式批准可以执行() {
         .unwrap();
     assert!(denied.status.success());
     assert!(!denied_dir.path().join("created.txt").exists());
-    let denied_session = fs::read_dir(denied_dir.path().join(".xdudu/sessions/json"))
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
-    let denied_session: serde_json::Value =
-        serde_json::from_slice(&fs::read(denied_session).unwrap()).unwrap();
+    let denied_id = first_session_id(denied_dir.path());
+    let denied_session = session_show(denied_dir.path(), &denied_id);
     assert_eq!(denied_session["toolCalls"][0]["status"], "denied");
     assert_eq!(
         denied_session["toolCalls"][0]["approval"]["approved"],

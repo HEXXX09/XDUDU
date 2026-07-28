@@ -1,6 +1,6 @@
 # XDUDU 系统架构
 
-> 当前基线：Rust-only v0.4.0。旧 TypeScript 实现已退役，可通过 Git 历史审计。
+> 当前基线：Rust-only v0.5.0。旧 TypeScript 实现已退役，可通过 Git 历史审计。
 
 ## 1. 系统定位
 
@@ -33,7 +33,8 @@ Cargo workspace
     │   └── retry.rs     安全重试、退避和请求节流
     ├── permission.rs    显式权限矩阵
     ├── tools/           注册中心和三个内置工具
-    ├── session.rs       JSON 会话存储
+    ├── session.rs       会话领域模型与兼容 JSON 读取
+    ├── sqlite_session.rs SQLite、迁移、恢复与工作区锁
     ├── prompt.rs        中文系统提示词
     └── error.rs         错误类别和退出码
 ```
@@ -61,7 +62,7 @@ Agent + ToolRegistry + SessionStore + EventSink
 ## 4. Agent 运行数据流
 
 1. CLI 创建或恢复会话并选择 Renderer；
-2. Agent 构建历史消息、中文系统提示词和工具 JSON Schema；
+2. Agent 按 Token 预算构建历史消息、压缩摘要、中文系统提示词和工具 JSON Schema；
 3. Provider 通过统一流接口发送文本、工具调用、用量和终止原因；
 4. Agent 将文本增量和状态变化转为 `AgentEvent`，自身不写 stdout；
 5. 工具调用参数聚合完成后，ToolRegistry 检查权限并严格校验输入；
@@ -155,7 +156,11 @@ PermissionMode 显式允许矩阵
 
 ## 10. 会话、变更账本与终态
 
-会话保存在 `.xdudu/sessions/json/<uuid>.json`。字段使用 `camelCase`，写入采用同目录临时文件后原子重命名，单进程内有异步互斥。恢复会话要求工作目录一致。
+会话保存在 `.xdudu/xdudu.db`。SQLite 启用 WAL、外键约束、五秒忙等待和显式事务；`schema_migrations` 记录数据库版本。Unix 下数据库、WAL、共享内存和锁文件收紧为 `0600`。首次启动在单个事务中导入 `.xdudu/sessions/json` 和 `.xycli/sessions/json`，成功后只写迁移标记，不删除旧文件。
+
+`.xdudu/workspace.lock` 使用操作系统独占文件锁，阻止两个 XDUDU 进程同时修改同一工作区。锁在进程退出或崩溃时自动释放；下次启动将遗留的 `running` 或 `waiting_approval` 会话标记为 `interrupted`。工具执行前先持久化 `pending` 记录，恢复时将结果未知的调用改为 `cancelled` 并补充错误观察，不自动重放副作用。
+
+上下文预算默认限制输入估算值为 24,000 Token。超过预算时，本地确定性压缩较早消息，保留会话计划、角色、工具名称与受限长度结果，并继续携带最近完整消息。压缩只影响发给 Provider 的窗口；SQLite 中的原始消息不删除。
 
 成功的 `file_write` 在 `.xdudu/changes/json/<uuid>.json` 记录路径、会话、工具调用、前镜像及前后 SHA-256。`xdudu undo` 只选择 `applied` 记录；当前内容必须仍匹配写入后哈希，否则拒绝撤销。恢复旧文件后记录改为 `undone`；Agent 新建的文件则安全删除。
 
@@ -174,4 +179,4 @@ Cargo 是唯一构建入口。CI 在 Linux、macOS 和 Windows 执行格式、Cl
 
 ## 12. 后续演进
 
-Provider 扩展按当前决定暂缓，DeepSeek 保持主路径。下一阶段进入 M5：SQLite、会话查询与恢复、跨进程锁和上下文压缩。之后新增的搜索、Web、MCP 和插件必须进入同一 ToolRegistry、权限、审批、脱敏和审计链。
+Provider 扩展按当前决定暂缓，DeepSeek 保持主路径。M5 已完成；下一阶段进入 M6：原生搜索、补丁、Git 专用工具和受限 Web。新增能力必须进入同一 ToolRegistry、权限、审批、脱敏和审计链。

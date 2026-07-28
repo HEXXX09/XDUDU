@@ -1,6 +1,6 @@
 # XDUDU 任务路线图
 
-> 当前技术基线：Rust-only v0.4.0。
+> 当前技术基线：Rust-only v0.5.0。
 > 状态更新时间：2026-07-28。
 
 ## 规划调整
@@ -18,10 +18,10 @@
 | 里程碑 | 目标 | 状态 |
 | --- | --- | --- |
 | M1 | Rust 核心迁移与旧 TS 退役 | 已完成 |
-| M2 | 产品化基础：配置、凭据、流式、CI | 已完成，CI 修复待分支推送验证 |
+| M2 | 产品化基础：配置、凭据、流式、CI | 已完成 |
 | M3 | Provider 扩展与容错 | 暂缓，DeepSeek 优先 |
-| M4 | 审批、脱敏、变更账本与撤销 | 本地完成，待远端 CI |
-| M5 | SQLite、恢复与上下文管理 | 下一阶段 |
+| M4 | 审批、脱敏、变更账本与撤销 | 已完成 |
+| M5 | SQLite、恢复与上下文管理 | 已完成，待远端 CI |
 | M6 | 搜索、Web 与 Git 专用工具 | 待开始 |
 | M7 | Plan 模式与任务执行 | 待开始 |
 | M8 | MCP 与插件 | 待开始 |
@@ -63,7 +63,7 @@ cargo build --workspace --release
 - [x] M2-T09：实现 doctor 与全局安装检查；
 - [x] M2-T10：建立三平台 CI 和发布产物草案。
 
-M2 尚需建立 Pull Request 或合并到 `main`，由远端矩阵确认 macOS、Linux 和 Windows 实际运行结果；在此之前不把工作流文件等同于三平台已经通过。
+M2 已由 `main` 的 macOS、Linux 和 Windows CI 矩阵确认。
 
 ## M3：Provider 扩展与容错
 
@@ -90,13 +90,15 @@ M2 尚需建立 Pull Request 或合并到 `main`，由远端矩阵确认 macOS�
 
 ## M5：SQLite、恢复与上下文管理
 
-- [ ] M5-T01：建立 SQLite Schema、版本和迁移机制；
-- [ ] M5-T02：实现 SQLite SessionStore；
-- [ ] M5-T03：实现 session list/show/resume 命令；
-- [ ] M5-T04：实现跨进程锁和崩溃恢复；
-- [ ] M5-T05：实现 Token 预算与上下文压缩；
-- [ ] M5-T06：保留关键约束、计划和工具摘要；
-- [ ] M5-T07：完成迁移、恢复和长会话 E2E。
+详细设计见 `M5_SESSION_RECOVERY_DESIGN.md`。
+
+- [x] M5-T01：建立 SQLite Schema、版本和迁移机制；
+- [x] M5-T02：实现 SQLite SessionStore；
+- [x] M5-T03：实现 session list/show/resume 命令；
+- [x] M5-T04：实现跨进程锁和崩溃恢复；
+- [x] M5-T05：实现 Token 预算与上下文压缩；
+- [x] M5-T06：保留关键约束、计划和工具摘要；
+- [x] M5-T07：完成迁移、恢复和长会话 E2E。
 
 ## M6：搜索、Web 与 Git 专用工具
 

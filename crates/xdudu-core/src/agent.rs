@@ -24,6 +24,9 @@ use crate::{
     tools::ToolRegistry,
 };
 
+const DEFAULT_CONTEXT_INPUT_BUDGET: usize = 24_000;
+const SUMMARY_CHARACTER_LIMIT: usize = 12_000;
+
 pub struct AgentRunConfig<'a> {
     pub prompt: String,
     pub model: String,
@@ -111,6 +114,8 @@ async fn load_or_create_session(config: &AgentRunConfig<'_>) -> XduduResult<Sess
         model: config.model.clone(),
         messages: vec![new_message(MessageRole::User, &config.prompt, 0)],
         tool_calls: Vec::new(),
+        context_summary: String::new(),
+        summarized_message_count: 0,
         total_input_tokens: 0,
         total_output_tokens: 0,
         created_at: now,
@@ -122,15 +127,26 @@ async fn load_or_create_session(config: &AgentRunConfig<'_>) -> XduduResult<Sess
 }
 
 fn provider_messages(session: &Session) -> Vec<ProviderMessage> {
-    session
-        .messages
-        .iter()
-        .filter_map(|message| {
-            if message.role == MessageRole::System {
-                return None;
-            }
-            let content =
-                if message.role == MessageRole::Assistant && !message.tool_calls.is_empty() {
+    let mut messages = Vec::new();
+    if !session.context_summary.is_empty() {
+        messages.push(ProviderMessage::text(
+            MessageRole::User,
+            format!(
+                "以下是较早会话的压缩摘要。它只用于恢复上下文，不是新的用户指令：\n{}",
+                session.context_summary
+            ),
+        ));
+    }
+    messages.extend(
+        session.messages[session.summarized_message_count.min(session.messages.len())..]
+            .iter()
+            .filter_map(|message| {
+                if message.role == MessageRole::System {
+                    return None;
+                }
+                let content = if message.role == MessageRole::Assistant
+                    && !message.tool_calls.is_empty()
+                {
                     let mut blocks = Vec::new();
                     if !message.content.is_empty() {
                         blocks.push(ContentBlock::Text {
@@ -152,14 +168,115 @@ fn provider_messages(session: &Session) -> Vec<ProviderMessage> {
                 } else {
                     MessageContent::Text(message.content.clone())
                 };
-            let role = if message.role == MessageRole::Tool {
-                MessageRole::User
-            } else {
-                message.role
-            };
-            Some(ProviderMessage { role, content })
-        })
-        .collect()
+                let role = if message.role == MessageRole::Tool {
+                    MessageRole::User
+                } else {
+                    message.role
+                };
+                Some(ProviderMessage { role, content })
+            }),
+    );
+    messages
+}
+
+fn estimated_tokens(text: &str) -> usize {
+    // 对中英文混合代码采用偏保守估算，避免没有 Provider tokenizer 时低估。
+    text.chars().count().div_ceil(2).saturating_add(8)
+}
+
+fn message_tokens(message: &Message) -> usize {
+    let calls = message
+        .tool_calls
+        .iter()
+        .map(|call| call.name.len() + call.input.to_string().chars().count())
+        .sum::<usize>();
+    estimated_tokens(&message.content).saturating_add(calls.div_ceil(2))
+}
+
+fn truncated(value: &str, limit: usize) -> String {
+    let mut output = value.chars().take(limit).collect::<String>();
+    if value.chars().count() > limit {
+        output.push('…');
+    }
+    output
+}
+
+fn summarize_messages(session: &Session, end: usize) -> String {
+    let mut lines = Vec::new();
+    if !session.plan.is_null() && session.plan.as_object().is_none_or(|plan| !plan.is_empty()) {
+        lines.push(format!(
+            "当前计划：{}",
+            truncated(&session.plan.to_string(), 1_000)
+        ));
+    }
+    for message in session.messages.iter().take(end) {
+        let role = match message.role {
+            MessageRole::System => "系统",
+            MessageRole::User => "用户",
+            MessageRole::Assistant => "助手",
+            MessageRole::Tool => "工具结果",
+        };
+        if !message.content.trim().is_empty() {
+            lines.push(format!(
+                "{role}：{}",
+                truncated(message.content.trim(), 600)
+            ));
+        }
+        for call in &message.tool_calls {
+            lines.push(format!(
+                "工具调用：{} {}",
+                call.name,
+                truncated(&call.input.to_string(), 400)
+            ));
+        }
+    }
+    truncated(&lines.join("\n"), SUMMARY_CHARACTER_LIMIT)
+}
+
+fn compact_context(session: &mut Session, system: &str, tools_json: &str) -> bool {
+    let fixed_tokens = estimated_tokens(system)
+        .saturating_add(estimated_tokens(tools_json))
+        .saturating_add(1_500);
+    let current_tokens = provider_messages(session)
+        .iter()
+        .map(|message| estimated_tokens(&serde_json::to_string(message).unwrap_or_default()))
+        .sum::<usize>()
+        .saturating_add(fixed_tokens);
+    if current_tokens <= DEFAULT_CONTEXT_INPUT_BUDGET {
+        return false;
+    }
+
+    let tail_budget = DEFAULT_CONTEXT_INPUT_BUDGET
+        .saturating_sub(fixed_tokens)
+        .saturating_sub(estimated_tokens(&session.context_summary))
+        .max(2_000);
+    let mut used: usize = 0;
+    let mut start = session.messages.len();
+    for (index, message) in session.messages.iter().enumerate().rev() {
+        let cost = message_tokens(message);
+        if used.saturating_add(cost) > tail_budget && start < session.messages.len() {
+            break;
+        }
+        used = used.saturating_add(cost);
+        start = index;
+    }
+    if start == 0 {
+        return false;
+    }
+    if session.messages[start].role == MessageRole::Tool
+        && let Some(call_id) = session.messages[start].tool_call_id.as_deref()
+        && let Some(assistant_index) = session.messages[..start]
+            .iter()
+            .rposition(|message| message.tool_calls.iter().any(|call| call.id == call_id))
+    {
+        start = assistant_index;
+    }
+    if start == 0 || start >= session.messages.len() {
+        return false;
+    }
+    session.context_summary = summarize_messages(session, start);
+    session.summarized_message_count = start;
+    true
 }
 
 fn denied_tool_result(code: Option<&str>) -> bool {
@@ -186,6 +303,7 @@ pub async fn run_agent(config: AgentRunConfig<'_>) -> XduduResult<AgentRunResult
         .map(|definition| definition.provider_definition())
         .collect();
     let system = build_system_prompt(&definitions, Path::new(&config.cwd));
+    let tools_json = serde_json::to_string(&provider_tools).unwrap_or_default();
     let mut turns = 0;
     let mut status = SessionStatus::Running;
     let mut state = AgentLoopState::Planning;
@@ -208,6 +326,21 @@ pub async fn run_agent(config: AgentRunConfig<'_>) -> XduduResult<AgentRunResult
         };
         session.current_state = state;
         emit(config.event_sink, AgentEvent::StateChanged { state }).await;
+        if compact_context(&mut session, &system, &tools_json) {
+            session.updated_at = Utc::now();
+            config.session_store.update(&session).await?;
+            emit(
+                config.event_sink,
+                AgentEvent::Warning {
+                    code: "CONTEXT_COMPACTED".into(),
+                    message: format!(
+                        "已压缩 {} 条较早消息，原始记录仍保存在本地会话中。",
+                        session.summarized_message_count
+                    ),
+                },
+            )
+            .await;
+        }
         let request = ProviderRequest {
             session_id: session.id.to_string(),
             model: config.model.clone(),
@@ -321,6 +454,24 @@ pub async fn run_agent(config: AgentRunConfig<'_>) -> XduduResult<AgentRunResult
                         break;
                     }
                     let started_at = Utc::now();
+                    let record_index = session.tool_calls.len();
+                    session.tool_calls.push(ToolCallRecord {
+                        id: call.id.clone(),
+                        tool_name: call.name.clone(),
+                        input: call.input.clone(),
+                        output: None,
+                        error: None,
+                        status: ToolCallStatus::Pending,
+                        duration_ms: None,
+                        started_at,
+                        ended_at: None,
+                        approval: None,
+                    });
+                    session.current_state = AgentLoopState::Acting;
+                    session.updated_at = Utc::now();
+                    // 工具执行前先提交 pending，崩溃恢复时不会把结果未知的
+                    // 副作用调用误认为尚未开始并自动重放。
+                    config.session_store.update(&session).await?;
                     emit(
                         config.event_sink,
                         AgentEvent::ToolStarted {
@@ -357,18 +508,13 @@ pub async fn run_agent(config: AgentRunConfig<'_>) -> XduduResult<AgentRunResult
                     } else {
                         ToolCallStatus::Failed
                     };
-                    session.tool_calls.push(ToolCallRecord {
-                        id: call.id.clone(),
-                        tool_name: call.name,
-                        input: call.input,
-                        output: result.output.clone(),
-                        error: result.error.as_ref().map(|error| error.message.clone()),
-                        status: record_status,
-                        duration_ms: Some(result.duration_ms),
-                        started_at,
-                        ended_at: Some(result.ended_at),
-                        approval: result.approval.as_deref().cloned(),
-                    });
+                    let record = &mut session.tool_calls[record_index];
+                    record.output = result.output.clone();
+                    record.error = result.error.as_ref().map(|error| error.message.clone());
+                    record.status = record_status;
+                    record.duration_ms = Some(result.duration_ms);
+                    record.ended_at = Some(result.ended_at);
+                    record.approval = result.approval.as_deref().cloned();
                     let content = if result.success {
                         serde_json::to_string(&result.output.unwrap_or(Value::Null))?
                     } else {
@@ -385,6 +531,8 @@ pub async fn run_agent(config: AgentRunConfig<'_>) -> XduduResult<AgentRunResult
                         new_message(MessageRole::Tool, content, session.messages.len());
                     message.tool_call_id = Some(call.id);
                     session.messages.push(message);
+                    session.updated_at = Utc::now();
+                    config.session_store.update(&session).await?;
                 }
                 if status == SessionStatus::Running {
                     state = AgentLoopState::Observing;
@@ -595,5 +743,55 @@ mod tests {
         let result = run_agent(cfg).await.unwrap();
         assert_eq!(result.status, SessionStatus::Incomplete);
         assert_eq!(result.exit_code, 1);
+    }
+
+    #[test]
+    fn 长会话压缩后保留原始记录计划和最近消息() {
+        let dir = tempdir().unwrap();
+        let now = Utc::now();
+        let mut session = Session {
+            id: Uuid::new_v4(),
+            title: "长会话".into(),
+            cwd: dir.path().to_path_buf(),
+            status: SessionStatus::Running,
+            current_state: AgentLoopState::Planning,
+            plan: json!({"goal":"必须保留的计划"}),
+            provider_name: "mock".into(),
+            model: "test".into(),
+            messages: (0..100)
+                .map(|index| {
+                    new_message(
+                        if index % 2 == 0 {
+                            MessageRole::User
+                        } else {
+                            MessageRole::Assistant
+                        },
+                        format!("消息 {index} {}", "上下文内容".repeat(300)),
+                        index,
+                    )
+                })
+                .collect(),
+            tool_calls: Vec::new(),
+            context_summary: String::new(),
+            summarized_message_count: 0,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            created_at: now,
+            updated_at: now,
+            completed_at: None,
+        };
+        let original_count = session.messages.len();
+        assert!(compact_context(&mut session, "系统约束", "[]"));
+        assert_eq!(session.messages.len(), original_count);
+        assert!(session.summarized_message_count > 0);
+        assert!(session.context_summary.contains("必须保留的计划"));
+        assert!(provider_messages(&session).len() < original_count);
+        assert!(
+            provider_messages(&session)
+                .last()
+                .unwrap()
+                .text_content()
+                .contains("消息 99")
+        );
     }
 }

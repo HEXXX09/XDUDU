@@ -1,6 +1,6 @@
 # XDUDU 详细设计
 
-> 当前版本：Rust-only v0.4.0。本文描述已经实现并通过本地验收的设计边界。
+> 当前版本：Rust-only v0.5.0。本文描述已经实现并通过本地验收的设计边界。
 
 ## 1. 依赖方向
 
@@ -161,16 +161,16 @@ ToolRegistry 的固定顺序是：
 
 ## 10. 会话、脱敏与变更账本
 
-`JsonSessionStore` 将会话写入 `.xdudu/sessions/json/<uuid>.json`：
+`SqliteSessionStore` 将会话写入 `.xdudu/xdudu.db`：
 
-- 字段使用 `camelCase`；
-- 临时文件和目标文件位于同一目录；
-- 原子重命名避免半截 JSON；
-- 单进程异步互斥避免同时覆盖；
-- 损坏的单个文件不阻断列表读取；
-- 恢复会话要求工作目录一致。
-
-跨进程锁、SQLite 迁移和上下文压缩尚未实现，进入 M5。
+- SQLite 使用 bundled 构建，避免三平台系统库差异；
+- WAL、外键、忙等待、Schema 版本和事务统一初始化；
+- 旧 JSON 会话事务导入，导入失败整体回滚，原文件始终保留；
+- 工作区独占锁阻止跨进程并发覆盖，并由操作系统在崩溃后释放；
+- 遗留运行状态自动恢复为 `interrupted`；
+- 工具执行前保存 `pending`，结果未知时恢复为 `cancelled` 且不自动重放；
+- `session list/show/resume` 提供查询和恢复入口；
+- 输入预算超限后压缩较早上下文，但完整原始消息仍保存在数据库。
 
 `redact_text` 和 `redact_value` 覆盖 `sk-`、GitHub Token、Bearer Token、PEM 私钥以及 key、token、secret、password、authorization 等敏感结构字段。会话保存、Renderer 和顶层错误共用该边界，避免只在 UI 层遮盖。
 
@@ -183,6 +183,7 @@ xdudu [prompt]
 xdudu run [prompt]
 xdudu auth login|status|logout
 xdudu config show|explain|set|path
+xdudu session list|show|resume
 xdudu doctor
 xdudu undo [--change <uuid>]
 xdudu --version

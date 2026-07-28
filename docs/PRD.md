@@ -1,6 +1,6 @@
 # XDUDU 产品需求文档
 
-> 当前技术基线：v0.4.0 使用 Rust 核心库与 Rust CLI，旧 TypeScript 实现已经退役。
+> 当前技术基线：v0.5.0 使用 Rust 核心库与 Rust CLI，旧 TypeScript 实现已经退役。
 
 ## 1. 产品概述
 
@@ -179,7 +179,7 @@ CLI 参数 > 环境变量 > 项目配置 > 用户配置 > 内置默认值
 
 ## 6. 当前范围
 
-M1 已完成 Rust Agent、工具、权限、会话和两个 Provider 的基础迁移。M2 已完成产品化基础，M4 已完成当前安全治理范围：
+M1 已完成 Rust Agent、工具、权限、会话和两个 Provider 的基础迁移。M2 已完成产品化基础，M4 已完成安全治理，M5 已完成会话可靠性和上下文管理：
 
 - FR6 中 Anthropic、DeepSeek、错误分类、重试和请求节流；
 - FR7 的统一事件、SSE 文本与工具调用、终端、非流式和 JSON Lines 输出；
@@ -189,8 +189,11 @@ M1 已完成 Rust Agent、工具、权限、会话和两个 Provider 的基础�
 - FR15 的文件变更账本、哈希冲突保护和 `undo`；
 - FR17 的本地 `doctor` 基础诊断；
 - FR18 的命令面、Cargo 全局安装、三平台 CI 和 Release 归档工作流。
+- SQLite 会话存储、旧 JSON 非破坏迁移和 Schema 版本；
+- `session list/show/resume`、工作区跨进程锁和崩溃恢复；
+- 工具调用防重放记录、Token 预算和长上下文压缩。
 
-Provider 扩展与 fallback 按当前产品决定暂缓，DeepSeek 为主用路径。尚未完成的主要需求包括 SQLite 与上下文压缩、会话查询与崩溃恢复、搜索与 Web、Plan 模式、MCP、插件和 RAG。目标文档不能被当作当前完成证明。
+Provider 扩展与 fallback 按当前产品决定暂缓，DeepSeek 为主用路径。尚未完成的主要需求包括搜索与 Web、Plan 模式、MCP、插件和 RAG。目标文档不能被当作当前完成证明。
 
 ## 7. 暂不包含
 

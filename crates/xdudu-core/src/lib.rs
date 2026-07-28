@@ -15,6 +15,7 @@ pub mod prompt;
 pub mod provider;
 pub mod redaction;
 pub mod session;
+pub mod sqlite_session;
 pub mod tools;
 
 pub use agent::{AgentRunConfig, AgentRunResult, run_agent};
@@ -40,5 +41,9 @@ pub use provider::{
     AnthropicProvider, DeepSeekProvider, DefaultProviderFactory, Provider, ProviderFactory,
 };
 pub use redaction::{redact_text, redact_value};
-pub use session::{JsonSessionStore, SessionStore};
+pub use session::{
+    AgentLoopState, JsonSessionStore, Message, Session, SessionStatus, SessionStore,
+    ToolCallRecord, ToolCallStatus,
+};
+pub use sqlite_session::{SqliteSessionStore, WorkspaceLock};
 pub use tools::{ToolRegistry, register_builtins};

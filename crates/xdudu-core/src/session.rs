@@ -102,11 +102,38 @@ pub struct Session {
     pub model: String,
     pub messages: Vec<Message>,
     pub tool_calls: Vec<ToolCallRecord>,
+    /// 较早消息的本地压缩摘要；原始消息仍完整保存在会话中。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub context_summary: String,
+    /// 已纳入 `context_summary` 的消息数量。
+    #[serde(default)]
+    pub summarized_message_count: usize,
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
+}
+
+pub(crate) fn sanitized_session(session: &Session) -> Session {
+    let mut sanitized = session.clone();
+    sanitized.title = redact_text(&sanitized.title);
+    sanitized.context_summary = redact_text(&sanitized.context_summary);
+    for message in &mut sanitized.messages {
+        message.content = redact_text(&message.content);
+        for call in &mut message.tool_calls {
+            call.input = redact_value(&call.input);
+        }
+    }
+    for call in &mut sanitized.tool_calls {
+        call.input = redact_value(&call.input);
+        call.output = call.output.as_ref().map(redact_value);
+        call.error = call.error.as_deref().map(redact_text);
+        if let Some(approval) = &mut call.approval {
+            approval.reason = redact_text(&approval.reason);
+        }
+    }
+    sanitized
 }
 
 #[async_trait]
@@ -163,22 +190,7 @@ impl JsonSessionStore {
     }
 
     async fn save(&self, session: &Session) -> XduduResult<()> {
-        let mut sanitized = session.clone();
-        sanitized.title = redact_text(&sanitized.title);
-        for message in &mut sanitized.messages {
-            message.content = redact_text(&message.content);
-            for call in &mut message.tool_calls {
-                call.input = redact_value(&call.input);
-            }
-        }
-        for call in &mut sanitized.tool_calls {
-            call.input = redact_value(&call.input);
-            call.output = call.output.as_ref().map(redact_value);
-            call.error = call.error.as_deref().map(redact_text);
-            if let Some(approval) = &mut call.approval {
-                approval.reason = redact_text(&approval.reason);
-            }
-        }
+        let sanitized = sanitized_session(session);
         let data = serde_json::to_vec_pretty(&sanitized)?;
         self.atomic_write(&self.session_path(session.id), &data)
             .await
@@ -262,6 +274,8 @@ mod tests {
             model: "test".into(),
             messages: Vec::new(),
             tool_calls: Vec::new(),
+            context_summary: String::new(),
+            summarized_message_count: 0,
             total_input_tokens: 0,
             total_output_tokens: 0,
             created_at: now,

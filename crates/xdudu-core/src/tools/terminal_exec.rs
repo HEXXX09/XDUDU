@@ -280,6 +280,23 @@ impl Tool for TerminalExecTool {
                 );
             }
         }
+        // `pwd` 在 Windows 上不是独立的可执行文件。直接返回已经过工作区边界
+        // 校验的目录，既保证跨平台行为一致，也避免为内建命令启动 shell。
+        if command == "pwd" && args.is_empty() {
+            let stdout = format!("{}\n", cwd.display());
+            return ToolResult::success(
+                json!({
+                    "exitCode":0,
+                    "signal":null,
+                    "stdout":stdout,
+                    "stderr":"",
+                    "outputSummary":cwd.display().to_string(),
+                    "truncated":false
+                }),
+                context.started_at,
+                json!({"command":command,"args":args,"exitCode":0,"signal":null,"cwd":cwd}),
+            );
+        }
         let executable = if context.permission_mode == PermissionMode::FullAccess {
             PathBuf::from(command)
         } else {

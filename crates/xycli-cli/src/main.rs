@@ -8,17 +8,21 @@ use std::{
     io::{self, IsTerminal, Write},
     path::PathBuf,
     process::ExitCode,
+    sync::Arc,
 };
 
+use async_trait::async_trait;
 use clap::{Args, Parser, Subcommand};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use xycli_core::{
-    AgentRunConfig, AgentRunResult, ConfigOverrides, DefaultProviderFactory, JsonSessionStore,
-    KeyringSecretStore, PermissionMode, Provider, ProviderFactory, ResolvedConfig, SecretSource,
-    SecretStore, SecretString, ToolRegistry, XycliError, config_paths, load_config,
-    register_builtins, resolve_secret, run_agent, write_config_value,
+    AgentRunConfig, AgentRunResult, AllowAllApprovalGate, ApprovalDecision, ApprovalGate,
+    ApprovalMode, ApprovalRequest, ConfigOverrides, DefaultProviderFactory, DenyAllApprovalGate,
+    JsonSessionStore, KeyringSecretStore, PermissionMode, Provider, ProviderFactory,
+    ResolvedConfig, SecretSource, SecretStore, SecretString, ToolRegistry, XycliError,
+    config_paths, load_config, redact_text, redact_value, register_builtins, resolve_secret,
+    run_agent, write_config_value,
 };
 
 use crate::doctor::run_doctor;
@@ -56,6 +60,10 @@ struct Cli {
     /// 权限模式：read-only、auto-safe 或 full-access。
     #[arg(long, global = true)]
     permission: Option<String>,
+
+    /// 副作用审批模式：ask、never 或 always。
+    #[arg(long, global = true)]
+    approval: Option<String>,
 
     /// 继续已有会话。
     #[arg(long, global = true)]
@@ -136,6 +144,7 @@ struct Runtime {
     max_turns: u32,
     cwd: PathBuf,
     permission_mode: PermissionMode,
+    approval_mode: ApprovalMode,
     registry: ToolRegistry,
     store: JsonSessionStore,
     renderer: ConsoleRenderer,
@@ -149,6 +158,7 @@ fn overrides(cli: &Cli) -> ConfigOverrides {
         base_url: cli.base_url.clone(),
         max_turns: cli.max_turns,
         permission: cli.permission.clone(),
+        approval: cli.approval.clone(),
         json: cli.json.then_some(true),
         no_stream: cli.no_stream.then_some(true),
         color: cli.no_color.then_some(false),
@@ -164,11 +174,59 @@ fn provider_label(name: &str) -> String {
     .to_owned()
 }
 
-async fn create_runtime(cwd: PathBuf, resolved: &ResolvedConfig) -> Result<Runtime, XycliError> {
+#[derive(Debug)]
+struct ConsoleApprovalGate;
+
+#[async_trait]
+impl ApprovalGate for ConsoleApprovalGate {
+    async fn review(&self, request: &ApprovalRequest) -> ApprovalDecision {
+        let input = serde_json::to_string_pretty(&redact_value(&request.input))
+            .unwrap_or_else(|_| "<无法显示输入>".into());
+        let prompt = format!(
+            "\n  待审批工具：{}\n  副作用：{}\n  输入：{}\n  是否批准？[y/N] ",
+            request.tool_name,
+            request.side_effect.as_str(),
+            input
+        );
+        match tokio::task::spawn_blocking(move || {
+            eprint!("{prompt}");
+            io::stderr().flush()?;
+            let mut answer = String::new();
+            io::stdin().read_line(&mut answer)?;
+            Ok::<_, io::Error>(answer)
+        })
+        .await
+        {
+            Ok(Ok(answer))
+                if matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") =>
+            {
+                ApprovalDecision::approve("用户在交互终端批准。")
+            }
+            Ok(Ok(_)) => ApprovalDecision::deny("用户拒绝或未明确批准。"),
+            Ok(Err(error)) => ApprovalDecision::deny(format!("读取审批输入失败：{error}")),
+            Err(error) => ApprovalDecision::deny(format!("审批任务失败：{error}")),
+        }
+    }
+}
+
+async fn create_runtime(
+    cwd: PathBuf,
+    resolved: &ResolvedConfig,
+    interactive: bool,
+) -> Result<Runtime, XycliError> {
     let store = KeyringSecretStore;
     let (secret, _) = resolve_secret(&resolved.config.provider.name, &store).await?;
     let provider = DefaultProviderFactory.create(&resolved.config.provider, secret)?;
-    let mut registry = ToolRegistry::new();
+    let approval_mode = resolved.config.agent.approval_mode()?;
+    let approval_gate: Arc<dyn ApprovalGate> = match approval_mode {
+        ApprovalMode::Always => Arc::new(AllowAllApprovalGate),
+        ApprovalMode::Never => Arc::new(DenyAllApprovalGate),
+        ApprovalMode::Ask if interactive && !resolved.config.output.json => {
+            Arc::new(ConsoleApprovalGate)
+        }
+        ApprovalMode::Ask => Arc::new(DenyAllApprovalGate),
+    };
+    let mut registry = ToolRegistry::with_approval_gate(approval_gate);
     register_builtins(&mut registry)?;
     Ok(Runtime {
         provider,
@@ -177,6 +235,7 @@ async fn create_runtime(cwd: PathBuf, resolved: &ResolvedConfig) -> Result<Runti
         max_turns: resolved.config.agent.max_turns,
         cwd: cwd.clone(),
         permission_mode: resolved.config.agent.permission_mode()?,
+        approval_mode,
         registry,
         store: JsonSessionStore::new(&cwd),
         renderer: ConsoleRenderer::new(
@@ -233,6 +292,7 @@ fn print_banner(runtime: &Runtime, interactive: bool) {
     );
     println!("  工作目录: {}", runtime.cwd.display());
     println!("  权限模式: {}", runtime.permission_mode.as_str());
+    println!("  审批模式: {}", runtime.approval_mode.as_str());
     if interactive {
         println!("  输入 /help 查看命令，/exit 退出\n");
     }
@@ -340,6 +400,7 @@ fn config_value(resolved: &ResolvedConfig, key: &str) -> Option<String> {
         }
         "agent.max_turns" => Some(resolved.config.agent.max_turns.to_string()),
         "agent.permission" => Some(resolved.config.agent.permission.clone()),
+        "agent.approval" => Some(resolved.config.agent.approval.clone()),
         "output.json" => Some(resolved.config.output.json.to_string()),
         "output.no_stream" => Some(resolved.config.output.no_stream.to_string()),
         "output.color" => Some(resolved.config.output.color.to_string()),
@@ -457,7 +518,6 @@ async fn run() -> Result<u8, XycliError> {
         _ => None,
     };
     let resolved = load_config(&cwd, cli_overrides)?;
-    let runtime = create_runtime(cwd, &resolved).await?;
     let piped = !io::stdin().is_terminal();
     let prompt = command_prompt.or(cli.prompt);
     let interactive = cli.interactive || (prompt.is_none() && !piped);
@@ -466,6 +526,7 @@ async fn run() -> Result<u8, XycliError> {
             "--json 仅支持非交互模式，请同时提供 prompt 或管道输入。",
         ));
     }
+    let runtime = create_runtime(cwd, &resolved, interactive).await?;
     if !resolved.config.output.json {
         print_banner(&runtime, interactive);
     }
@@ -495,7 +556,7 @@ async fn main() -> ExitCode {
     match run().await {
         Ok(code) => ExitCode::from(code),
         Err(error) => {
-            eprintln!("\n  错误：{}", error.message);
+            eprintln!("\n  错误：{}", redact_text(&error.message));
             ExitCode::from(error.exit_code())
         }
     }

@@ -20,6 +20,9 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
+    approval::{
+        ApprovalGate, ApprovalRecord, ApprovalRequest, DenyAllApprovalGate, SideEffectKind,
+    },
     error::{XycliError, XycliResult},
     permission::{PermissionLevel, PermissionMode},
     provider::ProviderToolDefinition,
@@ -35,6 +38,7 @@ pub struct ToolDefinition {
     pub description: &'static str,
     pub input_schema: Value,
     pub permission_level: PermissionLevel,
+    pub side_effect: SideEffectKind,
     pub default_timeout: Duration,
 }
 
@@ -77,6 +81,8 @@ pub struct ToolResult {
     pub started_at: DateTime<Utc>,
     pub ended_at: DateTime<Utc>,
     pub metadata: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval: Option<Box<ApprovalRecord>>,
 }
 
 impl ToolResult {
@@ -99,6 +105,7 @@ impl ToolResult {
             started_at,
             ended_at: Utc::now(),
             metadata: Value::Object(Default::default()),
+            approval: None,
         }
     }
 
@@ -111,6 +118,7 @@ impl ToolResult {
             started_at,
             ended_at: Utc::now(),
             metadata,
+            approval: None,
         }
     }
 }
@@ -129,14 +137,30 @@ pub trait Tool: Send + Sync {
     async fn execute(&self, input: Value, context: ToolContext) -> ToolResult;
 }
 
-#[derive(Default)]
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
+    approval_gate: Arc<dyn ApprovalGate>,
+}
+
+impl Default for ToolRegistry {
+    fn default() -> Self {
+        Self {
+            tools: HashMap::new(),
+            approval_gate: Arc::new(DenyAllApprovalGate),
+        }
+    }
 }
 
 impl ToolRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_approval_gate(approval_gate: Arc<dyn ApprovalGate>) -> Self {
+        Self {
+            tools: HashMap::new(),
+            approval_gate,
+        }
     }
 
     pub fn register<T: Tool + 'static>(&mut self, tool: T) -> XycliResult<()> {
@@ -221,10 +245,46 @@ impl ToolRegistry {
             cancellation: cancellation.clone(),
             started_at,
         };
+        let mut approval = None;
+        if definition.side_effect.requires_approval() {
+            let request = ApprovalRequest {
+                id: Uuid::new_v4(),
+                session_id,
+                tool_name: name.to_owned(),
+                input: input.clone(),
+                permission_level: definition.permission_level,
+                side_effect: definition.side_effect,
+                requested_at: Utc::now(),
+            };
+            let decision = self.approval_gate.review(&request).await;
+            let record = ApprovalRecord {
+                id: request.id,
+                approved: decision.approved,
+                reason: decision.reason.clone(),
+                side_effect: request.side_effect,
+                requested_at: request.requested_at,
+                decided_at: Utc::now(),
+            };
+            if !decision.approved {
+                let mut result = ToolResult::failure(
+                    "APPROVAL_DENIED",
+                    format!("工具“{name}”未获批准：{}", decision.reason),
+                    started_at,
+                    json!({
+                        "toolName": name,
+                        "sideEffect": definition.side_effect.as_str(),
+                    }),
+                );
+                result.approval = Some(Box::new(record));
+                return result;
+            }
+            approval = Some(Box::new(record));
+        }
         let started = Instant::now();
         match tokio::time::timeout(definition.default_timeout, tool.execute(input, context)).await {
             Ok(mut result) => {
                 result.duration_ms = started.elapsed().as_millis() as u64;
+                result.approval = approval;
                 result
             }
             Err(_) => {

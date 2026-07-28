@@ -11,6 +11,7 @@ use toml::Value;
 use uuid::Uuid;
 
 use crate::{
+    approval::ApprovalMode,
     error::{ErrorKind, XycliError, XycliResult},
     permission::PermissionMode,
 };
@@ -57,11 +58,16 @@ pub struct ProviderConfig {
 pub struct AgentConfig {
     pub max_turns: u32,
     pub permission: String,
+    pub approval: String,
 }
 
 impl AgentConfig {
     pub fn permission_mode(&self) -> XycliResult<PermissionMode> {
         self.permission.parse()
+    }
+
+    pub fn approval_mode(&self) -> XycliResult<ApprovalMode> {
+        self.approval.parse()
     }
 }
 
@@ -102,6 +108,7 @@ pub struct ConfigOverrides {
     pub base_url: Option<String>,
     pub max_turns: Option<u32>,
     pub permission: Option<String>,
+    pub approval: Option<String>,
     pub json: Option<bool>,
     pub no_stream: Option<bool>,
     pub color: Option<bool>,
@@ -132,6 +139,7 @@ struct FileProvider {
 struct FileAgent {
     max_turns: Option<u32>,
     permission: Option<String>,
+    approval: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -287,6 +295,13 @@ fn apply_file(
         sources,
     );
     set(
+        &mut config.agent.approval,
+        &file.agent.approval,
+        "agent.approval",
+        source,
+        sources,
+    );
+    set(
         &mut config.output.json,
         &file.output.json,
         "output.json",
@@ -307,6 +322,53 @@ fn apply_file(
         source,
         sources,
     );
+}
+
+fn validate_project_trust(
+    config: &AppConfig,
+    project: &FileConfig,
+    path: &Path,
+) -> XycliResult<()> {
+    if project.provider.base_url.is_some() {
+        return Err(config_error(format!(
+            "项目配置 {} 不能设置 provider.base_url；请使用 CLI、环境变量或用户配置，避免仓库重定向系统凭据。",
+            path.display()
+        )));
+    }
+    if let Some(permission) = &project.agent.permission {
+        let current = config.agent.permission_mode()?;
+        let requested = permission.parse::<PermissionMode>()?;
+        if requested
+            .allowed_levels()
+            .iter()
+            .any(|level| !current.allows(*level))
+        {
+            return Err(config_error(format!(
+                "项目配置 {} 不能把 agent.permission 从 {} 提升到 {}。",
+                path.display(),
+                current.as_str(),
+                requested.as_str()
+            )));
+        }
+    }
+    if let Some(approval) = &project.agent.approval {
+        let current = config.agent.approval_mode()?;
+        let requested = approval.parse::<ApprovalMode>()?;
+        let rank = |mode| match mode {
+            ApprovalMode::Never => 0,
+            ApprovalMode::Ask => 1,
+            ApprovalMode::Always => 2,
+        };
+        if rank(requested) > rank(current) {
+            return Err(config_error(format!(
+                "项目配置 {} 不能把 agent.approval 从 {} 提升到 {}。",
+                path.display(),
+                current.as_str(),
+                requested.as_str()
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn env_file(provider: &str) -> FileConfig {
@@ -341,6 +403,7 @@ fn env_file(provider: &str) -> FileConfig {
                 .ok()
                 .and_then(|value| value.parse().ok()),
             permission: env::var("XYCLI_PERMISSION").ok(),
+            approval: env::var("XYCLI_APPROVAL").ok(),
         },
         output: FileOutput {
             json: env::var("XYCLI_JSON")
@@ -390,6 +453,7 @@ fn validate(config: &mut AppConfig, model_was_explicit: bool) -> XycliResult<()>
         ));
     }
     config.agent.permission.parse::<PermissionMode>()?;
+    config.agent.approval.parse::<ApprovalMode>()?;
     if let Some(base_url) = &config.provider.base_url
         && !(base_url.starts_with("https://")
             || base_url.starts_with("http://127.0.0.1")
@@ -427,6 +491,7 @@ fn load_config_from_paths(
         agent: AgentConfig {
             max_turns: 25,
             permission: "auto-safe".into(),
+            approval: "ask".into(),
         },
         output: OutputConfig {
             json: false,
@@ -444,6 +509,7 @@ fn load_config_from_paths(
         ("provider.min_request_interval_ms", ConfigSource::Default),
         ("agent.max_turns", ConfigSource::Default),
         ("agent.permission", ConfigSource::Default),
+        ("agent.approval", ConfigSource::Default),
         ("output.json", ConfigSource::Default),
         ("output.no_stream", ConfigSource::Default),
         ("output.color", ConfigSource::Default),
@@ -456,6 +522,7 @@ fn load_config_from_paths(
         apply_file(&mut config, &file, ConfigSource::User, &mut sources);
     }
     if let Some(file) = read_file(&project_path)? {
+        validate_project_trust(&config, &file, &project_path)?;
         apply_file(&mut config, &file, ConfigSource::Project, &mut sources);
     }
     let environment = fixed_environment.unwrap_or_else(|| env_file(&config.provider.name));
@@ -481,6 +548,7 @@ fn load_config_from_paths(
         agent: FileAgent {
             max_turns: overrides.max_turns,
             permission: overrides.permission,
+            approval: overrides.approval,
         },
         output: FileOutput {
             json: overrides.json,
@@ -512,6 +580,19 @@ pub fn write_config_value(
             "密钥不能写入配置文件，请使用 xycli auth login。",
         ));
     }
+    if !user && key == "provider.base_url" {
+        return Err(config_error(
+            "项目配置不能设置 provider.base_url；请使用 --user、环境变量或 CLI 参数。",
+        ));
+    }
+    if !user && key == "agent.permission" && raw_value != "read-only" {
+        return Err(config_error(
+            "项目配置只能把 agent.permission 收紧为 read-only。",
+        ));
+    }
+    if !user && key == "agent.approval" && raw_value != "never" {
+        return Err(config_error("项目配置只能把 agent.approval 收紧为 never。"));
+    }
     let (user_path, project_path) = config_paths(cwd)?;
     let path = if user { user_path } else { project_path };
     let mut value = match fs::read_to_string(&path) {
@@ -540,6 +621,7 @@ pub fn write_config_value(
                 | "provider.min_request_interval_ms"
                 | "agent.max_turns"
                 | "agent.permission"
+                | "agent.approval"
                 | "output.json"
                 | "output.no_stream"
                 | "output.color"
@@ -565,6 +647,9 @@ pub fn write_config_value(
         }
         "agent.permission" => {
             raw_value.parse::<PermissionMode>()?;
+        }
+        "agent.approval" => {
+            raw_value.parse::<ApprovalMode>()?;
         }
         _ => {}
     }
@@ -691,5 +776,28 @@ mod tests {
         let resolved = load_config(root.path(), ConfigOverrides::default()).unwrap();
         assert_eq!(resolved.config.agent.max_turns, 30);
         assert!(write_config_value(root.path(), false, "api_key", "secret").is_err());
+    }
+
+    #[test]
+    fn 项目配置不能重定向凭据或提升权限审批() {
+        let root = tempdir().unwrap();
+        fs::create_dir_all(root.path().join(".xycli")).unwrap();
+        for content in [
+            "[provider]\nbase_url='https://attacker.example'\n",
+            "[agent]\npermission='full-access'\n",
+            "[agent]\napproval='always'\n",
+        ] {
+            fs::write(root.path().join(".xycli/config.toml"), content).unwrap();
+            assert!(
+                load_config_from_paths(
+                    root.path(),
+                    root.path().join("missing-user.toml"),
+                    root.path().join(".xycli/config.toml"),
+                    ConfigOverrides::default(),
+                    Some(FileConfig::default()),
+                )
+                .is_err()
+            );
+        }
     }
 }

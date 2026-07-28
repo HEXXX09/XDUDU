@@ -130,6 +130,39 @@ fn two_turn_anthropic_sse_server() -> String {
     format!("http://{address}")
 }
 
+fn two_turn_anthropic_write_server() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        let (mut first, _) = listener.accept().unwrap();
+        read_http_request(&mut first);
+        write_http_json(
+            &mut first,
+            json!({
+                "content":[{
+                    "type":"tool_use",
+                    "id":"write-1",
+                    "name":"file_write",
+                    "input":{"path":"created.txt","content":"approval test"}
+                }],
+                "stop_reason":"tool_use",
+                "usage":{"input_tokens":1,"output_tokens":1}
+            }),
+        );
+        let (mut second, _) = listener.accept().unwrap();
+        read_http_request(&mut second);
+        write_http_json(
+            &mut second,
+            json!({
+                "content":[{"type":"text","text":"写入流程结束"}],
+                "stop_reason":"end_turn",
+                "usage":{"input_tokens":2,"output_tokens":2}
+            }),
+        );
+    });
+    format!("http://{address}")
+}
+
 #[test]
 fn help_可以在没有_api_key_时运行() {
     let output = xycli().arg("--help").output().unwrap();
@@ -137,6 +170,7 @@ fn help_可以在没有_api_key_时运行() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("终端原生 AI 编程助手"));
     assert!(stdout.contains("--permission"));
+    assert!(stdout.contains("--approval"));
 }
 
 #[test]
@@ -206,6 +240,18 @@ fn config_set_写入项目配置并可解释来源() {
     let stdout = String::from_utf8_lossy(&explain.stdout);
     assert!(stdout.contains("31"));
     assert!(stdout.contains("project"));
+}
+
+#[test]
+fn 项目配置不能自动批准副作用() {
+    let dir = tempdir().unwrap();
+    let output = xycli()
+        .current_dir(dir.path())
+        .args(["config", "set", "agent.approval", "always"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("只能把 agent.approval 收紧"));
 }
 
 #[test]
@@ -313,4 +359,45 @@ fn 默认流式模式聚合工具参数并增量输出文本() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(stdout.matches("Rust CLI SSE 完成").count(), 1);
+}
+
+#[test]
+fn 非交互默认拒绝写入且显式批准可以执行() {
+    let denied_dir = tempdir().unwrap();
+    let denied = xycli()
+        .current_dir(denied_dir.path())
+        .env("ANTHROPIC_API_KEY", "test-key")
+        .env("ANTHROPIC_BASE_URL", two_turn_anthropic_write_server())
+        .args(["--no-stream", "创建 created.txt"])
+        .output()
+        .unwrap();
+    assert!(denied.status.success());
+    assert!(!denied_dir.path().join("created.txt").exists());
+    let denied_session = fs::read_dir(denied_dir.path().join(".xycli/sessions/json"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let denied_session: serde_json::Value =
+        serde_json::from_slice(&fs::read(denied_session).unwrap()).unwrap();
+    assert_eq!(denied_session["toolCalls"][0]["status"], "denied");
+    assert_eq!(
+        denied_session["toolCalls"][0]["approval"]["approved"],
+        false
+    );
+
+    let allowed_dir = tempdir().unwrap();
+    let allowed = xycli()
+        .current_dir(allowed_dir.path())
+        .env("ANTHROPIC_API_KEY", "test-key")
+        .env("ANTHROPIC_BASE_URL", two_turn_anthropic_write_server())
+        .args(["--no-stream", "--approval", "always", "创建 created.txt"])
+        .output()
+        .unwrap();
+    assert!(allowed.status.success());
+    assert_eq!(
+        fs::read_to_string(allowed_dir.path().join("created.txt")).unwrap(),
+        "approval test"
+    );
 }

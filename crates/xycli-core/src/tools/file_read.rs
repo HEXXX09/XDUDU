@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::{fs, io::AsyncReadExt};
 
-use crate::permission::PermissionLevel;
+use crate::{SideEffectKind, permission::PermissionLevel};
 
 use super::path_policy::resolve_existing;
 use super::{
@@ -36,6 +36,7 @@ impl Tool for FileReadTool {
                 "additionalProperties": false
             }),
             permission_level: PermissionLevel::ReadOnly,
+            side_effect: SideEffectKind::None,
             default_timeout: Duration::from_secs(30),
         }
     }

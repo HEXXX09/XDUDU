@@ -165,7 +165,7 @@ fn provider_messages(session: &Session) -> Vec<ProviderMessage> {
 fn denied_tool_result(code: Option<&str>) -> bool {
     matches!(
         code,
-        Some("PERMISSION_DENIED" | "UNSAFE_COMMAND" | "PATH_OUTSIDE_WORKSPACE")
+        Some("PERMISSION_DENIED" | "APPROVAL_DENIED" | "UNSAFE_COMMAND" | "PATH_OUTSIDE_WORKSPACE")
     )
 }
 
@@ -367,6 +367,7 @@ pub async fn run_agent(config: AgentRunConfig<'_>) -> XycliResult<AgentRunResult
                         duration_ms: Some(result.duration_ms),
                         started_at,
                         ended_at: Some(result.ended_at),
+                        approval: result.approval.as_deref().cloned(),
                     });
                     let content = if result.success {
                         serde_json::to_string(&result.output.unwrap_or(Value::Null))?

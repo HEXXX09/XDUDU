@@ -1,10 +1,10 @@
-use std::fs;
+use std::{fs, sync::Arc};
 
 use serde_json::json;
 use tempfile::tempdir;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-use xycli_core::{PermissionMode, ToolRegistry, register_builtins};
+use xycli_core::{AllowAllApprovalGate, PermissionMode, ToolRegistry, register_builtins};
 
 async fn execute(
     registry: &ToolRegistry,
@@ -26,9 +26,26 @@ async fn execute(
 }
 
 fn registry() -> ToolRegistry {
-    let mut registry = ToolRegistry::new();
+    let mut registry = ToolRegistry::with_approval_gate(Arc::new(AllowAllApprovalGate));
     register_builtins(&mut registry).unwrap();
     registry
+}
+
+#[tokio::test]
+async fn 默认审批策略拒绝副作用工具() {
+    let dir = tempdir().unwrap();
+    let mut registry = ToolRegistry::new();
+    register_builtins(&mut registry).unwrap();
+    let result = execute(
+        &registry,
+        "file_write",
+        json!({"path":"blocked.txt","content":"blocked"}),
+        dir.path(),
+        PermissionMode::AutoSafe,
+    )
+    .await;
+    assert_eq!(result.error.unwrap().code, "APPROVAL_DENIED");
+    assert!(!dir.path().join("blocked.txt").exists());
 }
 
 #[test]

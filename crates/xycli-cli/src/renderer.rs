@@ -10,7 +10,7 @@ use std::{
 
 use async_trait::async_trait;
 use serde_json::json;
-use xycli_core::{AgentEvent, AgentRunResult, EventSink, XycliError};
+use xycli_core::{AgentEvent, AgentRunResult, EventSink, XycliError, redact_text, redact_value};
 
 pub struct ConsoleRenderer {
     json: bool,
@@ -46,21 +46,21 @@ impl ConsoleRenderer {
     pub fn finish_run(&self, result: &AgentRunResult) -> Result<(), XycliError> {
         let _guard = self.output_lock.lock().unwrap();
         if self.json {
+            let value = redact_value(&json!({
+                "type": "run_completed",
+                "sessionId": result.session_id,
+                "status": result.status,
+                "turns": result.turns,
+                "finalMessage": result.final_message,
+                "exitCode": result.exit_code,
+            }));
             println!(
                 "{}",
-                serde_json::to_string(&json!({
-                    "type": "run_completed",
-                    "sessionId": result.session_id,
-                    "status": result.status,
-                    "turns": result.turns,
-                    "finalMessage": result.final_message,
-                    "exitCode": result.exit_code,
-                }))
-                .map_err(XycliError::from)?
+                serde_json::to_string(&value).map_err(XycliError::from)?
             );
         } else if !self.stream || !self.emitted_assistant.load(Ordering::Acquire) {
             if !result.final_message.is_empty() {
-                println!("\n{}", result.final_message);
+                println!("\n{}", redact_text(&result.final_message));
             }
         } else {
             println!();
@@ -74,7 +74,10 @@ impl EventSink for ConsoleRenderer {
     async fn emit(&self, event: AgentEvent) {
         let _guard = self.output_lock.lock().unwrap();
         if self.json {
-            if let Ok(line) = serde_json::to_string(&event) {
+            let event = serde_json::to_value(&event)
+                .map(|value| redact_value(&value))
+                .and_then(|value| serde_json::to_string(&value));
+            if let Ok(line) = event {
                 println!("{line}");
             }
             return;
@@ -82,7 +85,7 @@ impl EventSink for ConsoleRenderer {
         match event {
             AgentEvent::AssistantDelta { text } if self.stream => {
                 self.emitted_assistant.store(true, Ordering::Release);
-                print!("{text}");
+                print!("{}", redact_text(&text));
                 let _ = io::stdout().flush();
             }
             AgentEvent::ToolStarted { name, .. } => {
@@ -97,7 +100,7 @@ impl EventSink for ConsoleRenderer {
                 eprintln!("  {marker} {name}（{} ms）", result.duration_ms);
             }
             AgentEvent::Warning { message, .. } => {
-                eprintln!("  {} {message}", self.style("33", "警告："));
+                eprintln!("  {} {}", self.style("33", "警告："), redact_text(&message));
             }
             _ => {}
         }

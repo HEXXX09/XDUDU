@@ -13,8 +13,10 @@ use tokio::{fs, sync::Mutex};
 use uuid::Uuid;
 
 use crate::{
+    approval::ApprovalRecord,
     error::{XycliError, XycliResult},
     provider::{MessageRole, ToolCall},
+    redaction::{redact_text, redact_value},
 };
 
 const DEFAULT_SESSIONS_DIR: &str = ".xycli/sessions/json";
@@ -70,6 +72,8 @@ pub struct ToolCallRecord {
     pub duration_ms: Option<u64>,
     pub started_at: DateTime<Utc>,
     pub ended_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval: Option<ApprovalRecord>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,7 +156,23 @@ impl JsonSessionStore {
     }
 
     async fn save(&self, session: &Session) -> XycliResult<()> {
-        let data = serde_json::to_vec_pretty(session)?;
+        let mut sanitized = session.clone();
+        sanitized.title = redact_text(&sanitized.title);
+        for message in &mut sanitized.messages {
+            message.content = redact_text(&message.content);
+            for call in &mut message.tool_calls {
+                call.input = redact_value(&call.input);
+            }
+        }
+        for call in &mut sanitized.tool_calls {
+            call.input = redact_value(&call.input);
+            call.output = call.output.as_ref().map(redact_value);
+            call.error = call.error.as_deref().map(redact_text);
+            if let Some(approval) = &mut call.approval {
+                approval.reason = redact_text(&approval.reason);
+            }
+        }
+        let data = serde_json::to_vec_pretty(&sanitized)?;
         self.atomic_write(&self.session_path(session.id), &data)
             .await
     }
@@ -254,5 +274,27 @@ mod tests {
         let sessions = store.list(10).await.unwrap();
         assert_eq!(sessions.len(), 2);
         assert_eq!(sessions[0].id, newer.id);
+    }
+
+    #[tokio::test]
+    async fn 会话落盘前脱敏密钥() {
+        let dir = tempdir().unwrap();
+        let store = JsonSessionStore::with_dir(dir.path());
+        let mut session = sample_session(dir.path());
+        session.messages.push(Message {
+            id: Uuid::new_v4(),
+            role: MessageRole::User,
+            content: "请使用 sk-abcdefghijklmnopqrstuvwxyz".into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            sequence: 0,
+            created_at: Utc::now(),
+        });
+        store.create(&session).await.unwrap();
+        let raw = fs::read_to_string(store.session_path(session.id))
+            .await
+            .unwrap();
+        assert!(!raw.contains("sk-abcdefghijklmnopqrstuvwxyz"));
+        assert!(raw.contains("[已脱敏]"));
     }
 }

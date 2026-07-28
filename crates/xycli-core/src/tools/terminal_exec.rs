@@ -15,7 +15,10 @@ use tokio::{
     time,
 };
 
-use crate::permission::{PermissionLevel, PermissionMode};
+use crate::{
+    SideEffectKind,
+    permission::{PermissionLevel, PermissionMode},
+};
 
 use super::path_policy::{resolve_directory, resolve_existing};
 use super::{
@@ -165,6 +168,7 @@ impl Tool for TerminalExecTool {
                 "additionalProperties":false
             }),
             permission_level: PermissionLevel::RunSafeCommands,
+            side_effect: SideEffectKind::ProcessExecution,
             default_timeout: Duration::from_millis(DEFAULT_TIMEOUT_MS + 1_000),
         }
     }

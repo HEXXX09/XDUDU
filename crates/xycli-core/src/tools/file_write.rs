@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use tokio::fs;
 use uuid::Uuid;
 
-use crate::permission::PermissionLevel;
+use crate::{SideEffectKind, permission::PermissionLevel};
 
 use super::path_policy::resolve_writable;
 use super::{
@@ -107,6 +107,7 @@ impl Tool for FileWriteTool {
                 "additionalProperties":false
             }),
             permission_level: PermissionLevel::WriteFiles,
+            side_effect: SideEffectKind::WorkspaceWrite,
             default_timeout: Duration::from_secs(30),
         }
     }

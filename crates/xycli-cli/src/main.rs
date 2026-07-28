@@ -19,10 +19,10 @@ use uuid::Uuid;
 use xycli_core::{
     AgentRunConfig, AgentRunResult, AllowAllApprovalGate, ApprovalDecision, ApprovalGate,
     ApprovalMode, ApprovalRequest, ConfigOverrides, DefaultProviderFactory, DenyAllApprovalGate,
-    JsonSessionStore, KeyringSecretStore, PermissionMode, Provider, ProviderFactory,
-    ResolvedConfig, SecretSource, SecretStore, SecretString, ToolRegistry, XycliError,
-    config_paths, load_config, redact_text, redact_value, register_builtins, resolve_secret,
-    run_agent, write_config_value,
+    JsonChangeLedger, JsonSessionStore, KeyringSecretStore, PermissionMode, Provider,
+    ProviderFactory, ResolvedConfig, SecretSource, SecretStore, SecretString, ToolRegistry,
+    XycliError, config_paths, load_config, redact_text, redact_value, register_builtins,
+    resolve_secret, run_agent, write_config_value,
 };
 
 use crate::doctor::run_doctor;
@@ -98,12 +98,21 @@ enum Command {
     },
     /// 检查安装、配置、凭据和工作区状态。
     Doctor,
+    /// 安全撤销最近一次或指定的 Agent 文件变更。
+    Undo(UndoArgs),
 }
 
 #[derive(Debug, Args)]
 struct RunArgs {
     /// 要执行的自然语言任务。
     prompt: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct UndoArgs {
+    /// 指定变更记录 ID；省略时撤销符合条件的最近一次变更。
+    #[arg(long)]
+    change: Option<Uuid>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -226,7 +235,8 @@ async fn create_runtime(
         }
         ApprovalMode::Ask => Arc::new(DenyAllApprovalGate),
     };
-    let mut registry = ToolRegistry::with_approval_gate(approval_gate);
+    let change_ledger = Arc::new(JsonChangeLedger::new(&cwd));
+    let mut registry = ToolRegistry::with_runtime(approval_gate, change_ledger);
     register_builtins(&mut registry)?;
     Ok(Runtime {
         provider,
@@ -509,6 +519,22 @@ async fn run() -> Result<u8, XycliError> {
         }
         Some(Command::Doctor) => {
             return run_doctor(&cwd, cli_overrides, cli.json).await;
+        }
+        Some(Command::Undo(args)) => {
+            let result = JsonChangeLedger::new(&cwd)
+                .undo(args.change, cli.session)
+                .await?;
+            let action = if result.removed_created_file {
+                "已删除由 Agent 创建的文件"
+            } else {
+                "已恢复变更前内容"
+            };
+            println!(
+                "{action}：{}\n变更记录：{}",
+                result.path.display(),
+                result.change_id
+            );
+            return Ok(0);
         }
         _ => {}
     }

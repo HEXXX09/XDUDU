@@ -23,6 +23,7 @@ use crate::{
     approval::{
         ApprovalGate, ApprovalRecord, ApprovalRequest, DenyAllApprovalGate, SideEffectKind,
     },
+    changes::{ChangeLedger, NoopChangeLedger},
     error::{XycliError, XycliResult},
     permission::{PermissionLevel, PermissionMode},
     provider::ProviderToolDefinition,
@@ -52,7 +53,7 @@ impl ToolDefinition {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ToolContext {
     pub session_id: Uuid,
     pub call_id: Uuid,
@@ -60,6 +61,7 @@ pub struct ToolContext {
     pub permission_mode: PermissionMode,
     pub cancellation: CancellationToken,
     pub started_at: DateTime<Utc>,
+    pub change_ledger: Arc<dyn ChangeLedger>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -140,6 +142,7 @@ pub trait Tool: Send + Sync {
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
     approval_gate: Arc<dyn ApprovalGate>,
+    change_ledger: Arc<dyn ChangeLedger>,
 }
 
 impl Default for ToolRegistry {
@@ -147,6 +150,7 @@ impl Default for ToolRegistry {
         Self {
             tools: HashMap::new(),
             approval_gate: Arc::new(DenyAllApprovalGate),
+            change_ledger: Arc::new(NoopChangeLedger),
         }
     }
 }
@@ -160,6 +164,18 @@ impl ToolRegistry {
         Self {
             tools: HashMap::new(),
             approval_gate,
+            change_ledger: Arc::new(NoopChangeLedger),
+        }
+    }
+
+    pub fn with_runtime(
+        approval_gate: Arc<dyn ApprovalGate>,
+        change_ledger: Arc<dyn ChangeLedger>,
+    ) -> Self {
+        Self {
+            tools: HashMap::new(),
+            approval_gate,
+            change_ledger,
         }
     }
 
@@ -244,6 +260,7 @@ impl ToolRegistry {
             permission_mode,
             cancellation: cancellation.clone(),
             started_at,
+            change_ledger: Arc::clone(&self.change_ledger),
         };
         let mut approval = None;
         if definition.side_effect.requires_approval() {

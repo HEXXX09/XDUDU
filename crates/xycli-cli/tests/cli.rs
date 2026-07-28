@@ -171,6 +171,7 @@ fn help_可以在没有_api_key_时运行() {
     assert!(stdout.contains("终端原生 AI 编程助手"));
     assert!(stdout.contains("--permission"));
     assert!(stdout.contains("--approval"));
+    assert!(stdout.contains("undo"));
 }
 
 #[test]
@@ -399,5 +400,66 @@ fn 非交互默认拒绝写入且显式批准可以执行() {
     assert_eq!(
         fs::read_to_string(allowed_dir.path().join("created.txt")).unwrap(),
         "approval test"
+    );
+    assert_eq!(
+        fs::read_dir(allowed_dir.path().join(".xycli/changes/json"))
+            .unwrap()
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn undo_无需_api_key_即可撤销_agent_创建的文件() {
+    let dir = tempdir().unwrap();
+    let write = xycli()
+        .current_dir(dir.path())
+        .env("ANTHROPIC_API_KEY", "test-key")
+        .env("ANTHROPIC_BASE_URL", two_turn_anthropic_write_server())
+        .args(["--no-stream", "--approval", "always", "创建 created.txt"])
+        .output()
+        .unwrap();
+    assert!(write.status.success());
+    assert!(dir.path().join("created.txt").exists());
+
+    let undo = xycli()
+        .current_dir(dir.path())
+        .env_remove("ANTHROPIC_API_KEY")
+        .arg("undo")
+        .output()
+        .unwrap();
+    assert!(
+        undo.status.success(),
+        "{}",
+        String::from_utf8_lossy(&undo.stderr)
+    );
+    assert!(!dir.path().join("created.txt").exists());
+    assert!(String::from_utf8_lossy(&undo.stdout).contains("已删除由 Agent 创建的文件"));
+}
+
+#[test]
+fn undo_发现后续人工修改时拒绝覆盖() {
+    let dir = tempdir().unwrap();
+    let write = xycli()
+        .current_dir(dir.path())
+        .env("ANTHROPIC_API_KEY", "test-key")
+        .env("ANTHROPIC_BASE_URL", two_turn_anthropic_write_server())
+        .args(["--no-stream", "--approval", "always", "创建 created.txt"])
+        .output()
+        .unwrap();
+    assert!(write.status.success());
+    fs::write(dir.path().join("created.txt"), "user edit").unwrap();
+
+    let undo = xycli()
+        .current_dir(dir.path())
+        .env_remove("ANTHROPIC_API_KEY")
+        .arg("undo")
+        .output()
+        .unwrap();
+    assert!(!undo.status.success());
+    assert!(String::from_utf8_lossy(&undo.stderr).contains("又发生变化"));
+    assert_eq!(
+        fs::read_to_string(dir.path().join("created.txt")).unwrap(),
+        "user edit"
     );
 }

@@ -5,6 +5,7 @@
 
 pub mod agent;
 pub mod approval;
+pub mod changes;
 pub mod config;
 pub mod credentials;
 pub mod error;
@@ -20,6 +21,10 @@ pub use agent::{AgentRunConfig, AgentRunResult, run_agent};
 pub use approval::{
     AllowAllApprovalGate, ApprovalDecision, ApprovalGate, ApprovalMode, ApprovalRecord,
     ApprovalRequest, DenyAllApprovalGate, SideEffectKind,
+};
+pub use changes::{
+    ChangeLedger, FileChangeDraft, FileChangeRecord, FileChangeStatus, JsonChangeLedger,
+    NoopChangeLedger, UndoResult,
 };
 pub use config::{
     AppConfig, ConfigOverrides, ConfigSource, ResolvedConfig, config_paths, load_config,

@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use tokio::fs;
 use uuid::Uuid;
 
-use crate::{SideEffectKind, permission::PermissionLevel};
+use crate::{FileChangeDraft, SideEffectKind, permission::PermissionLevel};
 
 use super::path_policy::resolve_writable;
 use super::{
@@ -237,13 +237,49 @@ impl Tool for FileWriteTool {
             );
         }
         let old_text = old_bytes.as_deref().map(String::from_utf8_lossy);
+        let post_hash = sha256(content.as_bytes());
+        let change_id = match context
+            .change_ledger
+            .record_file_change(FileChangeDraft {
+                session_id: context.session_id,
+                tool_call_id: context.call_id,
+                path: Path::new(path_text).to_path_buf(),
+                pre_image: old_bytes.clone(),
+                pre_image_sha256: pre_hash.clone(),
+                post_image_sha256: post_hash.clone(),
+            })
+            .await
+        {
+            Ok(change_id) => change_id,
+            Err(error) => {
+                let rollback = if let Some(old_bytes) = &old_bytes {
+                    fs::write(&resolved, old_bytes).await
+                } else {
+                    fs::remove_file(&resolved).await
+                };
+                let message = match rollback {
+                    Ok(()) => format!("记录变更失败，已恢复原文件：{}", error.message),
+                    Err(rollback_error) => format!(
+                        "记录变更失败且恢复原文件失败：{}；恢复错误：{rollback_error}",
+                        error.message
+                    ),
+                };
+                return ToolResult::failure(
+                    "CHANGE_LEDGER_ERROR",
+                    message,
+                    context.started_at,
+                    json!({"path":path_text}),
+                );
+            }
+        };
         ToolResult::success(
             json!({
                 "path": path_text,
                 "created": old_bytes.is_none(),
                 "preImageSha256": pre_hash,
-                "postImageSha256": sha256(content.as_bytes()),
+                "postImageSha256": post_hash,
                 "unifiedDiff": unified_diff(path_text, old_text.as_deref(), content),
+                "changeId": change_id,
             }),
             context.started_at,
             json!({"resolvedPath":resolved,"contentLength":content.len()}),

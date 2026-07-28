@@ -1,4 +1,4 @@
-# XYCLI Rust 迁移与收尾记录
+# XDUDU Rust 迁移与收尾记录
 
 > 迁移版本：v0.2.0
 > 开始日期：2026-07-20
@@ -15,10 +15,10 @@
 
 ```text
 Cargo workspace
-├── crates/xycli-cli
+├── crates/xdudu-cli
 │   ├── src/main.rs
 │   └── tests/cli.rs
-└── crates/xycli-core
+└── crates/xdudu-core
     ├── src/
     └── tests/
 ```
@@ -29,7 +29,7 @@ Cargo workspace
 
 ### 3.1 核心库与 CLI 分离
 
-`xycli-core` 不依赖具体终端，`xycli` 是薄 CLI。这样可以独立测试核心，也为桌面端或服务端复用留出边界。
+`xdudu-core` 不依赖具体终端，`xdudu` 是薄 CLI。这样可以独立测试核心，也为桌面端或服务端复用留出边界。
 
 ### 3.2 统一异步运行时
 
@@ -55,7 +55,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --all-targets
 cargo build --workspace --release
-./target/release/xycli --help
+./target/release/xdudu --help
 ```
 
 测试覆盖单元、Agent、多轮工具、路径安全、命令安全、Provider HTTP 和真实 CLI 子进程。默认测试不访问线上模型 API。

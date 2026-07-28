@@ -43,28 +43,28 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: 构建目标二进制
-        run: cargo build -p xycli --release --locked --target ${{ matrix.target }}
+        run: cargo build -p xdudu --release --locked --target ${{ matrix.target }}
 
       - name: 打包 Unix 产物并生成校验和
         if: matrix.archive == 'tar'
         shell: bash
         run: |
-          archive="xycli-${{ github.ref_name }}-${{ matrix.target }}.tar.gz"
-          tar -C "target/${{ matrix.target }}/release" -czf "$archive" xycli
+          archive="xdudu-${{ github.ref_name }}-${{ matrix.target }}.tar.gz"
+          tar -C "target/${{ matrix.target }}/release" -czf "$archive" xdudu
           shasum -a 256 "$archive" > "$archive.sha256"
 
       - name: 打包 Windows 产物并生成校验和
         if: matrix.archive == 'zip'
         shell: pwsh
         run: |
-          $archive = "xycli-${{ github.ref_name }}-${{ matrix.target }}.zip"
-          Compress-Archive -Path "target/${{ matrix.target }}/release/xycli.exe" -DestinationPath $archive
+          $archive = "xdudu-${{ github.ref_name }}-${{ matrix.target }}.zip"
+          Compress-Archive -Path "target/${{ matrix.target }}/release/xdudu.exe" -DestinationPath $archive
           $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLower()
           "$hash  $archive" | Out-File -Encoding ascii "$archive.sha256"
 
       - name: 上传构建产物
         uses: actions/upload-artifact@v4
         with:
-          name: xycli-${{ matrix.target }}
+          name: xdudu-${{ matrix.target }}
           path: |
-            xycli-*
+            xdudu-*

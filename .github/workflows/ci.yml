@@ -49,4 +49,4 @@ jobs:
         run: cargo build --workspace --release --locked
 
       - name: 验证源码安装
-        run: cargo install --path crates/xycli-cli --locked --force --root "${{ runner.temp }}/xycli-install"
+        run: cargo install --path crates/xdudu-cli --locked --force --root "${{ runner.temp }}/xdudu-install"

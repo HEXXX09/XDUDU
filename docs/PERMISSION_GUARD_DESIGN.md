@@ -1,6 +1,6 @@
 # PermissionGuard 与工具安全边界设计
 
-> 当前生产权限矩阵位于 `crates/xycli-core/src/permission.rs`，工具执行层位于 `crates/xycli-core/src/tools/`。
+> 当前生产权限矩阵位于 `crates/xdudu-core/src/permission.rs`，工具执行层位于 `crates/xdudu-core/src/tools/`。
 
 ## 1. 目标
 
@@ -106,7 +106,7 @@ Provider 返回 tool call
 
 第二个示例在 `full-access` 下可以执行，但在 `auto-safe` 下返回 `UNSAFE_COMMAND`。
 
-安全白名单及参数限制定义在 `crates/xycli-core/src/tools/terminal_exec.rs`。不能把 `cargo test` 视为只读安全命令，因为构建脚本和测试可以执行任意代码。
+安全白名单及参数限制定义在 `crates/xdudu-core/src/tools/terminal_exec.rs`。不能把 `cargo test` 视为只读安全命令，因为构建脚本和测试可以执行任意代码。
 
 ## 8. 测试矩阵
 
@@ -123,13 +123,13 @@ Provider 返回 tool call
 - full-access 显式可执行文件与参数；
 - 拒绝调用的 Session 审计状态。
 
-## 9. 后续增强
+## 9. 当前增强与后续
 
-M9 将增加：
+v0.4.0 已增加副作用审批、审批记录持久化、敏感输出脱敏、文件变更账本和哈希保护撤销。
+
+后续仍需增加：
 
 - 项目级和用户级 allowlist/denylist；
-- 副作用审批提示；
-- 命令语义风险扫描；
-- 密钥和敏感输出脱敏；
-- 文件变更追踪与撤销；
-- 审批记录持久化。
+- 更细粒度的命令语义风险扫描；
+- 网络、MCP 和插件的统一策略；
+- SQLite 跨进程事务与恢复。

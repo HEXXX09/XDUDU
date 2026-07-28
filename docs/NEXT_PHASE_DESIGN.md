@@ -1,4 +1,4 @@
-# XYCLI v0.3.0 阶段设计与验收
+# XDUDU v0.3.0 阶段设计与验收
 
 > 目标版本：v0.3.0
 > 状态：本地实现完成，等待远端 CI 验证
@@ -24,7 +24,7 @@
 
 ### 2.1 目标
 
-- 用户安装一次后可在任意目录运行 `xycli`；
+- 用户安装一次后可在任意目录运行 `xdudu`；
 - 常用 Provider 和模型不需要每次传参；
 - API Key 不写入项目配置、会话或日志；
 - 终端可实时显示模型文本和工具状态；
@@ -42,12 +42,12 @@
 ## 3. 模块调整
 
 ```text
-xycli-cli
+xdudu-cli
 ├── main.rs              run、auth、config、依赖装配与 REPL
 ├── renderer.rs          终端、JSON Lines 与非流式输出
 └── doctor.rs            安装、配置、凭据与工作区诊断
 
-xycli-core
+xdudu-core
 ├── config.rs            配置模型、来源、合并与写入
 ├── credentials.rs       SecretStore trait 与系统凭据适配
 ├── events.rs            AgentEvent + EventSink
@@ -70,12 +70,12 @@ xycli-core
 ```text
 CLI 参数
   > 环境变量
-  > 项目配置 .xycli/config.toml
-  > 用户配置 ~/.config/xycli/config.toml
+  > 项目配置 .xdudu/config.toml
+  > 用户配置 ~/.config/xdudu/config.toml
   > 内置默认值
 ```
 
-项目配置只能设置非秘密参数，例如默认模型、最大轮次、权限请求策略和 Provider Base URL。项目文件中出现明文 API Key 时，加载器必须拒绝并给出迁移提示。
+本阶段最初允许项目配置 Provider Base URL；v0.4.0 安全复审后已收紧：项目配置不能设置 Base URL，也不能提升权限或审批级别。项目文件中出现明文 API Key 时，加载器必须拒绝并给出迁移提示。
 
 ### 4.2 配置模型
 
@@ -92,14 +92,14 @@ pub struct Resolved<T> {
 }
 ```
 
-`Resolved<T>` 让 `xycli config explain` 能显示最终值来自哪里，但秘密值只能显示来源和末四位，不能输出原文。
+`Resolved<T>` 让 `xdudu config explain` 能显示最终值来自哪里，但秘密值只能显示来源和末四位，不能输出原文。
 
 ### 4.3 配置命令
 
-- `xycli config show`：展示脱敏后的最终配置；
-- `xycli config explain <key>`：展示优先级决议；
-- `xycli config set <key> <value> --user|--project`：只允许非秘密字段；
-- `xycli config path`：显示实际配置路径。
+- `xdudu config show`：展示脱敏后的最终配置；
+- `xdudu config explain <key>`：展示优先级决议；
+- `xdudu config set <key> <value> --user|--project`：只允许非秘密字段；
+- `xdudu config path`：显示实际配置路径。
 
 ## 5. 凭据存储
 
@@ -108,9 +108,9 @@ pub struct Resolved<T> {
 ```rust
 #[async_trait]
 pub trait SecretStore: Send + Sync {
-    async fn get(&self, provider: &str) -> XycliResult<Option<SecretString>>;
-    async fn set(&self, provider: &str, value: SecretString) -> XycliResult<()>;
-    async fn delete(&self, provider: &str) -> XycliResult<()>;
+    async fn get(&self, provider: &str) -> XduduResult<Option<SecretString>>;
+    async fn set(&self, provider: &str, value: SecretString) -> XduduResult<()>;
+    async fn delete(&self, provider: &str) -> XduduResult<()>;
 }
 ```
 
@@ -124,9 +124,9 @@ Provider 专用环境变量
 
 首期使用跨平台系统凭据库适配器；不支持系统凭据库时保留环境变量降级，不创建明文 secret 文件。新增命令：
 
-- `xycli auth login <provider>`：通过隐藏输入保存；
-- `xycli auth status`：只报告是否已配置；
-- `xycli auth logout <provider>`：删除凭据。
+- `xdudu auth login <provider>`：通过隐藏输入保存；
+- `xdudu auth status`：只报告是否已配置；
+- `xdudu auth logout <provider>`：删除凭据。
 
 测试必须验证 Debug、Display、错误和配置输出都不会包含完整密钥。
 
@@ -138,7 +138,7 @@ pub trait ProviderFactory {
         &self,
         config: &ProviderConfig,
         secret: SecretString,
-    ) -> XycliResult<Box<dyn Provider>>;
+    ) -> XduduResult<Box<dyn Provider>>;
 }
 ```
 
@@ -201,15 +201,15 @@ Provider 增加 `stream_chat`，输出统一的文本增量、工具参数增量
 新增命令面：
 
 ```text
-xycli [prompt]
-xycli run [prompt]
-xycli auth login|status|logout
-xycli config show|explain|set|path
-xycli doctor
-xycli --version
+xdudu [prompt]
+xdudu run [prompt]
+xdudu auth login|status|logout
+xdudu config show|explain|set|path
+xdudu doctor
+xdudu --version
 ```
 
-`cargo install --path crates/xycli-cli --locked` 是源码安装基线。CI 生成 macOS arm64/x86_64、Linux x86_64、Windows x86_64 二进制归档和 SHA-256 校验和；安装脚本只有在发布产物签名与校验流程确定后再提供。
+`cargo install --path crates/xdudu-cli --locked` 是源码安装基线。CI 生成 macOS arm64/x86_64、Linux x86_64、Windows x86_64 二进制归档和 SHA-256 校验和；安装脚本只有在发布产物签名与校验流程确定后再提供。
 
 ## 10. 测试与 CI
 
@@ -247,7 +247,7 @@ CI 矩阵：
 
 ## 12. v0.3.0 验收状态
 
-- [x] 支持通过 Cargo 全局安装并从任意工作区运行 `xycli`；
+- [x] 支持通过 Cargo 全局安装并从任意工作区运行 `xdudu`；
 - [x] API Key 可存入系统凭据库，秘密类型和输出均脱敏；
 - [x] CLI、环境、项目、用户和默认配置优先级有自动化测试；
 - [x] 两个 Provider 的流式文本和工具调用协议测试通过；

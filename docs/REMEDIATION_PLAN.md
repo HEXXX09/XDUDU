@@ -1,4 +1,4 @@
-# XYCLI M1 稳定化修复设计（历史归档）
+# XDUDU M1 稳定化修复设计（历史归档）
 
 > 状态：已完成并被 Rust 实现取代。本文仅记录迁移前发现的问题和决策依据，不代表当前模块、命令或构建方式；当前设计见 `DESIGN.md`。
 
@@ -91,7 +91,7 @@
 | Provider 错误 | 4 |
 | Tool 致命错误 | 5 |
 
-CLI 使用 `parseAsync()`，顶层统一捕获 `XycliError`。单次模式设置 `process.exitCode`，不再无条件 `process.exit(0)`。
+CLI 使用 `parseAsync()`，顶层统一捕获 `XduduError`。单次模式设置 `process.exitCode`，不再无条件 `process.exit(0)`。
 
 ## 6. 中断与 REPL
 

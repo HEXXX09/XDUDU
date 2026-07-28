@@ -1,14 +1,14 @@
-# XYCLI 任务路线图
+# XDUDU 任务路线图
 
-> 当前技术基线：Rust-only v0.3.0。
-> 状态更新时间：2026-07-21。
+> 当前技术基线：Rust-only v0.4.0。
+> 状态更新时间：2026-07-28。
 
 ## 规划调整
 
 路线图已按依赖和风险重新排序：
 
 - 配置、凭据、安装、事件协议和 CI 提前到 M2；
-- Provider 稳定性并入 M2，fallback 保留到 M3；
+- Provider 稳定性并入 M2；按当前产品决定，M3 Provider 扩展暂缓，近期只使用 DeepSeek 主路径；
 - 审批、脱敏、变更账本和撤销提前到新增 Web/MCP 等高风险能力之前；
 - SQLite 和上下文压缩先于跨会话记忆；
 - Computer Use 移出 1.0 主线，待安全、恢复和跨平台基础成熟后再评估。
@@ -18,10 +18,10 @@
 | 里程碑 | 目标 | 状态 |
 | --- | --- | --- |
 | M1 | Rust 核心迁移与旧 TS 退役 | 已完成 |
-| M2 | 产品化基础：配置、凭据、流式、CI | 本地完成，待远端 CI |
-| M3 | Provider 扩展与容错 | 下一阶段 |
-| M4 | 审批、脱敏、变更账本与撤销 | 待开始 |
-| M5 | SQLite、恢复与上下文管理 | 待开始 |
+| M2 | 产品化基础：配置、凭据、流式、CI | 已完成，CI 修复待分支推送验证 |
+| M3 | Provider 扩展与容错 | 暂缓，DeepSeek 优先 |
+| M4 | 审批、脱敏、变更账本与撤销 | 本地完成，待远端 CI |
+| M5 | SQLite、恢复与上下文管理 | 下一阶段 |
 | M6 | 搜索、Web 与 Git 专用工具 | 待开始 |
 | M7 | Plan 模式与任务执行 | 待开始 |
 | M8 | MCP 与插件 | 待开始 |
@@ -45,7 +45,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --all-targets
 cargo build --workspace --release
-./target/release/xycli --help
+./target/release/xdudu --help
 ```
 
 ## M2：产品化基础
@@ -67,6 +67,8 @@ M2 尚需建立 Pull Request 或合并到 `main`，由远端矩阵确认 macOS�
 
 ## M3：Provider 扩展与容错
 
+按 2026-07-28 的产品决策暂缓。本阶段不新增 Provider、不实现 fallback，保持 DeepSeek 为主用路径；以下任务保留为未来候选，不阻塞 M4、M5。
+
 - [ ] M3-T01：实现 OpenAI Provider；
 - [ ] M3-T02：实现 OpenAI-compatible 自定义网关；
 - [ ] M3-T03：实现 Provider 能力探测；
@@ -76,13 +78,15 @@ M2 尚需建立 Pull Request 或合并到 `main`，由远端矩阵确认 macOS�
 
 ## M4：审批、脱敏、变更账本与撤销
 
-- [ ] M4-T01：将 PermissionMode 演进为统一 Policy Engine；
-- [ ] M4-T02：定义副作用分类和 ApprovalGate；
-- [ ] M4-T03：实现交互审批、非交互默认拒绝和审批记录；
-- [ ] M4-T04：实现密钥、Token、私钥和用户规则脱敏；
-- [ ] M4-T05：实现会话级文件变化账本；
-- [ ] M4-T06：实现基于哈希保护的 `undo`；
-- [ ] M4-T07：完成审批、拒绝、脱敏、冲突和撤销 E2E。
+详细设计见 `SAFETY_GOVERNANCE_DESIGN.md`。
+
+- [x] M4-T01：在 ToolRegistry 建立“权限 → 校验 → 审批 → 执行 → 审计”统一策略链；
+- [x] M4-T02：定义副作用分类和 ApprovalGate；
+- [x] M4-T03：实现交互审批、非交互默认拒绝和审批记录；
+- [x] M4-T04：实现密钥、Token、私钥和敏感结构字段脱敏；
+- [x] M4-T05：实现会话级文件变化账本；
+- [x] M4-T06：实现基于哈希保护的 `undo`；
+- [x] M4-T07：完成审批、拒绝、脱敏、冲突和撤销 E2E。
 
 ## M5：SQLite、恢复与上下文管理
 

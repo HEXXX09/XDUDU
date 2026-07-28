@@ -2486,8 +2486,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "xycli"
-version = "0.3.0"
+name = "xdudu"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "clap",
@@ -2498,12 +2498,12 @@ dependencies = [
  "tokio",
  "tokio-util",
  "uuid",
- "xycli-core",
+ "xdudu-core",
 ]
 
 [[package]]
-name = "xycli-core"
-version = "0.3.0"
+name = "xdudu-core"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "chrono",

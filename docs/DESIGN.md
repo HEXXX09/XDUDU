@@ -63,7 +63,7 @@ pub trait SecretStore: Send + Sync {
 
 `KeyringSecretStore` 通过系统凭据服务读写，`auth login` 使用隐藏输入。运行时查找顺序是 Provider 专用环境变量优先、系统凭据其次。
 
-改名兼容策略为“新名称优先、旧名称只读”：优先读取 `xdudu` 凭据服务，缺失时读取 `xycli`；配置和会话同样可从旧位置读取，但更新统一写入 `xdudu` 与 `.xdudu`。
+改名兼容策略为“新名称优先、旧配置只读、旧凭据一次迁移”：优先读取 `xdudu` 凭据服务，缺失时读取 `xycli` 并立刻写入新的 `xdudu` 项；后续启动只访问新项。配置和会话可从旧位置读取，但更新统一写入 `.xdudu`。
 
 `SecretString` 使用可清零内存容器；Debug 和 Display 只输出脱敏内容。状态和配置命令只报告来源或是否存在，绝不输出原文。系统凭据不可用时返回可操作提示，不创建明文 secret 文件。
 

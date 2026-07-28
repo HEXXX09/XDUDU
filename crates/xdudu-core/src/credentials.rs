@@ -88,19 +88,38 @@ impl SecretStore for KeyringSecretStore {
     async fn get(&self, provider: &str) -> XduduResult<Option<SecretString>> {
         let provider = provider.to_owned();
         tokio::task::spawn_blocking(move || {
-            for service in [KEYRING_SERVICE, LEGACY_KEYRING_SERVICE] {
-                match entry(service, &provider)?.get_password() {
-                    Ok(value) => return SecretString::new(value).map(Some),
-                    Err(keyring::Error::NoEntry) => {}
-                    Err(error) => {
-                        return Err(XduduError::new(
-                            ErrorKind::ConfigError,
-                            format!("读取系统凭据失败：{error}"),
-                        ));
-                    }
+            match entry(KEYRING_SERVICE, &provider)?.get_password() {
+                Ok(value) => return SecretString::new(value).map(Some),
+                Err(keyring::Error::NoEntry) => {}
+                Err(error) => {
+                    return Err(XduduError::new(
+                        ErrorKind::ConfigError,
+                        format!("读取系统凭据失败：{error}"),
+                    ));
                 }
             }
-            Ok(None)
+
+            let legacy_secret = match entry(LEGACY_KEYRING_SERVICE, &provider)?.get_password() {
+                Ok(value) => SecretString::new(value)?,
+                Err(keyring::Error::NoEntry) => return Ok(None),
+                Err(error) => {
+                    return Err(XduduError::new(
+                        ErrorKind::ConfigError,
+                        format!(
+                            "读取旧 XYCLI 凭据失败：{error}。可运行 xdudu auth login {provider} 直接创建新凭据。"
+                        ),
+                    ));
+                }
+            };
+            entry(KEYRING_SERVICE, &provider)?
+                .set_password(legacy_secret.expose())
+                .map_err(|error| {
+                    XduduError::new(
+                        ErrorKind::ConfigError,
+                        format!("迁移旧 XYCLI 凭据到 XDUDU 失败：{error}"),
+                    )
+                })?;
+            Ok(Some(legacy_secret))
         })
         .await
         .map_err(|error| {

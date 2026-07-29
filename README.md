@@ -128,7 +128,7 @@ API Key 不属于普通配置。项目或用户 TOML 中出现 key、token、sec
 
 项目配置属于不可信输入：它不能设置 `provider.base_url`，也不能把用户级权限或审批策略调宽。自定义 Base URL 只能通过用户配置、环境变量或 CLI 显式提供。
 
-`v0.4.0` 改名兼容层会优先读取 `XDUDU_*`、`.xdudu` 和 `xdudu` 系统凭据；新位置不存在时，可继续读取原 `XYCLI_*` 环境变量、`.xycli` 配置/会话。首次读取旧 `xycli` 系统凭据时，macOS 可能要求确认一次，允许后会立即复制到新的 `xdudu` 钥匙串项，此后启动不再访问旧项。所有新增数据只写入新名称位置。
+`v0.4.0` 改名兼容层会优先读取 `XDUDU_*` 和 `.xdudu`；新位置不存在时，可继续读取原 `XYCLI_*` 环境变量和 `.xycli` 配置/会话。系统凭据沿用原 XYCLI 的原生 `keyring` 实现，仅把固定服务名改为 `xdudu`，不进行隐式跨服务迁移。首次使用时运行 `xdudu auth login deepseek` 创建 XDUDU 凭据。
 
 `v0.5.0` 首次启动会在事务中把旧 `.xdudu/sessions/json` 和 `.xycli/sessions/json` 会话导入 `.xdudu/xdudu.db`。旧文件不会删除，可作为迁移备份。
 
@@ -235,7 +235,6 @@ xdudu-core
 - [v0.3.0 阶段设计与验收](docs/NEXT_PHASE_DESIGN.md)
 - [v0.4.0 安全治理设计与验收](docs/SAFETY_GOVERNANCE_DESIGN.md)
 - [v0.5.0 会话恢复与上下文设计](docs/M5_SESSION_RECOVERY_DESIGN.md)
-- [M5 技术难点与实现细节](docs/M5_TECHNICAL_IMPLEMENTATION.md)
 - [产品需求](docs/PRD.md)
 - [任务路线图](docs/TASKS.md)
 - [Rust 迁移记录](docs/RUST_MIGRATION.md)

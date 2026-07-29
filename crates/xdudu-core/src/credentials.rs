@@ -8,7 +8,6 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::error::{ErrorKind, XduduError, XduduResult};
 
 const KEYRING_SERVICE: &str = "xdudu";
-const LEGACY_KEYRING_SERVICE: &str = "xycli";
 
 pub struct SecretString(Zeroizing<String>);
 
@@ -89,37 +88,13 @@ impl SecretStore for KeyringSecretStore {
         let provider = provider.to_owned();
         tokio::task::spawn_blocking(move || {
             match entry(KEYRING_SERVICE, &provider)?.get_password() {
-                Ok(value) => return SecretString::new(value).map(Some),
-                Err(keyring::Error::NoEntry) => {}
-                Err(error) => {
-                    return Err(XduduError::new(
-                        ErrorKind::ConfigError,
-                        format!("读取系统凭据失败：{error}"),
-                    ));
-                }
+                Ok(value) => SecretString::new(value).map(Some),
+                Err(keyring::Error::NoEntry) => Ok(None),
+                Err(error) => Err(XduduError::new(
+                    ErrorKind::ConfigError,
+                    format!("读取系统凭据失败：{error}"),
+                )),
             }
-
-            let legacy_secret = match entry(LEGACY_KEYRING_SERVICE, &provider)?.get_password() {
-                Ok(value) => SecretString::new(value)?,
-                Err(keyring::Error::NoEntry) => return Ok(None),
-                Err(error) => {
-                    return Err(XduduError::new(
-                        ErrorKind::ConfigError,
-                        format!(
-                            "读取旧 XYCLI 凭据失败：{error}。可运行 xdudu auth login {provider} 直接创建新凭据。"
-                        ),
-                    ));
-                }
-            };
-            entry(KEYRING_SERVICE, &provider)?
-                .set_password(legacy_secret.expose())
-                .map_err(|error| {
-                    XduduError::new(
-                        ErrorKind::ConfigError,
-                        format!("迁移旧 XYCLI 凭据到 XDUDU 失败：{error}"),
-                    )
-                })?;
-            Ok(Some(legacy_secret))
         })
         .await
         .map_err(|error| {
@@ -147,20 +122,14 @@ impl SecretStore for KeyringSecretStore {
     async fn delete(&self, provider: &str) -> XduduResult<bool> {
         let provider = provider.to_owned();
         tokio::task::spawn_blocking(move || {
-            let mut deleted = false;
-            for service in [KEYRING_SERVICE, LEGACY_KEYRING_SERVICE] {
-                match entry(service, &provider)?.delete_credential() {
-                    Ok(()) => deleted = true,
-                    Err(keyring::Error::NoEntry) => {}
-                    Err(error) => {
-                        return Err(XduduError::new(
-                            ErrorKind::ConfigError,
-                            format!("删除系统凭据失败：{error}"),
-                        ));
-                    }
-                }
+            match entry(KEYRING_SERVICE, &provider)?.delete_credential() {
+                Ok(()) => Ok(true),
+                Err(keyring::Error::NoEntry) => Ok(false),
+                Err(error) => Err(XduduError::new(
+                    ErrorKind::ConfigError,
+                    format!("删除系统凭据失败：{error}"),
+                )),
             }
-            Ok(deleted)
         })
         .await
         .map_err(|error| {

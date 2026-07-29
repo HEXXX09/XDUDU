@@ -2,3 +2,7 @@
 .xycli/
 target/
 .DS_Store
+
+# 本地学习资料：只供个人学习，不上传 GitHub
+docs/LEARNING_GUIDE.md
+docs/M5_TECHNICAL_IMPLEMENTATION.md

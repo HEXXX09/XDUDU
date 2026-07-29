@@ -191,6 +191,14 @@ pub fn config_paths(cwd: &Path) -> XduduResult<(PathBuf, PathBuf)> {
     Ok((user_config_path()?, cwd.join(".xdudu/config.toml")))
 }
 
+pub fn approval_rules_path() -> XduduResult<PathBuf> {
+    let config = user_config_path()?;
+    let parent = config
+        .parent()
+        .ok_or_else(|| config_error("用户配置路径缺少父目录。"))?;
+    Ok(parent.join("approval-rules.json"))
+}
+
 fn contains_secret_key(value: &Value) -> bool {
     match value {
         Value::Table(table) => table.iter().any(|(key, value)| {

@@ -4,7 +4,9 @@ use serde_json::json;
 use tempfile::tempdir;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-use xdudu_core::{AllowAllApprovalGate, PermissionMode, ToolRegistry, register_builtins};
+use xdudu_core::{
+    AllowAllApprovalGate, JsonChangeLedger, PermissionMode, ToolRegistry, register_builtins,
+};
 
 async fn execute(
     registry: &ToolRegistry,
@@ -51,10 +53,19 @@ async fn 默认审批策略拒绝副作用工具() {
 #[test]
 fn 内置工具定义完整() {
     let definitions = registry().definitions();
-    assert_eq!(definitions.len(), 3);
+    assert_eq!(definitions.len(), 8);
     assert_eq!(
         definitions.iter().map(|item| item.name).collect::<Vec<_>>(),
-        ["file_read", "file_write", "terminal_exec"]
+        [
+            "apply_patch",
+            "file_read",
+            "file_write",
+            "git_diff",
+            "git_status",
+            "search_text",
+            "terminal_exec",
+            "web_fetch"
+        ]
     );
 }
 
@@ -313,4 +324,181 @@ async fn full_access_仍然不经过_shell() {
     .await;
     assert!(result.success);
     assert!(!marker.exists());
+}
+
+#[tokio::test]
+async fn search_text_遵守忽略规则并返回_unicode_列号() {
+    let dir = tempdir().unwrap();
+    fs::create_dir_all(dir.path().join(".github/workflows")).unwrap();
+    fs::create_dir_all(dir.path().join("target")).unwrap();
+    fs::write(
+        dir.path().join(".github/workflows/ci.yml"),
+        "步骤：ToolRegistry\n",
+    )
+    .unwrap();
+    fs::write(dir.path().join("target/ignored.txt"), "ToolRegistry\n").unwrap();
+    let result = execute(
+        &registry(),
+        "search_text",
+        json!({"query":"ToolRegistry","path":".","mode":"literal"}),
+        dir.path(),
+        PermissionMode::ReadOnly,
+    )
+    .await;
+    assert!(result.success);
+    let output = result.output.unwrap();
+    assert_eq!(output["matches"].as_array().unwrap().len(), 1);
+    assert_eq!(output["matches"][0]["path"], ".github/workflows/ci.yml");
+    assert_eq!(output["matches"][0]["column"], 4);
+}
+
+#[tokio::test]
+async fn git_专用工具返回结构化状态和暂存差异() {
+    let dir = tempdir().unwrap();
+    let status = std::process::Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(dir.path())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    fs::write(dir.path().join("a.txt"), "hello\n").unwrap();
+    let status_result = execute(
+        &registry(),
+        "git_status",
+        json!({}),
+        dir.path(),
+        PermissionMode::ReadOnly,
+    )
+    .await;
+    assert!(status_result.success);
+    assert_eq!(
+        status_result.output.unwrap()["entries"][0]["kind"],
+        "untracked"
+    );
+    assert!(
+        std::process::Command::new("git")
+            .args(["add", "a.txt"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    let diff = execute(
+        &registry(),
+        "git_diff",
+        json!({"scope":"staged"}),
+        dir.path(),
+        PermissionMode::ReadOnly,
+    )
+    .await;
+    assert!(diff.success);
+    assert!(
+        diff.output.unwrap()["diff"]
+            .as_str()
+            .unwrap()
+            .contains("+hello")
+    );
+}
+
+#[tokio::test]
+async fn apply_patch_多文件事务可以整批撤销() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("a.txt"), "old\n").unwrap();
+    let mut registry = ToolRegistry::with_runtime(
+        Arc::new(AllowAllApprovalGate),
+        Arc::new(JsonChangeLedger::new(dir.path())),
+    );
+    register_builtins(&mut registry).unwrap();
+    let patch = "\
+--- a/a.txt
++++ b/a.txt
+@@ -1 +1 @@
+-old
++new
+--- /dev/null
++++ b/b.txt
+@@ -0,0 +1 @@
++created
+";
+    let result = execute(
+        &registry,
+        "apply_patch",
+        json!({"patch":patch}),
+        dir.path(),
+        PermissionMode::AutoSafe,
+    )
+    .await;
+    assert!(result.success, "{:?}", result.error);
+    assert_eq!(
+        fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "new\n"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("b.txt")).unwrap(),
+        "created\n"
+    );
+    let transaction = result.output.unwrap()["transactionId"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    JsonChangeLedger::new(dir.path())
+        .undo(Some(transaction), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "old\n"
+    );
+    assert!(!dir.path().join("b.txt").exists());
+}
+
+#[tokio::test]
+async fn apply_patch_上下文错误在审批前完成预检() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("a.txt"), "actual\n").unwrap();
+    let mut registry = ToolRegistry::new();
+    register_builtins(&mut registry).unwrap();
+    let patch = "\
+--- a/a.txt
++++ b/a.txt
+@@ -1 +1 @@
+-expected
++new
+";
+    let result = execute(
+        &registry,
+        "apply_patch",
+        json!({"patch":patch}),
+        dir.path(),
+        PermissionMode::AutoSafe,
+    )
+    .await;
+    assert_eq!(result.error.unwrap().code, "PATCH_CONTEXT_MISMATCH");
+    assert_eq!(
+        fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "actual\n"
+    );
+}
+
+#[tokio::test]
+async fn web_fetch_所有权限模式都必须经过网络审批() {
+    let dir = tempdir().unwrap();
+    for mode in [
+        PermissionMode::ReadOnly,
+        PermissionMode::AutoSafe,
+        PermissionMode::FullAccess,
+    ] {
+        let mut denied_registry = ToolRegistry::new();
+        register_builtins(&mut denied_registry).unwrap();
+        let denied = execute(
+            &denied_registry,
+            "web_fetch",
+            json!({"url":"https://example.com"}),
+            dir.path(),
+            mode,
+        )
+        .await;
+        assert_eq!(denied.error.unwrap().code, "APPROVAL_DENIED");
+    }
 }

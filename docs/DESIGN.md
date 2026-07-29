@@ -1,6 +1,6 @@
 # XDUDU 详细设计
 
-> 当前版本：Rust-only v0.5.0。本文描述已经实现并通过本地验收的设计边界。
+> 当前版本：Rust-only v0.6.0。本文描述已经实现并通过本地验收的设计边界。
 
 ## 1. 依赖方向
 
@@ -124,7 +124,7 @@ Idle → Planning → Acting → Observing
 任意运行态 → Completed | Incomplete | Interrupted | Error
 ```
 
-Agent 将状态、文本增量、工具开始、工具结束、用量和告警发送为 `AgentEvent`。Renderer 只是消费者，不能改变 Agent 领域状态。达到最大轮次或模型长度截断均为 `Incomplete`。
+Agent 将状态、文本增量、工具开始、工具进度、工具结束、用量和告警发送为 `AgentEvent`。每个工具调用拥有容量为 64 的非阻塞进度通道；通道满时丢弃中间更新，工具执行不能因 UI 变慢而阻塞。Renderer 只是消费者，不能改变 Agent 领域状态。达到最大轮次或模型长度截断均为 `Incomplete`。
 
 ## 8. Renderer
 
@@ -132,8 +132,8 @@ CLI Renderer 有三种输出策略：
 
 | 模式 | 行为 |
 | --- | --- |
-| 默认 | 文本增量立即写终端，工具事件给出状态提示 |
-| `--no-stream` | 缓存文本，在完成点统一输出 |
+| 默认 | 文本增量立即写终端，工具事件给出已脱敏的阶段提示 |
+| `--no-stream` | 缓存助手文本，但仍实时显示工具阶段 |
 | `--json` | 每个事件一行 JSON，末尾输出运行结果 |
 
 `--no-color` 和 `NO_COLOR` 禁用颜色。JSON 字段不包含 ANSI，并适合管道消费。CLI 的打印错误也不得包含 Secret 原文。
@@ -153,11 +153,21 @@ ToolRegistry 的固定顺序是：
   → 归一化 ToolResult
 ```
 
-`file_read` 仅访问工作区内路径并提供范围、截断和 SHA-256。`file_write` 支持 `expectedSha256` 冲突保护和原子写入。`terminal_exec` 只接受程序名与参数数组，不经过 shell，输出有界且可超时取消。
+`file_read` 仅访问工作区内路径并提供范围、截断和 SHA-256。`file_write` 支持 `expectedSha256` 冲突保护和事务写入。`terminal_exec` 只接受程序名与参数数组，不经过 shell，输出有界且可超时取消。
+
+`search_text` 在 Rust 进程内完成 literal/regex 搜索、Glob 过滤和 `.gitignore` 遍历。路径、单文件、扫描总量、返回行和输出 JSON 均有独立上限；列号按 Unicode 字符从 1 计算。
+
+`git_status` 固定执行 `git status --porcelain=v2 --branch -z` 并解析为结构化状态。`git_diff` 固定禁用外部 diff 与 textconv，并在 `--` 后追加经过校验的工作区相对路径。两者是可信只读工具，不经过进程执行审批，但仍校验 Git 仓库根位于工作区。
+
+`apply_patch` 先完整解析全部 unified diff，再读取前镜像、精确应用 hunk、检查并发哈希并准备 v2 事务。写入通过同目录临时文件和原子替换完成；任一提交或账本失败都会整批回滚，回滚本身失败则事务标记为 `Conflict`。
 
 权限使用显式矩阵，新增级别必须默认拒绝。项目配置、提示词和模型输出都不能提升 CLI 选择的权限。
 
-副作用分为 `none`、`workspace_write` 和 `process_execution`。默认 Gate 为拒绝；CLI 依据 `ask`、`never`、`always` 装配实现。`ask` 只有在可交互且非 JSON 的终端中读取确认，待审批输入先脱敏再展示。审批决定附加到工具结果并保存到会话。
+副作用分为 `none`、`workspace_write`、`process_execution` 和 `network_access`。默认 Gate 为拒绝；CLI 依据 `ask`、`never`、`always` 装配实现。`ask` 的交互选择包括 `once`、`session` 和 `always`：单次规则不缓存；会话规则以会话 UUID、工具名和副作用类型为键；永久规则以工具名和副作用类型为键，原子写入用户级 `approval-rules.json`。待审批输入先脱敏再展示，作用域随 `ApprovalRecord` 保存到会话；旧记录缺少作用域时按 `once` 读取。
+
+`xdudu approval list/revoke/clear` 用于管理永久规则。`never` 始终拒绝，显式全局 `--approval always` 仍表示调用方批准全部当前运行操作，不依赖细粒度规则。
+
+`web_fetch` 是只读工具，因此三种权限模式都可以提出调用；其 `NetworkAccess` 副作用始终进入 ApprovalGate，由 `ask`、`never`、`always` 单独决定是否联网。实现仅发起 GET，不转发代理凭据并禁用自动重定向；每一跳重新解析 DNS、拒绝任一非公网地址并把已验证地址固定给 reqwest，防止 DNS 重绑定。系统 DNS 使用代理 Fake-IP 时通过固定公网 DoH 获取真实记录，结果仍接受同一公网检查。响应只接受 HTML、纯文本和 JSON，大小、超时、重定向次数均有硬限制。
 
 ## 10. 会话、脱敏与变更账本
 
@@ -174,7 +184,7 @@ ToolRegistry 的固定顺序是：
 
 `redact_text` 和 `redact_value` 覆盖 `sk-`、GitHub Token、Bearer Token、PEM 私钥以及 key、token、secret、password、authorization 等敏感结构字段。会话保存、Renderer 和顶层错误共用该边界，避免只在 UI 层遮盖。
 
-`JsonChangeLedger` 保存 `file_write` 的前镜像、前后 SHA-256、会话 ID、工具调用 ID 和状态。账本失败时文件写入回滚。`undo` 在操作前重新校验工作区真实路径和当前哈希；不匹配时返回冲突错误，不覆盖用户的新修改。当前实现只覆盖 `file_write`，终端命令的外部副作用不可通用撤销。
+`JsonChangeLedger` 的新记录使用 `schemaVersion: 2`，一个工具调用只生成一个事务 ID。事务保存文件操作、原权限、前后镜像和 SHA-256，并经历 `Prepared → Applying → Applied`；失败可进入 `RolledBack`，用户冲突进入 `Conflict`，撤销后进入 `Undone`。启动恢复会检查未完成事务全部文件的当前哈希；只在内容可判定时恢复前镜像，不能判定时不覆盖用户文件。`undo` 先预检全部后哈希再整批恢复，同时保持 v1 单文件账本兼容。终端命令与网络访问的外部副作用不可通用撤销。
 
 ## 11. CLI 命令和退出码
 
@@ -200,9 +210,9 @@ xdudu --version
 
 ## 12. 测试分层
 
-1. 配置、凭据脱敏、审批、账本、事件、SSE 和重试单元测试；
+1. 配置、凭据脱敏、审批、事务账本、进度事件、SSE 和重试单元测试；
 2. MockProvider 驱动的 Agent 多轮、状态和会话测试；
-3. 路径逃逸、符号链接、哈希冲突、命令注入和权限测试；
+3. 路径逃逸、符号链接、哈希冲突、补丁原子性、Git 边界、SSRF、命令注入和权限测试；
 4. 本机临时 HTTP 服务验证两个 Provider 的请求与流式协议；
 5. 真实 CLI 进程验证参数、stdin、输出模式、doctor、审批、撤销和退出码；
 6. CI 在 macOS、Linux 和 Windows 运行质量门禁。
@@ -213,4 +223,4 @@ xdudu --version
 
 源码安装基线是 `cargo install --path crates/xdudu-cli --locked --force`。CI 执行 fmt、Clippy、全目标测试、Release 构建和安装检查；Release 工作流按平台打包二进制并生成 SHA-256。
 
-后续约束：Provider 扩展当前冻结；未来 fallback 不得跨工具副作用边界；审批发生在输入校验之后、副作用之前；MCP 和插件必须进入统一 ToolRegistry；SQLite 替换 JSON 时保持 `SessionStore` 与 `ChangeLedger` 边界；Computer Use 在审批、审计、恢复和跨平台发布成熟前不进入主线。
+后续约束：Provider 扩展当前冻结；未来 fallback 不得跨工具副作用边界；审批发生在输入校验之后、副作用之前；M7 Plan 只编排现有受控工具，不能创建绕过权限的执行通道；MCP 和插件必须进入统一 ToolRegistry；Computer Use 在审批、审计、恢复和跨平台发布成熟前不进入主线。

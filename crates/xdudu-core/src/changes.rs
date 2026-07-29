@@ -1,4 +1,4 @@
-//! 文件变更账本与基于哈希保护的安全撤销。
+//! 文件变更事务、崩溃恢复与基于哈希保护的整批撤销。
 
 use std::{
     path::{Path, PathBuf},
@@ -37,6 +37,7 @@ pub enum FileChangeStatus {
     Undone,
 }
 
+/// v1 单文件记录。保留反序列化能力，保证旧账本仍可撤销。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileChangeRecord {
@@ -55,16 +56,123 @@ pub struct FileChangeRecord {
     pub undone_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileOperation {
+    Created,
+    Modified,
+    Deleted,
+}
+
+impl FileOperation {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Created => "created",
+            Self::Modified => "modified",
+            Self::Deleted => "deleted",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ChangeSetFileDraft {
+    pub path: PathBuf,
+    pub operation: FileOperation,
+    pub pre_image: Option<Vec<u8>>,
+    pub post_image: Option<Vec<u8>>,
+    pub pre_image_sha256: Option<String>,
+    pub post_image_sha256: Option<String>,
+    pub pre_mode: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChangeSetDraft {
+    pub session_id: Uuid,
+    pub tool_call_id: Uuid,
+    pub files: Vec<ChangeSetFileDraft>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeSetStatus {
+    Prepared,
+    Applying,
+    Applied,
+    RolledBack,
+    Undone,
+    Conflict,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChangeSetFileRecord {
+    pub path: PathBuf,
+    pub operation: FileOperation,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pre_image_hex: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub post_image_hex: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pre_image_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub post_image_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pre_mode: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChangeSetRecord {
+    pub schema_version: u32,
+    pub id: Uuid,
+    pub session_id: Uuid,
+    pub tool_call_id: Uuid,
+    pub files: Vec<ChangeSetFileRecord>,
+    pub status: ChangeSetStatus,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub undone_at: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Clone)]
 pub struct UndoResult {
     pub change_id: Uuid,
-    pub path: PathBuf,
-    pub removed_created_file: bool,
+    pub paths: Vec<PathBuf>,
+    pub removed_created_files: usize,
 }
 
 #[async_trait]
 pub trait ChangeLedger: Send + Sync {
-    async fn record_file_change(&self, draft: FileChangeDraft) -> XduduResult<Option<Uuid>>;
+    async fn prepare_change_set(&self, draft: ChangeSetDraft) -> XduduResult<Option<Uuid>>;
+    async fn set_change_set_status(&self, id: Uuid, status: ChangeSetStatus) -> XduduResult<()>;
+
+    async fn record_file_change(&self, draft: FileChangeDraft) -> XduduResult<Option<Uuid>> {
+        let id = self
+            .prepare_change_set(ChangeSetDraft {
+                session_id: draft.session_id,
+                tool_call_id: draft.tool_call_id,
+                files: vec![ChangeSetFileDraft {
+                    path: draft.path,
+                    operation: if draft.pre_image.is_some() {
+                        FileOperation::Modified
+                    } else {
+                        FileOperation::Created
+                    },
+                    pre_image: draft.pre_image,
+                    post_image: None,
+                    pre_image_sha256: draft.pre_image_sha256,
+                    post_image_sha256: Some(draft.post_image_sha256),
+                    pre_mode: None,
+                }],
+            })
+            .await?;
+        if let Some(id) = id {
+            self.set_change_set_status(id, ChangeSetStatus::Applied)
+                .await?;
+        }
+        Ok(id)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -72,9 +180,20 @@ pub struct NoopChangeLedger;
 
 #[async_trait]
 impl ChangeLedger for NoopChangeLedger {
-    async fn record_file_change(&self, _draft: FileChangeDraft) -> XduduResult<Option<Uuid>> {
+    async fn prepare_change_set(&self, _draft: ChangeSetDraft) -> XduduResult<Option<Uuid>> {
         Ok(None)
     }
+
+    async fn set_change_set_status(&self, _id: Uuid, _status: ChangeSetStatus) -> XduduResult<()> {
+        Ok(())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RecordVersion {
+    #[serde(default)]
+    schema_version: u32,
 }
 
 pub struct JsonChangeLedger {
@@ -105,10 +224,10 @@ impl JsonChangeLedger {
         self.changes_dir.join(format!("{id}.json"))
     }
 
-    async fn atomic_write_record(&self, record: &FileChangeRecord) -> XduduResult<()> {
+    async fn atomic_write<T: Serialize>(&self, id: Uuid, record: &T) -> XduduResult<()> {
         let _guard = self.write_lock.lock().await;
         fs::create_dir_all(&self.changes_dir).await?;
-        let path = self.record_path(record.id);
+        let path = self.record_path(id);
         let temporary = path.with_extension(format!("json.{}.tmp", Uuid::new_v4()));
         let data = serde_json::to_vec_pretty(record)?;
         if let Err(error) = async {
@@ -128,15 +247,37 @@ impl JsonChangeLedger {
         Ok(())
     }
 
-    async fn read_record(&self, id: Uuid) -> XduduResult<Option<FileChangeRecord>> {
+    async fn read_bytes(&self, id: Uuid) -> XduduResult<Option<Vec<u8>>> {
         match fs::read(self.record_path(id)).await {
-            Ok(data) => Ok(Some(serde_json::from_slice(&data)?)),
+            Ok(data) => Ok(Some(data)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(XduduError::tool(format!("读取变更记录失败：{error}"))),
         }
     }
 
-    pub async fn list(&self, session_id: Option<Uuid>) -> XduduResult<Vec<FileChangeRecord>> {
+    async fn read_change_set(&self, id: Uuid) -> XduduResult<Option<ChangeSetRecord>> {
+        let Some(data) = self.read_bytes(id).await? else {
+            return Ok(None);
+        };
+        let version: RecordVersion = serde_json::from_slice(&data)?;
+        if version.schema_version != 2 {
+            return Ok(None);
+        }
+        Ok(Some(serde_json::from_slice(&data)?))
+    }
+
+    async fn read_legacy(&self, id: Uuid) -> XduduResult<Option<FileChangeRecord>> {
+        let Some(data) = self.read_bytes(id).await? else {
+            return Ok(None);
+        };
+        let version: RecordVersion = serde_json::from_slice(&data)?;
+        if version.schema_version == 2 {
+            return Ok(None);
+        }
+        Ok(Some(serde_json::from_slice(&data)?))
+    }
+
+    async fn all_record_bytes(&self) -> XduduResult<Vec<Vec<u8>>> {
         let mut entries = match fs::read_dir(&self.changes_dir).await {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -147,18 +288,14 @@ impl JsonChangeLedger {
             if entry.path().extension().and_then(|value| value.to_str()) != Some("json") {
                 continue;
             }
-            if let Ok(data) = fs::read(entry.path()).await
-                && let Ok(record) = serde_json::from_slice::<FileChangeRecord>(&data)
-                && session_id.is_none_or(|session_id| record.session_id == session_id)
-            {
-                records.push(record);
+            if let Ok(data) = fs::read(entry.path()).await {
+                records.push(data);
             }
         }
-        records.sort_by_key(|record| std::cmp::Reverse(record.created_at));
         Ok(records)
     }
 
-    async fn resolve_current_file(&self, relative: &Path) -> XduduResult<PathBuf> {
+    async fn safe_target(&self, relative: &Path) -> XduduResult<PathBuf> {
         if relative.is_absolute()
             || relative
                 .components()
@@ -166,41 +303,265 @@ impl JsonChangeLedger {
         {
             return Err(XduduError::new(
                 ErrorKind::PermissionDenied,
-                "变更记录包含不安全路径，拒绝撤销。",
+                "变更记录包含不安全路径，拒绝操作。",
             ));
         }
         let root = fs::canonicalize(&self.cwd).await?;
-        let target = fs::canonicalize(self.cwd.join(relative))
-            .await
-            .map_err(|error| XduduError::tool(format!("撤销目标不存在或不可访问：{error}")))?;
-        if !target.starts_with(&root) {
+        let candidate = root.join(relative);
+        let mut ancestor = candidate.as_path();
+        while !ancestor.exists() {
+            ancestor = ancestor
+                .parent()
+                .ok_or_else(|| XduduError::tool("变更路径缺少安全父目录。"))?;
+        }
+        let real_ancestor = fs::canonicalize(ancestor).await?;
+        if !real_ancestor.starts_with(&root) {
             return Err(XduduError::new(
                 ErrorKind::PermissionDenied,
-                "撤销目标已经指向工作区外部，拒绝操作。",
+                "变更目标已经指向工作区外部，拒绝操作。",
             ));
         }
-        Ok(target)
+        let suffix = candidate
+            .strip_prefix(ancestor)
+            .map_err(|_| XduduError::tool("无法解析变更目标路径。"))?;
+        if suffix.as_os_str().is_empty() {
+            Ok(real_ancestor)
+        } else {
+            Ok(real_ancestor.join(suffix))
+        }
     }
 
-    pub async fn undo(
+    async fn current_hash(&self, path: &Path) -> XduduResult<Option<String>> {
+        match fs::read(path).await {
+            Ok(bytes) => Ok(Some(sha256(&bytes))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(XduduError::tool(format!(
+                "读取变更目标失败 {}：{error}",
+                path.display()
+            ))),
+        }
+    }
+
+    async fn write_state(
         &self,
-        change_id: Option<Uuid>,
+        path: &Path,
+        image_hex: Option<&str>,
+        mode: Option<u32>,
+    ) -> XduduResult<()> {
+        if let Some(image_hex) = image_hex {
+            let bytes = hex::decode(image_hex)
+                .map_err(|error| XduduError::tool(format!("变更镜像损坏：{error}")))?;
+            let parent = path
+                .parent()
+                .ok_or_else(|| XduduError::tool("变更目标缺少父目录。"))?;
+            fs::create_dir_all(parent).await?;
+            let temporary = path.with_extension(format!("xdudu-restore-{}", Uuid::new_v4()));
+            fs::write(&temporary, bytes).await?;
+            #[cfg(unix)]
+            if let Some(mode) = mode {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&temporary, std::fs::Permissions::from_mode(mode)).await?;
+            }
+            #[cfg(windows)]
+            if fs::try_exists(path).await.unwrap_or(false) {
+                fs::remove_file(path).await?;
+            }
+            fs::rename(&temporary, path).await?;
+        } else {
+            match fs::remove_file(path).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+
+    async fn set_record_status(
+        &self,
+        mut record: ChangeSetRecord,
+        status: ChangeSetStatus,
+    ) -> XduduResult<()> {
+        record.status = status;
+        record.updated_at = Utc::now();
+        if status == ChangeSetStatus::Undone {
+            record.undone_at = Some(Utc::now());
+        }
+        self.atomic_write(record.id, &record).await
+    }
+
+    pub async fn recover_incomplete(&self) -> XduduResult<usize> {
+        let records = self.all_record_bytes().await?;
+        let mut recovered = 0;
+        let mut conflicts = Vec::new();
+        for data in records {
+            let Ok(version) = serde_json::from_slice::<RecordVersion>(&data) else {
+                continue;
+            };
+            if version.schema_version != 2 {
+                continue;
+            }
+            let mut record: ChangeSetRecord = serde_json::from_slice(&data)?;
+            if !matches!(
+                record.status,
+                ChangeSetStatus::Prepared | ChangeSetStatus::Applying
+            ) {
+                continue;
+            }
+            let mut safe = true;
+            for file in &record.files {
+                let target = self.safe_target(&file.path).await?;
+                let current = self.current_hash(&target).await?;
+                if current != file.pre_image_sha256 && current != file.post_image_sha256 {
+                    safe = false;
+                    break;
+                }
+            }
+            if !safe {
+                record.status = ChangeSetStatus::Conflict;
+                record.updated_at = Utc::now();
+                self.atomic_write(record.id, &record).await?;
+                conflicts.push(record.id);
+                continue;
+            }
+            let mut restore_error = None;
+            for file in &record.files {
+                let target = self.safe_target(&file.path).await?;
+                if let Err(error) = self
+                    .write_state(&target, file.pre_image_hex.as_deref(), file.pre_mode)
+                    .await
+                {
+                    restore_error = Some(error);
+                    break;
+                }
+            }
+            if let Some(error) = restore_error {
+                record.status = ChangeSetStatus::Conflict;
+                record.updated_at = Utc::now();
+                self.atomic_write(record.id, &record).await?;
+                return Err(XduduError::tool(format!(
+                    "恢复未完成事务 {} 失败，已标记为冲突：{}",
+                    record.id, error.message
+                )));
+            }
+            record.status = ChangeSetStatus::RolledBack;
+            record.updated_at = Utc::now();
+            self.atomic_write(record.id, &record).await?;
+            recovered += 1;
+        }
+        if !conflicts.is_empty() {
+            return Err(XduduError::tool(format!(
+                "发现无法自动恢复的变更事务，已标记为冲突：{}。请先检查相关文件。",
+                conflicts
+                    .iter()
+                    .map(Uuid::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+        Ok(recovered)
+    }
+
+    async fn latest_candidate(
+        &self,
+        session_id: Option<Uuid>,
+    ) -> XduduResult<Option<(Uuid, DateTime<Utc>, bool)>> {
+        let mut candidates = Vec::new();
+        for data in self.all_record_bytes().await? {
+            let version: RecordVersion = match serde_json::from_slice(&data) {
+                Ok(version) => version,
+                Err(_) => continue,
+            };
+            if version.schema_version == 2 {
+                if let Ok(record) = serde_json::from_slice::<ChangeSetRecord>(&data)
+                    && record.status == ChangeSetStatus::Applied
+                    && session_id.is_none_or(|id| id == record.session_id)
+                {
+                    candidates.push((record.id, record.created_at, true));
+                }
+            } else if let Ok(record) = serde_json::from_slice::<FileChangeRecord>(&data)
+                && record.status == FileChangeStatus::Applied
+                && session_id.is_none_or(|id| id == record.session_id)
+            {
+                candidates.push((record.id, record.created_at, false));
+            }
+        }
+        candidates.sort_by_key(|(_, created_at, _)| std::cmp::Reverse(*created_at));
+        Ok(candidates.into_iter().next())
+    }
+
+    async fn undo_change_set(
+        &self,
+        mut record: ChangeSetRecord,
         session_id: Option<Uuid>,
     ) -> XduduResult<UndoResult> {
-        let mut record = if let Some(change_id) = change_id {
-            self.read_record(change_id)
-                .await?
-                .ok_or_else(|| XduduError::validation(format!("找不到变更记录：{change_id}")))?
-        } else {
-            self.list(session_id)
-                .await?
-                .into_iter()
-                .find(|record| record.status == FileChangeStatus::Applied)
-                .ok_or_else(|| XduduError::validation("没有可撤销的文件变更。"))?
-        };
-        if let Some(session_id) = session_id
-            && record.session_id != session_id
-        {
+        if session_id.is_some_and(|id| id != record.session_id) {
+            return Err(XduduError::validation(
+                "指定变更不属于要求的会话，拒绝撤销。",
+            ));
+        }
+        if record.status != ChangeSetStatus::Applied {
+            return Err(XduduError::validation("该变更事务当前不可撤销。"));
+        }
+        let mut targets = Vec::new();
+        for file in &record.files {
+            let target = self.safe_target(&file.path).await?;
+            let current = self.current_hash(&target).await?;
+            if current != file.post_image_sha256 {
+                return Err(XduduError::tool(format!(
+                    "文件在 Agent 写入后又发生变化，拒绝整批撤销：{}。",
+                    file.path.display()
+                )));
+            }
+            targets.push(target);
+        }
+        let mut restored: Vec<usize> = Vec::new();
+        for (index, file) in record.files.iter().enumerate() {
+            if let Err(error) = self
+                .write_state(
+                    &targets[index],
+                    file.pre_image_hex.as_deref(),
+                    file.pre_mode,
+                )
+                .await
+            {
+                for previous in restored.into_iter().rev() {
+                    let previous_file: &ChangeSetFileRecord = &record.files[previous];
+                    let _ = self
+                        .write_state(
+                            &targets[previous],
+                            previous_file.post_image_hex.as_deref(),
+                            previous_file.pre_mode,
+                        )
+                        .await;
+                }
+                return Err(XduduError::tool(format!(
+                    "撤销事务失败，已尽力恢复撤销前状态：{error}"
+                )));
+            }
+            restored.push(index);
+        }
+        record.status = ChangeSetStatus::Undone;
+        record.updated_at = Utc::now();
+        record.undone_at = Some(Utc::now());
+        self.atomic_write(record.id, &record).await?;
+        Ok(UndoResult {
+            change_id: record.id,
+            paths: record.files.iter().map(|file| file.path.clone()).collect(),
+            removed_created_files: record
+                .files
+                .iter()
+                .filter(|file| file.operation == FileOperation::Created)
+                .count(),
+        })
+    }
+
+    async fn undo_legacy(
+        &self,
+        mut record: FileChangeRecord,
+        session_id: Option<Uuid>,
+    ) -> XduduResult<UndoResult> {
+        if session_id.is_some_and(|id| id != record.session_id) {
             return Err(XduduError::validation(
                 "指定变更不属于要求的会话，拒绝撤销。",
             ));
@@ -208,70 +569,99 @@ impl JsonChangeLedger {
         if record.status != FileChangeStatus::Applied {
             return Err(XduduError::validation("该变更已经撤销。"));
         }
-        let target = self.resolve_current_file(&record.path).await?;
-        let current = fs::read(&target).await?;
-        let actual_hash = sha256(&current);
-        if actual_hash != record.post_image_sha256 {
+        let target = self.safe_target(&record.path).await?;
+        if self.current_hash(&target).await?.as_deref() != Some(&record.post_image_sha256) {
             return Err(XduduError::tool(format!(
-                "文件在 Agent 写入后又发生变化，拒绝撤销：{}；记录哈希 {}，当前哈希 {}。",
-                record.path.display(),
-                record.post_image_sha256,
-                actual_hash
+                "文件在 Agent 写入后又发生变化，拒绝撤销：{}。",
+                record.path.display()
             )));
         }
-        let removed_created_file = if let Some(pre_image_hex) = &record.pre_image_hex {
-            let pre_image = hex::decode(pre_image_hex)
-                .map_err(|error| XduduError::tool(format!("变更前镜像损坏：{error}")))?;
-            let pre_image_hash = sha256(&pre_image);
-            if record.pre_image_sha256.as_deref() != Some(pre_image_hash.as_str()) {
-                return Err(XduduError::tool("变更前镜像哈希不匹配，拒绝撤销。"));
-            }
-            let temporary = target.with_extension(format!("xdudu-undo-{}", Uuid::new_v4()));
-            if let Err(error) = async {
-                fs::write(&temporary, pre_image).await?;
-                #[cfg(windows)]
-                fs::remove_file(&target).await?;
-                fs::rename(&temporary, &target).await
-            }
-            .await
-            {
-                let _ = fs::remove_file(&temporary).await;
-                return Err(XduduError::tool(format!("恢复文件失败：{error}")));
-            }
-            false
-        } else {
-            fs::remove_file(&target).await?;
-            true
-        };
+        self.write_state(&target, record.pre_image_hex.as_deref(), None)
+            .await?;
         record.status = FileChangeStatus::Undone;
         record.undone_at = Some(Utc::now());
-        self.atomic_write_record(&record).await?;
+        self.atomic_write(record.id, &record).await?;
         Ok(UndoResult {
             change_id: record.id,
-            path: record.path,
-            removed_created_file,
+            paths: vec![record.path],
+            removed_created_files: usize::from(record.pre_image_hex.is_none()),
         })
+    }
+
+    pub async fn undo(
+        &self,
+        change_id: Option<Uuid>,
+        session_id: Option<Uuid>,
+    ) -> XduduResult<UndoResult> {
+        let (id, is_v2) = if let Some(id) = change_id {
+            let Some(data) = self.read_bytes(id).await? else {
+                return Err(XduduError::validation(format!("找不到变更记录：{id}")));
+            };
+            let version: RecordVersion = serde_json::from_slice(&data)?;
+            (id, version.schema_version == 2)
+        } else {
+            let Some((id, _, is_v2)) = self.latest_candidate(session_id).await? else {
+                return Err(XduduError::validation("没有可撤销的文件变更。"));
+            };
+            (id, is_v2)
+        };
+        if is_v2 {
+            let record = self
+                .read_change_set(id)
+                .await?
+                .ok_or_else(|| XduduError::validation(format!("找不到变更事务：{id}")))?;
+            self.undo_change_set(record, session_id).await
+        } else {
+            let record = self
+                .read_legacy(id)
+                .await?
+                .ok_or_else(|| XduduError::validation(format!("找不到变更记录：{id}")))?;
+            self.undo_legacy(record, session_id).await
+        }
     }
 }
 
 #[async_trait]
 impl ChangeLedger for JsonChangeLedger {
-    async fn record_file_change(&self, draft: FileChangeDraft) -> XduduResult<Option<Uuid>> {
+    async fn prepare_change_set(&self, draft: ChangeSetDraft) -> XduduResult<Option<Uuid>> {
+        if draft.files.is_empty() {
+            return Err(XduduError::tool("变更事务不能为空。"));
+        }
         let id = Uuid::new_v4();
-        let record = FileChangeRecord {
+        let now = Utc::now();
+        let record = ChangeSetRecord {
+            schema_version: 2,
             id,
             session_id: draft.session_id,
             tool_call_id: draft.tool_call_id,
-            path: draft.path,
-            pre_image_hex: draft.pre_image.map(hex::encode),
-            pre_image_sha256: draft.pre_image_sha256,
-            post_image_sha256: draft.post_image_sha256,
-            status: FileChangeStatus::Applied,
-            created_at: Utc::now(),
+            files: draft
+                .files
+                .into_iter()
+                .map(|file| ChangeSetFileRecord {
+                    path: file.path,
+                    operation: file.operation,
+                    pre_image_hex: file.pre_image.map(hex::encode),
+                    post_image_hex: file.post_image.map(hex::encode),
+                    pre_image_sha256: file.pre_image_sha256,
+                    post_image_sha256: file.post_image_sha256,
+                    pre_mode: file.pre_mode,
+                })
+                .collect(),
+            status: ChangeSetStatus::Prepared,
+            created_at: now,
+            updated_at: now,
             undone_at: None,
         };
-        self.atomic_write_record(&record).await?;
+        self.atomic_write(id, &record).await?;
         Ok(Some(id))
+    }
+
+    async fn set_change_set_status(&self, id: Uuid, status: ChangeSetStatus) -> XduduResult<()> {
+        let record = self
+            .read_change_set(id)
+            .await?
+            .ok_or_else(|| XduduError::tool(format!("找不到变更事务：{id}")))?;
+        self.set_record_status(record, status).await
     }
 }
 
@@ -281,56 +671,181 @@ mod tests {
 
     use super::*;
 
-    async fn record(
-        ledger: &JsonChangeLedger,
-        path: &str,
-        before: Option<&[u8]>,
-        after: &[u8],
-    ) -> Uuid {
-        ledger
-            .record_file_change(FileChangeDraft {
+    #[tokio::test]
+    async fn v2_事务可以整批撤销() {
+        let dir = tempdir().unwrap();
+        let ledger = JsonChangeLedger::with_dir(dir.path(), dir.path().join("ledger"));
+        fs::write(dir.path().join("a.txt"), b"after").await.unwrap();
+        fs::write(dir.path().join("b.txt"), b"created")
+            .await
+            .unwrap();
+        let id = ledger
+            .prepare_change_set(ChangeSetDraft {
                 session_id: Uuid::new_v4(),
                 tool_call_id: Uuid::new_v4(),
-                path: PathBuf::from(path),
-                pre_image: before.map(ToOwned::to_owned),
-                pre_image_sha256: before.map(sha256),
-                post_image_sha256: sha256(after),
+                files: vec![
+                    ChangeSetFileDraft {
+                        path: "a.txt".into(),
+                        operation: FileOperation::Modified,
+                        pre_image: Some(b"before".to_vec()),
+                        post_image: Some(b"after".to_vec()),
+                        pre_image_sha256: Some(sha256(b"before")),
+                        post_image_sha256: Some(sha256(b"after")),
+                        pre_mode: None,
+                    },
+                    ChangeSetFileDraft {
+                        path: "b.txt".into(),
+                        operation: FileOperation::Created,
+                        pre_image: None,
+                        post_image: Some(b"created".to_vec()),
+                        pre_image_sha256: None,
+                        post_image_sha256: Some(sha256(b"created")),
+                        pre_mode: None,
+                    },
+                ],
             })
             .await
             .unwrap()
+            .unwrap();
+        ledger
+            .set_change_set_status(id, ChangeSetStatus::Applied)
+            .await
+            .unwrap();
+        let result = ledger.undo(Some(id), None).await.unwrap();
+        assert_eq!(result.paths.len(), 2);
+        assert_eq!(fs::read(dir.path().join("a.txt")).await.unwrap(), b"before");
+        assert!(!dir.path().join("b.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn 任一文件冲突时整批不撤销() {
+        let dir = tempdir().unwrap();
+        let ledger = JsonChangeLedger::with_dir(dir.path(), dir.path().join("ledger"));
+        fs::write(dir.path().join("a.txt"), b"after").await.unwrap();
+        let id = ledger
+            .prepare_change_set(ChangeSetDraft {
+                session_id: Uuid::new_v4(),
+                tool_call_id: Uuid::new_v4(),
+                files: vec![ChangeSetFileDraft {
+                    path: "a.txt".into(),
+                    operation: FileOperation::Modified,
+                    pre_image: Some(b"before".to_vec()),
+                    post_image: Some(b"after".to_vec()),
+                    pre_image_sha256: Some(sha256(b"before")),
+                    post_image_sha256: Some(sha256(b"after")),
+                    pre_mode: None,
+                }],
+            })
+            .await
             .unwrap()
-    }
-
-    #[tokio::test]
-    async fn 撤销恢复旧文件并删除新文件() {
-        let dir = tempdir().unwrap();
-        let ledger = JsonChangeLedger::with_dir(dir.path(), dir.path().join("ledger"));
-        fs::write(dir.path().join("existing.txt"), b"after")
+            .unwrap();
+        ledger
+            .set_change_set_status(id, ChangeSetStatus::Applied)
             .await
             .unwrap();
-        let existing = record(&ledger, "existing.txt", Some(b"before"), b"after").await;
-        ledger.undo(Some(existing), None).await.unwrap();
-        assert_eq!(
-            fs::read(dir.path().join("existing.txt")).await.unwrap(),
-            b"before"
-        );
-
-        fs::write(dir.path().join("created.txt"), b"created")
-            .await
-            .unwrap();
-        let created = record(&ledger, "created.txt", None, b"created").await;
-        ledger.undo(Some(created), None).await.unwrap();
-        assert!(!dir.path().join("created.txt").exists());
-    }
-
-    #[tokio::test]
-    async fn 文件被用户修改后拒绝撤销() {
-        let dir = tempdir().unwrap();
-        let ledger = JsonChangeLedger::with_dir(dir.path(), dir.path().join("ledger"));
-        fs::write(dir.path().join("a.txt"), b"agent").await.unwrap();
-        let id = record(&ledger, "a.txt", Some(b"before"), b"agent").await;
         fs::write(dir.path().join("a.txt"), b"user").await.unwrap();
         assert!(ledger.undo(Some(id), None).await.is_err());
         assert_eq!(fs::read(dir.path().join("a.txt")).await.unwrap(), b"user");
+    }
+
+    #[tokio::test]
+    async fn 启动时回滚未完成事务() {
+        let dir = tempdir().unwrap();
+        let ledger = JsonChangeLedger::with_dir(dir.path(), dir.path().join("ledger"));
+        fs::write(dir.path().join("a.txt"), b"after").await.unwrap();
+        let id = ledger
+            .prepare_change_set(ChangeSetDraft {
+                session_id: Uuid::new_v4(),
+                tool_call_id: Uuid::new_v4(),
+                files: vec![ChangeSetFileDraft {
+                    path: "a.txt".into(),
+                    operation: FileOperation::Modified,
+                    pre_image: Some(b"before".to_vec()),
+                    post_image: Some(b"after".to_vec()),
+                    pre_image_sha256: Some(sha256(b"before")),
+                    post_image_sha256: Some(sha256(b"after")),
+                    pre_mode: None,
+                }],
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        ledger
+            .set_change_set_status(id, ChangeSetStatus::Applying)
+            .await
+            .unwrap();
+
+        assert_eq!(ledger.recover_incomplete().await.unwrap(), 1);
+        assert_eq!(fs::read(dir.path().join("a.txt")).await.unwrap(), b"before");
+        assert_eq!(
+            ledger.read_change_set(id).await.unwrap().unwrap().status,
+            ChangeSetStatus::RolledBack
+        );
+    }
+
+    #[tokio::test]
+    async fn 启动恢复遇到用户修改时标记冲突并阻止继续() {
+        let dir = tempdir().unwrap();
+        let ledger = JsonChangeLedger::with_dir(dir.path(), dir.path().join("ledger"));
+        fs::write(dir.path().join("a.txt"), b"user").await.unwrap();
+        let id = ledger
+            .prepare_change_set(ChangeSetDraft {
+                session_id: Uuid::new_v4(),
+                tool_call_id: Uuid::new_v4(),
+                files: vec![ChangeSetFileDraft {
+                    path: "a.txt".into(),
+                    operation: FileOperation::Modified,
+                    pre_image: Some(b"before".to_vec()),
+                    post_image: Some(b"after".to_vec()),
+                    pre_image_sha256: Some(sha256(b"before")),
+                    post_image_sha256: Some(sha256(b"after")),
+                    pre_mode: None,
+                }],
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(ledger.recover_incomplete().await.is_err());
+        assert_eq!(fs::read(dir.path().join("a.txt")).await.unwrap(), b"user");
+        assert_eq!(
+            ledger.read_change_set(id).await.unwrap().unwrap().status,
+            ChangeSetStatus::Conflict
+        );
+    }
+
+    #[tokio::test]
+    async fn v1_旧账本仍可撤销() {
+        let dir = tempdir().unwrap();
+        let ledger = JsonChangeLedger::with_dir(dir.path(), dir.path().join("ledger"));
+        fs::create_dir_all(dir.path().join("ledger")).await.unwrap();
+        fs::write(dir.path().join("legacy.txt"), b"after")
+            .await
+            .unwrap();
+        let id = Uuid::new_v4();
+        let record = FileChangeRecord {
+            id,
+            session_id: Uuid::new_v4(),
+            tool_call_id: Uuid::new_v4(),
+            path: "legacy.txt".into(),
+            pre_image_hex: Some(hex::encode(b"before")),
+            pre_image_sha256: Some(sha256(b"before")),
+            post_image_sha256: sha256(b"after"),
+            status: FileChangeStatus::Applied,
+            created_at: Utc::now(),
+            undone_at: None,
+        };
+        fs::write(
+            ledger.record_path(id),
+            serde_json::to_vec_pretty(&record).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        ledger.undo(Some(id), None).await.unwrap();
+        assert_eq!(
+            fs::read(dir.path().join("legacy.txt")).await.unwrap(),
+            b"before"
+        );
     }
 }

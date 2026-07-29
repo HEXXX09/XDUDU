@@ -91,6 +91,29 @@ impl EventSink for ConsoleRenderer {
             AgentEvent::ToolStarted { name, .. } => {
                 eprintln!("\n  {} {name}", self.style("36", "→"));
             }
+            AgentEvent::ToolProgress {
+                name,
+                phase,
+                completed,
+                total,
+                unit,
+                message,
+                ..
+            } => {
+                let count = match (completed, total, unit.as_deref()) {
+                    (Some(completed), Some(total), Some(unit)) => {
+                        format!(" {completed}/{total} {unit}")
+                    }
+                    (Some(completed), None, Some(unit)) => format!(" {completed} {unit}"),
+                    _ => String::new(),
+                };
+                let message = message
+                    .as_deref()
+                    .map(redact_text)
+                    .map(|message| format!("：{message}"))
+                    .unwrap_or_default();
+                eprintln!("  {} {name}/{phase}{count}{message}", self.style("36", "·"));
+            }
             AgentEvent::ToolFinished { name, result, .. } => {
                 let marker = if result.success {
                     self.style("32", "✓")

@@ -18,6 +18,15 @@ pub enum AgentEvent {
         call_id: String,
         name: String,
     },
+    ToolProgress {
+        call_id: String,
+        name: String,
+        phase: String,
+        completed: Option<u64>,
+        total: Option<u64>,
+        unit: Option<String>,
+        message: Option<String>,
+    },
     ToolFinished {
         call_id: String,
         name: String,
@@ -63,5 +72,23 @@ mod tests {
         .unwrap();
         assert_eq!(value["type"], "assistant_delta");
         assert_eq!(value["text"], "你好");
+    }
+
+    #[test]
+    fn 工具进度序列化为稳定事件() {
+        let value = serde_json::to_value(AgentEvent::ToolProgress {
+            call_id: "call-1".into(),
+            name: "search_text".into(),
+            phase: "scanning".into(),
+            completed: Some(1000),
+            total: None,
+            unit: Some("files".into()),
+            message: None,
+        })
+        .unwrap();
+        assert_eq!(value["type"], "tool_progress");
+        assert_eq!(value["call_id"], "call-1");
+        assert_eq!(value["completed"], 1000);
+        assert_eq!(value["unit"], "files");
     }
 }

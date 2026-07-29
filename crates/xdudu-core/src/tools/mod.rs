@@ -1,9 +1,15 @@
 //! 内置工具、输入校验、权限检查与统一执行入口。
 
+mod apply_patch;
 mod file_read;
 mod file_write;
+mod git_common;
+mod git_diff;
+mod git_status;
 mod path_policy;
+mod search_text;
 mod terminal_exec;
+mod web_fetch;
 
 use std::{
     collections::HashMap,
@@ -16,6 +22,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -29,9 +36,14 @@ use crate::{
     provider::ProviderToolDefinition,
 };
 
+pub use apply_patch::ApplyPatchTool;
 pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;
+pub use git_diff::GitDiffTool;
+pub use git_status::GitStatusTool;
+pub use search_text::SearchTextTool;
 pub use terminal_exec::TerminalExecTool;
+pub use web_fetch::WebFetchTool;
 
 #[derive(Debug, Clone)]
 pub struct ToolDefinition {
@@ -62,6 +74,51 @@ pub struct ToolContext {
     pub cancellation: CancellationToken,
     pub started_at: DateTime<Utc>,
     pub change_ledger: Arc<dyn ChangeLedger>,
+    pub progress: Option<mpsc::Sender<ToolProgressUpdate>>,
+}
+
+impl ToolContext {
+    pub fn report_progress(&self, update: ToolProgressUpdate) {
+        if let Some(progress) = &self.progress {
+            let _ = progress.try_send(update);
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolProgressUpdate {
+    pub phase: String,
+    pub completed: Option<u64>,
+    pub total: Option<u64>,
+    pub unit: Option<String>,
+    pub message: Option<String>,
+}
+
+impl ToolProgressUpdate {
+    pub fn phase(phase: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            phase: phase.into(),
+            completed: None,
+            total: None,
+            unit: None,
+            message: Some(message.into()),
+        }
+    }
+
+    pub fn counted(
+        phase: impl Into<String>,
+        completed: u64,
+        total: Option<u64>,
+        unit: impl Into<String>,
+    ) -> Self {
+        Self {
+            phase: phase.into(),
+            completed: Some(completed),
+            total,
+            unit: Some(unit.into()),
+            message: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -136,6 +193,9 @@ fn elapsed_ms(started_at: DateTime<Utc>) -> u64 {
 pub trait Tool: Send + Sync {
     fn definition(&self) -> ToolDefinition;
     fn validate(&self, input: &Value) -> Result<(), Vec<String>>;
+    async fn preflight(&self, _input: &Value, _context: &ToolContext) -> Option<ToolResult> {
+        None
+    }
     async fn execute(&self, input: Value, context: ToolContext) -> ToolResult;
 }
 
@@ -211,6 +271,29 @@ impl ToolRegistry {
         permission_mode: PermissionMode,
         cancellation: CancellationToken,
     ) -> ToolResult {
+        self.execute_with_progress(
+            name,
+            input,
+            session_id,
+            cwd,
+            permission_mode,
+            cancellation,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn execute_with_progress(
+        &self,
+        name: &str,
+        input: Value,
+        session_id: Uuid,
+        cwd: impl AsRef<Path>,
+        permission_mode: PermissionMode,
+        cancellation: CancellationToken,
+        progress: Option<mpsc::Sender<ToolProgressUpdate>>,
+    ) -> ToolResult {
         let started_at = Utc::now();
         let Some(tool) = self.tools.get(name) else {
             return ToolResult::failure(
@@ -261,7 +344,23 @@ impl ToolRegistry {
             cancellation: cancellation.clone(),
             started_at,
             change_ledger: Arc::clone(&self.change_ledger),
+            progress,
         };
+        match tokio::time::timeout(definition.default_timeout, tool.preflight(&input, &context))
+            .await
+        {
+            Ok(Some(result)) => return result,
+            Ok(None) => {}
+            Err(_) => {
+                cancellation.cancel();
+                return ToolResult::failure(
+                    "TOOL_TIMEOUT",
+                    format!("工具“{name}”预检超时。"),
+                    started_at,
+                    json!({ "timeoutMs": definition.default_timeout.as_millis() }),
+                );
+            }
+        }
         let mut approval = None;
         if definition.side_effect.requires_approval() {
             let request = ApprovalRequest {
@@ -279,6 +378,7 @@ impl ToolRegistry {
                 approved: decision.approved,
                 reason: decision.reason.clone(),
                 side_effect: request.side_effect,
+                scope: decision.scope,
                 requested_at: request.requested_at,
                 decided_at: Utc::now(),
             };
@@ -318,9 +418,14 @@ impl ToolRegistry {
 }
 
 pub fn register_builtins(registry: &mut ToolRegistry) -> XduduResult<()> {
+    registry.register(ApplyPatchTool)?;
     registry.register(FileReadTool)?;
     registry.register(FileWriteTool)?;
+    registry.register(GitDiffTool)?;
+    registry.register(GitStatusTool)?;
+    registry.register(SearchTextTool)?;
     registry.register(TerminalExecTool)?;
+    registry.register(WebFetchTool)?;
     Ok(())
 }
 

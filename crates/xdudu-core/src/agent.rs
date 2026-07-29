@@ -480,17 +480,42 @@ pub async fn run_agent(config: AgentRunConfig<'_>) -> XduduResult<AgentRunResult
                         },
                     )
                     .await;
-                    let result = config
-                        .tool_registry
-                        .execute(
-                            &call.name,
-                            call.input.clone(),
-                            session.id,
-                            &config.cwd,
-                            config.permission_mode,
-                            config.cancellation.child_token(),
-                        )
-                        .await;
+                    let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel(64);
+                    let execution = config.tool_registry.execute_with_progress(
+                        &call.name,
+                        call.input.clone(),
+                        session.id,
+                        &config.cwd,
+                        config.permission_mode,
+                        config.cancellation.child_token(),
+                        Some(progress_tx),
+                    );
+                    tokio::pin!(execution);
+                    let mut progress_open = true;
+                    let result = loop {
+                        tokio::select! {
+                            result = &mut execution => break result,
+                            update = progress_rx.recv(), if progress_open => {
+                                let Some(update) = update else {
+                                    progress_open = false;
+                                    continue;
+                                };
+                                emit(
+                                    config.event_sink,
+                                    AgentEvent::ToolProgress {
+                                        call_id: call.id.clone(),
+                                        name: call.name.clone(),
+                                        phase: update.phase,
+                                        completed: update.completed,
+                                        total: update.total,
+                                        unit: update.unit,
+                                        message: update.message,
+                                    },
+                                )
+                                .await;
+                            }
+                        }
+                    };
                     emit(
                         config.event_sink,
                         AgentEvent::ToolFinished {

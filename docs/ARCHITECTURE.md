@@ -1,12 +1,12 @@
 # XDUDU 系统架构
 
-> 当前基线：Rust-only v0.5.0。旧 TypeScript 实现已退役，可通过 Git 历史审计。
+> 当前基线：Rust-only v0.6.0。旧 TypeScript 实现已退役，可通过 Git 历史审计。
 
 ## 1. 系统定位
 
 XDUDU 是运行在开发者本机终端中的 AI 编程 Agent。它接收自然语言任务，通过模型推理、受控工具调用和本地会话持久化完成编码工作，不是常驻 Web 服务。
 
-当前外部边界包括模型 API、系统凭据库、当前工作区文件系统和本地可执行程序。搜索、Web、MCP 和插件属于后续里程碑。
+当前外部边界包括模型 API、受限公网 HTTPS、系统凭据库、当前工作区文件系统和本地可执行程序。MCP 和插件属于后续里程碑。
 
 ## 2. Rust 工作区
 
@@ -22,7 +22,7 @@ Cargo workspace
     ├── credentials.rs   SecretStore、系统凭据和秘密类型
     ├── events.rs        AgentEvent 与 EventSink
     ├── approval.rs      副作用分类、审批请求和审批网关
-    ├── changes.rs       文件变更账本与安全撤销
+    ├── changes.rs       多文件事务账本、恢复与安全撤销
     ├── redaction.rs     敏感字符串和结构化字段脱敏
     ├── provider/
     │   ├── mod.rs       Provider trait 和领域类型
@@ -32,7 +32,7 @@ Cargo workspace
     │   ├── stream.rs    流事件、Sink 和 SSE 解码
     │   └── retry.rs     安全重试、退避和请求节流
     ├── permission.rs    显式权限矩阵
-    ├── tools/           注册中心和三个内置工具
+    ├── tools/           注册中心、八个内置工具及路径策略
     ├── session.rs       会话领域模型与兼容 JSON 读取
     ├── sqlite_session.rs SQLite、迁移、恢复与工作区锁
     ├── prompt.rs        中文系统提示词
@@ -68,9 +68,10 @@ Agent + ToolRegistry + SessionStore + EventSink
 5. 工具调用参数聚合完成后，ToolRegistry 检查权限并严格校验输入；
 6. 有副作用的工具进入 ApprovalGate；交互确认或显式策略批准后才能继续；
 7. 工具执行路径或命令级安全检查，并接受超时和取消信号；
-8. 文件写入同步记录前镜像和前后哈希，结果与审批记录写入会话；
-9. 持久化和渲染前统一脱敏，然后进入下一轮模型请求；
-10. 正常结束、达到轮次、输出截断、中断和错误保存为明确终态。
+8. 长工具通过有界非阻塞通道发布 `ToolProgress`；进度只实时渲染，不进入会话上下文；
+9. 文件写入先保存 `Prepared` 事务，再进入 `Applying` 和原子提交，成功后标记 `Applied`；
+10. 持久化和渲染前统一脱敏，然后进入下一轮模型请求；
+11. 正常结束、达到轮次、输出截断、中断和错误保存为明确终态。
 
 ## 5. 核心接口
 
@@ -82,8 +83,8 @@ Agent + ToolRegistry + SessionStore + EventSink
 | `EventSink` | 接收 Agent 状态、文本、工具和用量事件 |
 | `Tool` | 工具定义、运行时校验和异步执行 |
 | `ToolRegistry` | 注册、权限、超时、取消和统一错误 |
-| `ApprovalGate` | 对工作区写入和进程执行作出可审计决策 |
-| `ChangeLedger` | 记录可撤销文件变化，隔离具体存储 |
+| `ApprovalGate` | 对工作区写入、进程执行和网络访问作出可审计决策 |
+| `ChangeLedger` | 记录可恢复、可整批撤销的文件事务，隔离具体存储 |
 | `SessionStore` | 会话创建、更新、读取和列表 |
 | `run_agent` | 驱动模型与工具之间的多轮闭环 |
 
@@ -127,7 +128,7 @@ Agent 发出以下领域事件：
 
 - `StateChanged`：运行状态变化；
 - `AssistantDelta`：助手文本增量；
-- `ToolStarted`、`ToolFinished`：工具生命周期；
+- `ToolStarted`、`ToolProgress`、`ToolFinished`：工具生命周期和实时阶段；
 - `UsageUpdated`：Token 用量；
 - `Warning`：可恢复告警。
 
@@ -146,11 +147,15 @@ PermissionMode 显式允许矩阵
 | --- | --- |
 | `read-only` | 仅只读工具 |
 | `auto-safe` | 工作区文件读写和受限安全命令 |
-| `full-access` | 所有工具级别及任意本地可执行文件 |
+| `full-access` | 所有工具级别、受审批网络访问及任意本地可执行文件 |
 
 文件策略会解析真实工作区和符号链接，阻止越界。命令始终通过 `tokio::process::Command` 的程序名和参数数组执行，不调用 shell；`auto-safe` 只允许受限的 `pwd`、`echo`、`ls` 和只读 Git 子命令；超时或取消会终止子进程，stdout 和 stderr 均有保留上限。
 
-审批模式为 `ask`、`never`、`always`。`ask` 仅在交互 TTY 中询问；非交互与 JSON 模式按默认拒绝处理。项目配置只能收紧权限与审批，不能设置 Provider Base URL，避免仓库配置把凭据导向其他端点。
+审批模式为 `ask`、`never`、`always`。工作区写入、进程执行和网络访问都进入同一审批链。`ask` 在交互 TTY 中提供单次、当前会话和永久三种批准作用域；规则按工具名与副作用类型精确匹配。永久规则保存在用户配置目录，项目配置不能创建或扩大规则。非交互与 JSON 模式只使用已有永久规则，否则默认拒绝。项目配置只能收紧权限与审批，不能设置 Provider Base URL，避免仓库配置把凭据导向其他端点。
+
+`search_text` 使用 Rust `ignore`、`globset` 和 `regex`，不依赖外部 `rg`；它遵守 `.gitignore`，跳过二进制、符号链接及内部目录，并对扫描文件数、字节数和结果体积设硬上限。`git_status` 与 `git_diff` 只运行内部固定参数 Git 命令，仓库根必须位于工作区，且禁用外部 diff 和 textconv。
+
+`web_fetch` 在三种权限模式下都能提出调用，但 `NetworkAccess` 始终进入独立审批。每一跳 URL 都必须是无认证信息的 HTTPS；DNS 返回的全部地址都要通过公网检查，并使用已经验证的地址固定连接，TLS SNI 与证书校验仍使用原域名。系统 DNS 结果全部落入 `198.18.0.0/15` Fake-IP 网段时，使用固定公网地址的 HTTPS DoH 获取真实记录，结果仍执行同一公网校验。客户端不转发代理凭据、Cookie、认证、自定义 Header 或请求体，也不自动重试，只接收 HTML、纯文本与 JSON。
 
 会话、终端文本、JSON 事件、工具输入输出和顶层错误在持久化或展示前经过同一脱敏函数。文件变更前镜像只存于 `.xdudu/changes/json`，Unix 权限设为 `0600`，不进入模型上下文。
 
@@ -162,7 +167,7 @@ PermissionMode 显式允许矩阵
 
 上下文预算默认限制输入估算值为 24,000 Token。超过预算时，本地确定性压缩较早消息，保留会话计划、角色、工具名称与受限长度结果，并继续携带最近完整消息。压缩只影响发给 Provider 的窗口；SQLite 中的原始消息不删除。
 
-成功的 `file_write` 在 `.xdudu/changes/json/<uuid>.json` 记录路径、会话、工具调用、前镜像及前后 SHA-256。`xdudu undo` 只选择 `applied` 记录；当前内容必须仍匹配写入后哈希，否则拒绝撤销。恢复旧文件后记录改为 `undone`；Agent 新建的文件则安全删除。
+成功的 `file_write` 与 `apply_patch` 在 `.xdudu/changes/json/<uuid>.json` 写入 `schemaVersion: 2` 事务，记录全部路径、操作类型、权限、前后镜像及 SHA-256。启动时会恢复 `prepared` 或 `applying` 事务；若当前内容既不匹配前哈希也不匹配后哈希，则标记 `conflict` 并阻止静默继续。`xdudu undo` 先预检事务中全部文件，全部匹配后才整批恢复；旧 v1 单文件记录仍可读取和撤销。
 
 | 状态 | 退出码 | 含义 |
 | --- | ---: | --- |
@@ -179,4 +184,4 @@ Cargo 是唯一构建入口。CI 在 Linux、macOS 和 Windows 执行格式、Cl
 
 ## 12. 后续演进
 
-Provider 扩展按当前决定暂缓，DeepSeek 保持主路径。M5 已完成；下一阶段进入 M6：原生搜索、补丁、Git 专用工具和受限 Web。新增能力必须进入同一 ToolRegistry、权限、审批、脱敏和审计链。
+Provider 扩展按当前决定暂缓，DeepSeek 保持主路径。M6 已完成；下一阶段进入 M7 Plan 模式和任务执行。Plan 必须复用现有会话、权限、审批、工具进度、事务恢复与脱敏边界。

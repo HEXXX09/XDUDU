@@ -21,15 +21,17 @@ pub mod tools;
 pub use agent::{AgentRunConfig, AgentRunResult, run_agent};
 pub use approval::{
     AllowAllApprovalGate, ApprovalDecision, ApprovalGate, ApprovalMode, ApprovalRecord,
-    ApprovalRequest, DenyAllApprovalGate, SideEffectKind,
+    ApprovalRequest, ApprovalRule, ApprovalScope, DenyAllApprovalGate, JsonApprovalRuleStore,
+    SideEffectKind,
 };
 pub use changes::{
-    ChangeLedger, FileChangeDraft, FileChangeRecord, FileChangeStatus, JsonChangeLedger,
+    ChangeLedger, ChangeSetDraft, ChangeSetFileDraft, ChangeSetRecord, ChangeSetStatus,
+    FileChangeDraft, FileChangeRecord, FileChangeStatus, FileOperation, JsonChangeLedger,
     NoopChangeLedger, UndoResult,
 };
 pub use config::{
-    AppConfig, ConfigOverrides, ConfigSource, ResolvedConfig, config_paths, load_config,
-    write_config_value,
+    AppConfig, ConfigOverrides, ConfigSource, ResolvedConfig, approval_rules_path, config_paths,
+    load_config, write_config_value,
 };
 pub use credentials::{
     KeyringSecretStore, SecretSource, SecretStore, SecretString, resolve_secret,

@@ -4,6 +4,7 @@ mod doctor;
 mod renderer;
 
 use std::{
+    collections::BTreeSet,
     env,
     io::{self, IsTerminal, Write},
     path::PathBuf,
@@ -18,10 +19,11 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use xdudu_core::{
     AgentRunConfig, AgentRunResult, AllowAllApprovalGate, ApprovalDecision, ApprovalGate,
-    ApprovalMode, ApprovalRequest, ConfigOverrides, DefaultProviderFactory, DenyAllApprovalGate,
-    JsonChangeLedger, KeyringSecretStore, PermissionMode, Provider, ProviderFactory,
-    ResolvedConfig, SecretSource, SecretStore, SecretString, SessionStore, SqliteSessionStore,
-    ToolRegistry, WorkspaceLock, XduduError, config_paths, load_config, redact_text, redact_value,
+    ApprovalMode, ApprovalRequest, ApprovalRule, ApprovalScope, ConfigOverrides,
+    DefaultProviderFactory, DenyAllApprovalGate, JsonApprovalRuleStore, JsonChangeLedger,
+    KeyringSecretStore, PermissionMode, Provider, ProviderFactory, ResolvedConfig, SecretSource,
+    SecretStore, SecretString, SessionStore, SqliteSessionStore, ToolRegistry, WorkspaceLock,
+    XduduError, approval_rules_path, config_paths, load_config, redact_text, redact_value,
     register_builtins, resolve_secret, run_agent, write_config_value,
 };
 
@@ -96,6 +98,11 @@ enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// 查看或撤销永久工具审批规则。
+    Approval {
+        #[command(subcommand)]
+        command: ApprovalCommand,
+    },
     /// 检查安装、配置、凭据和工作区状态。
     Doctor,
     /// 安全撤销最近一次或指定的 Agent 文件变更。
@@ -165,6 +172,16 @@ enum ConfigCommand {
     Path,
 }
 
+#[derive(Debug, Subcommand)]
+enum ApprovalCommand {
+    /// 列出永久允许的同类工具。
+    List,
+    /// 按工具名撤销永久审批规则。
+    Revoke { tool: String },
+    /// 清除全部永久审批规则。
+    Clear,
+}
+
 struct Runtime {
     provider: Box<dyn Provider>,
     provider_display: String,
@@ -203,15 +220,56 @@ fn provider_label(name: &str) -> String {
 }
 
 #[derive(Debug)]
-struct ConsoleApprovalGate;
+struct ConsoleApprovalGate {
+    can_prompt: bool,
+    session_rules: tokio::sync::Mutex<BTreeSet<(Uuid, ApprovalRule)>>,
+    persistent_rules: JsonApprovalRuleStore,
+}
+
+impl ConsoleApprovalGate {
+    fn new(can_prompt: bool, persistent_rules: JsonApprovalRuleStore) -> Self {
+        Self {
+            can_prompt,
+            session_rules: tokio::sync::Mutex::new(BTreeSet::new()),
+            persistent_rules,
+        }
+    }
+}
 
 #[async_trait]
 impl ApprovalGate for ConsoleApprovalGate {
     async fn review(&self, request: &ApprovalRequest) -> ApprovalDecision {
+        let rule = ApprovalRule::from_request(request);
+        if self.persistent_rules.contains(&rule).await {
+            return ApprovalDecision::approve_with_scope(
+                "命中用户永久审批规则。",
+                ApprovalScope::Always,
+            );
+        }
+        if self
+            .session_rules
+            .lock()
+            .await
+            .contains(&(request.session_id, rule.clone()))
+        {
+            return ApprovalDecision::approve_with_scope(
+                "命中当前会话审批规则。",
+                ApprovalScope::Session,
+            );
+        }
+        if !self.can_prompt {
+            return ApprovalDecision::deny("当前运行方式无法交互审批，且没有匹配的永久审批规则。");
+        }
         let input = serde_json::to_string_pretty(&redact_value(&request.input))
             .unwrap_or_else(|_| "<无法显示输入>".into());
         let prompt = format!(
-            "\n  待审批工具：{}\n  副作用：{}\n  输入：{}\n  是否批准？[y/N] ",
+            "\n  待审批工具：{}\n  副作用：{}\n  输入：{}\n\
+             请选择：\n\
+             1) Allow once（仅本次）\n\
+             2) Allow this session（本会话同类工具）\n\
+             3) Allow always（永久允许同类工具）\n\
+             0) Deny（默认）\n\
+             选择 [0-3]：",
             request.tool_name,
             request.side_effect.as_str(),
             input
@@ -225,12 +283,33 @@ impl ApprovalGate for ConsoleApprovalGate {
         })
         .await
         {
-            Ok(Ok(answer))
-                if matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") =>
-            {
-                ApprovalDecision::approve("用户在交互终端批准。")
-            }
-            Ok(Ok(_)) => ApprovalDecision::deny("用户拒绝或未明确批准。"),
+            Ok(Ok(answer)) => match answer.trim().to_ascii_lowercase().as_str() {
+                "1" | "y" | "yes" => ApprovalDecision::approve_with_scope(
+                    "用户批准当前工具调用。",
+                    ApprovalScope::Once,
+                ),
+                "2" | "s" | "session" => {
+                    self.session_rules
+                        .lock()
+                        .await
+                        .insert((request.session_id, rule));
+                    ApprovalDecision::approve_with_scope(
+                        "用户批准本会话中的同类工具调用。",
+                        ApprovalScope::Session,
+                    )
+                }
+                "3" | "a" | "always" => match self.persistent_rules.allow(rule).await {
+                    Ok(()) => ApprovalDecision::approve_with_scope(
+                        "用户永久批准同类工具调用。",
+                        ApprovalScope::Always,
+                    ),
+                    Err(error) => ApprovalDecision::deny(format!(
+                        "无法保存永久审批规则，本次未执行：{}",
+                        error.message
+                    )),
+                },
+                _ => ApprovalDecision::deny("用户拒绝或未明确批准。"),
+            },
             Ok(Err(error)) => ApprovalDecision::deny(format!("读取审批输入失败：{error}")),
             Err(error) => ApprovalDecision::deny(format!("审批任务失败：{error}")),
         }
@@ -242,6 +321,8 @@ async fn create_runtime(
     resolved: &ResolvedConfig,
     interactive: bool,
 ) -> Result<Runtime, XduduError> {
+    let change_ledger = Arc::new(JsonChangeLedger::new(&cwd));
+    change_ledger.recover_incomplete().await?;
     let store = KeyringSecretStore;
     let (secret, _) = resolve_secret(&resolved.config.provider.name, &store).await?;
     let provider = DefaultProviderFactory.create(&resolved.config.provider, secret)?;
@@ -249,12 +330,11 @@ async fn create_runtime(
     let approval_gate: Arc<dyn ApprovalGate> = match approval_mode {
         ApprovalMode::Always => Arc::new(AllowAllApprovalGate),
         ApprovalMode::Never => Arc::new(DenyAllApprovalGate),
-        ApprovalMode::Ask if interactive && !resolved.config.output.json => {
-            Arc::new(ConsoleApprovalGate)
-        }
-        ApprovalMode::Ask => Arc::new(DenyAllApprovalGate),
+        ApprovalMode::Ask => Arc::new(ConsoleApprovalGate::new(
+            interactive && !resolved.config.output.json,
+            JsonApprovalRuleStore::open(approval_rules_path()?).await?,
+        )),
     };
-    let change_ledger = Arc::new(JsonChangeLedger::new(&cwd));
     let mut registry = ToolRegistry::with_runtime(approval_gate, change_ledger);
     register_builtins(&mut registry)?;
     Ok(Runtime {
@@ -466,9 +546,10 @@ async fn handle_config(
         ConfigCommand::Path => {
             let (user, project) = config_paths(cwd)?;
             println!(
-                "用户配置：{}\n项目配置：{}",
+                "用户配置：{}\n项目配置：{}\n永久审批规则：{}",
                 user.display(),
-                project.display()
+                project.display(),
+                approval_rules_path()?.display()
             );
         }
     }
@@ -518,6 +599,37 @@ async fn handle_auth(command: AuthCommand, resolved: &ResolvedConfig) -> Result<
             } else {
                 println!("系统凭据中没有 {provider} API Key。");
             }
+        }
+    }
+    Ok(0)
+}
+
+async fn handle_approval(command: ApprovalCommand) -> Result<u8, XduduError> {
+    let store = JsonApprovalRuleStore::open(approval_rules_path()?).await?;
+    match command {
+        ApprovalCommand::List => {
+            let rules = store.list().await;
+            if rules.is_empty() {
+                println!("没有永久审批规则。\n规则文件：{}", store.path().display());
+            } else {
+                println!("工具                 副作用");
+                for rule in rules {
+                    println!("{:<20} {}", rule.tool_name, rule.side_effect.as_str());
+                }
+                println!("规则文件：{}", store.path().display());
+            }
+        }
+        ApprovalCommand::Revoke { tool } => {
+            let removed = store.revoke(&tool).await?;
+            if removed == 0 {
+                println!("没有找到工具“{tool}”的永久审批规则。");
+            } else {
+                println!("已撤销工具“{tool}”的永久审批规则。");
+            }
+        }
+        ApprovalCommand::Clear => {
+            let removed = store.clear().await?;
+            println!("已清除 {removed} 条永久审批规则。");
         }
     }
     Ok(0)
@@ -578,6 +690,9 @@ async fn run() -> Result<u8, XduduError> {
             let resolved = load_config(&cwd, cli_overrides)?;
             return handle_auth(command, &resolved).await;
         }
+        Some(Command::Approval { command }) => {
+            return handle_approval(command).await;
+        }
         Some(Command::Doctor) => {
             return run_doctor(&cwd, cli_overrides, cli.json).await;
         }
@@ -586,14 +701,19 @@ async fn run() -> Result<u8, XduduError> {
             let result = JsonChangeLedger::new(&cwd)
                 .undo(args.change, cli.session)
                 .await?;
-            let action = if result.removed_created_file {
+            let action = if result.removed_created_files == result.paths.len() {
                 "已删除由 Agent 创建的文件"
             } else {
-                "已恢复变更前内容"
+                "已恢复变更事务"
             };
             println!(
                 "{action}：{}\n变更记录：{}",
-                result.path.display(),
+                result
+                    .paths
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join("、"),
                 result.change_id
             );
             return Ok(0);

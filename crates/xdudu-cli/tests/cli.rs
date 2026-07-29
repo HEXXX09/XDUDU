@@ -13,6 +13,10 @@ use tempfile::tempdir;
 fn xdudu() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_xdudu"));
     command.env("XDUDU_PROVIDER", "anthropic");
+    command.env(
+        "XDUDU_CONFIG_HOME",
+        std::env::temp_dir().join(format!("xdudu-cli-tests-{}", std::process::id())),
+    );
     command
 }
 
@@ -229,6 +233,53 @@ fn help_可以在没有_api_key_时运行() {
     assert!(stdout.contains("--permission"));
     assert!(stdout.contains("--approval"));
     assert!(stdout.contains("undo"));
+    assert!(stdout.contains("approval"));
+}
+
+#[test]
+fn approval_可以列出撤销和清除永久规则() {
+    let dir = tempdir().unwrap();
+    let config_home = dir.path().join("config-home");
+    fs::create_dir_all(&config_home).unwrap();
+    fs::write(
+        config_home.join("approval-rules.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schemaVersion": 1,
+            "rules": [{
+                "toolName": "web_fetch",
+                "sideEffect": "network-access"
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let listed = xdudu()
+        .current_dir(dir.path())
+        .env("XDUDU_CONFIG_HOME", &config_home)
+        .args(["approval", "list"])
+        .output()
+        .unwrap();
+    assert!(listed.status.success());
+    assert!(String::from_utf8_lossy(&listed.stdout).contains("web_fetch"));
+
+    let revoked = xdudu()
+        .current_dir(dir.path())
+        .env("XDUDU_CONFIG_HOME", &config_home)
+        .args(["approval", "revoke", "web_fetch"])
+        .output()
+        .unwrap();
+    assert!(revoked.status.success());
+    assert!(String::from_utf8_lossy(&revoked.stdout).contains("已撤销"));
+
+    let cleared = xdudu()
+        .current_dir(dir.path())
+        .env("XDUDU_CONFIG_HOME", &config_home)
+        .args(["approval", "clear"])
+        .output()
+        .unwrap();
+    assert!(cleared.status.success());
+    assert!(String::from_utf8_lossy(&cleared.stdout).contains("已清除 0 条"));
 }
 
 #[test]
@@ -489,6 +540,50 @@ fn 非交互默认拒绝写入且显式批准可以执行() {
             .count(),
         1
     );
+    let allowed_id = first_session_id(allowed_dir.path());
+    let allowed_session = session_show(allowed_dir.path(), &allowed_id);
+    assert_eq!(
+        allowed_session["toolCalls"][0]["approval"]["scope"],
+        "always"
+    );
+}
+
+#[test]
+fn 永久规则可在后续非交互会话批准同类工具() {
+    let dir = tempdir().unwrap();
+    let config_home = dir.path().join("config-home");
+    fs::create_dir_all(&config_home).unwrap();
+    fs::write(
+        config_home.join("approval-rules.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schemaVersion": 1,
+            "rules": [{
+                "toolName": "file_write",
+                "sideEffect": "workspace-write"
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let output = xdudu()
+        .current_dir(dir.path())
+        .env("XDUDU_CONFIG_HOME", &config_home)
+        .env("ANTHROPIC_API_KEY", "test-key")
+        .env("ANTHROPIC_BASE_URL", two_turn_anthropic_write_server())
+        .args(["--no-stream", "创建 created.txt"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("created.txt")).unwrap(),
+        "approval test"
+    );
+    let session = session_show(dir.path(), &first_session_id(dir.path()));
+    assert_eq!(session["toolCalls"][0]["approval"]["scope"], "always");
 }
 
 #[test]

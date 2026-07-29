@@ -4,12 +4,12 @@ XDUDU 是一个使用 Rust 实现的终端 AI 编程助手。它把自然语言�
 
 ## 当前状态
 
-当前版本为 Rust-only 的 `v0.5.0`：
+当前版本为 Rust-only 的 `v0.6.0`：
 
 - DeepSeek Chat Completions API 为当前主用 Provider，保留已验证的 Anthropic 适配；
 - 支持文本和工具调用的 SSE 流式响应；
 - 可继续上下文的 Agent 工具调用循环；
-- `file_read`、`file_write`、`terminal_exec` 三个内置工具；
+- `file_read`、`file_write`、`search_text`、`apply_patch`、`git_status`、`git_diff`、`web_fetch` 和 `terminal_exec` 八个内置工具；
 - `read-only`、`auto-safe`、`full-access` 三种权限模式；
 - `ask`、`never`、`always` 三种副作用审批模式，非交互环境默认拒绝待审批操作；
 - 工作区路径隔离、符号链接逃逸防御和无 shell 命令执行；
@@ -18,7 +18,11 @@ XDUDU 是一个使用 Rust 实现的终端 AI 编程助手。它把自然语言�
 - 统一 Agent 事件、终端流式渲染、JSON Lines 和无颜色输出；
 - Provider 指数退避、抖动、`Retry-After`、请求节流和取消；
 - `auth`、`config`、`doctor` 命令；
-- 会话级文件变更账本、哈希冲突保护和 `undo` 安全撤销；
+- 多文件事务变更账本、崩溃恢复、哈希冲突保护和 `undo` 整批安全撤销；
+- 原生工作区文本搜索，支持 literal、regex、Glob、上下文、`.gitignore` 和 Unicode 列号；
+- 固定参数的结构化 Git 状态与差异查询，不调用外部 diff 或 textconv；
+- 工具阶段进度事件，终端与 JSON Lines 均可实时观察；
+- 仅限 `full-access` 且仍需审批的公网 HTTPS 抓取，包含逐跳 SSRF 防御、DNS 固定、内容类型和大小限制；
 - SQLite 会话存储、旧 JSON 自动迁移、跨进程锁和崩溃恢复；
 - `session list/show/resume` 会话查询与恢复命令；
 - 长会话 Token 预算、上下文压缩和关键计划保留；
@@ -130,7 +134,7 @@ API Key 不属于普通配置。项目或用户 TOML 中出现 key、token、sec
 
 `v0.4.0` 改名兼容层会优先读取 `XDUDU_*` 和 `.xdudu`；新位置不存在时，可继续读取原 `XYCLI_*` 环境变量和 `.xycli` 配置/会话。系统凭据沿用原 XYCLI 的原生 `keyring` 实现，仅把固定服务名改为 `xdudu`，不进行隐式跨服务迁移。首次使用时运行 `xdudu auth login deepseek` 创建 XDUDU 凭据。
 
-`v0.5.0` 首次启动会在事务中把旧 `.xdudu/sessions/json` 和 `.xycli/sessions/json` 会话导入 `.xdudu/xdudu.db`。旧文件不会删除，可作为迁移备份。
+`v0.5.0` 起，首次启动会在事务中把旧 `.xdudu/sessions/json` 和 `.xycli/sessions/json` 会话导入 `.xdudu/xdudu.db`。旧文件不会删除，可作为迁移备份。
 
 ## 会话查询与恢复
 
@@ -179,23 +183,36 @@ Provider 发生连接失败、超时、HTTP 408、409、429 或 5xx 时，可以
 
 - 文件读写仅允许在启动工作区内；
 - 真实路径校验会阻止绝对路径、`..` 和符号链接逃逸；
+- `search_text`、`git_status`、`git_diff` 是只读工具，无需审批；
+- `apply_patch` 和 `file_write` 使用工作区写入审批，并进入同一事务账本；
 - `terminal_exec` 始终以“可执行文件 + 参数数组”运行，不经过 shell；
 - 仅允许 `pwd`、`echo`、工作区内 `ls` 和受限只读 Git 子命令；
+- `web_fetch` 在三种权限模式下都可请求，但始终按 `ask`、`never`、`always` 独立审批；只允许公网 HTTPS，不允许私网、认证、Cookie 或下载，并兼容代理 Fake-IP DNS；
 - 其他可执行文件需要显式使用 `--permission full-access`。
 
 `full-access` 仍不会启用 shell 字符串拼接，但允许模型调用 PATH 中的任意程序，只应在任务和仓库可信时使用。
 
-默认审批模式为 `ask`。交互终端会在文件写入或命令执行前展示已脱敏参数并等待确认；管道输入、一次性命令和 JSON 模式无法安全询问，因此默认拒绝。自动化场景只有在调用方明确承担风险时才应使用 `--approval always`。
+默认审批模式为 `ask`。交互终端会在文件写入、命令执行或网络访问前展示已脱敏参数，并提供 `Allow once`、`Allow this session`、`Allow always` 和拒绝四种选择。作用域按“工具名 + 副作用类型”匹配，批准 `web_fetch` 不会放行 `terminal_exec`。
 
-每次成功的 `file_write` 都会在 `.xdudu/changes/json/` 创建受保护的变更记录：
+`Allow always` 保存到用户配置目录的 `approval-rules.json`，不会写入项目仓库。管道输入、一次性命令和 JSON 模式无法安全询问：没有匹配永久规则时默认拒绝；有匹配规则时可以执行。永久规则可随时查看或撤销：
 
 ```bash
-xdudu undo                       # 撤销最近一次 Agent 文件写入
-xdudu undo --change <变更UUID>   # 撤销指定变更
+xdudu approval list
+xdudu approval revoke web_fetch
+xdudu approval clear
+```
+
+自动化场景只有在调用方明确承担风险时才应使用全局 `--approval always`。
+
+每次成功的 `file_write` 或 `apply_patch` 都会在 `.xdudu/changes/json/` 创建受保护的事务记录：
+
+```bash
+xdudu undo                       # 撤销最近一个完整文件事务
+xdudu undo --change <事务UUID>   # 撤销指定事务
 xdudu --session <会话UUID> undo  # 只撤销指定会话的最近变更
 ```
 
-撤销前会比较当前文件与写入后哈希。文件被人工或其他程序修改后，XDUDU 会拒绝覆盖；`undo` 不需要 API Key。
+撤销前会预检事务内全部文件。任何文件被人工或其他程序修改后，整批撤销都会拒绝且零文件变化；`undo` 不需要 API Key。启动时会检查 `Prepared` 或 `Applying` 事务：可判定的未完成写入恢复到前镜像，用户内容冲突则标记为 `Conflict` 并停止静默继续。
 
 ## 测试与质量检查
 
@@ -220,10 +237,11 @@ xdudu CLI
         ↓
 xdudu-core
   ├── Config + SecretStore + ProviderFactory
-  ├── Agent Loop + AgentEvent
+  ├── Agent Loop + AgentEvent + ToolProgress
   ├── Provider：Anthropic / DeepSeek / Stream / Retry
   ├── PermissionMode + ApprovalGate + ToolRegistry
-  ├── file_read / file_write / terminal_exec
+  ├── file_read / file_write / search_text / apply_patch
+  ├── git_status / git_diff / web_fetch / terminal_exec
   ├── SqliteSessionStore + WorkspaceLock + Context Compression
   └── JsonChangeLedger + Undo
 ```
@@ -235,6 +253,7 @@ xdudu-core
 - [v0.3.0 阶段设计与验收](docs/NEXT_PHASE_DESIGN.md)
 - [v0.4.0 安全治理设计与验收](docs/SAFETY_GOVERNANCE_DESIGN.md)
 - [v0.5.0 会话恢复与上下文设计](docs/M5_SESSION_RECOVERY_DESIGN.md)
+- [v0.6.0 工具与网络安全设计](docs/M6_TOOLING_WEB_DESIGN.md)
 - [产品需求](docs/PRD.md)
 - [任务路线图](docs/TASKS.md)
 - [Rust 迁移记录](docs/RUST_MIGRATION.md)

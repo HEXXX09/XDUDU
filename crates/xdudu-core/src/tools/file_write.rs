@@ -8,7 +8,10 @@ use sha2::{Digest, Sha256};
 use tokio::fs;
 use uuid::Uuid;
 
-use crate::{FileChangeDraft, SideEffectKind, permission::PermissionLevel};
+use crate::{
+    ChangeSetDraft, ChangeSetFileDraft, ChangeSetStatus, FileOperation, SideEffectKind,
+    permission::PermissionLevel,
+};
 
 use super::path_policy::resolve_writable;
 use super::{
@@ -87,6 +90,37 @@ fn unified_diff(path: &str, old: Option<&str>, new: &str) -> String {
 
 fn valid_hash(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+async fn read_optional(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    match fs::read(path).await {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+async fn write_image(path: &Path, image: Option<&[u8]>, mode: Option<u32>) -> std::io::Result<()> {
+    if let Some(bytes) = image {
+        let temporary = path.with_extension(format!("xdudu-write-{}", Uuid::new_v4()));
+        fs::write(&temporary, bytes).await?;
+        #[cfg(unix)]
+        if let Some(mode) = mode {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&temporary, std::fs::Permissions::from_mode(mode)).await?;
+        }
+        #[cfg(windows)]
+        if fs::try_exists(path).await.unwrap_or(false) {
+            fs::remove_file(path).await?;
+        }
+        fs::rename(temporary, path).await
+    } else {
+        match fs::remove_file(path).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
 }
 
 #[async_trait]
@@ -169,9 +203,9 @@ impl Tool for FileWriteTool {
                 );
             }
         };
-        let old_bytes = match fs::read(&resolved).await {
-            Ok(bytes) => Some(bytes),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        let old_bytes = match read_optional(&resolved).await {
+            Ok(Some(bytes)) => Some(bytes),
+            Ok(None) => {
                 if !create_if_missing {
                     return ToolResult::failure(
                         "FILE_NOT_FOUND",
@@ -221,14 +255,99 @@ impl Tool for FileWriteTool {
                 json!({"path":path_text}),
             );
         }
-        let tmp = resolved.with_extension(format!("xdudu-tmp-{}", Uuid::new_v4()));
-        let write_result = async {
-            fs::write(&tmp, content.as_bytes()).await?;
-            fs::rename(&tmp, &resolved).await
+        let post_hash = sha256(content.as_bytes());
+        #[cfg(unix)]
+        let pre_mode = match fs::metadata(&resolved).await {
+            Ok(metadata) => {
+                use std::os::unix::fs::PermissionsExt;
+                Some(metadata.permissions().mode())
+            }
+            Err(_) => None,
+        };
+        #[cfg(not(unix))]
+        let pre_mode = None;
+        let transaction_id = match context
+            .change_ledger
+            .prepare_change_set(ChangeSetDraft {
+                session_id: context.session_id,
+                tool_call_id: context.call_id,
+                files: vec![ChangeSetFileDraft {
+                    path: Path::new(path_text).to_path_buf(),
+                    operation: if old_bytes.is_some() {
+                        FileOperation::Modified
+                    } else {
+                        FileOperation::Created
+                    },
+                    pre_image: old_bytes.clone(),
+                    post_image: Some(content.as_bytes().to_vec()),
+                    pre_image_sha256: pre_hash.clone(),
+                    post_image_sha256: Some(post_hash.clone()),
+                    pre_mode,
+                }],
+            })
+            .await
+        {
+            Ok(id) => id,
+            Err(error) => {
+                return ToolResult::failure(
+                    "CHANGE_LEDGER_ERROR",
+                    error.message,
+                    context.started_at,
+                    json!({"path":path_text}),
+                );
+            }
+        };
+        if let Some(id) = transaction_id
+            && let Err(error) = context
+                .change_ledger
+                .set_change_set_status(id, ChangeSetStatus::Applying)
+                .await
+        {
+            return ToolResult::failure(
+                "CHANGE_LEDGER_ERROR",
+                error.message,
+                context.started_at,
+                json!({"path":path_text}),
+            );
         }
-        .await;
-        if let Err(error) = write_result {
-            let _ = fs::remove_file(&tmp).await;
+        let current = match read_optional(&resolved).await {
+            Ok(current) => current,
+            Err(error) => {
+                if let Some(id) = transaction_id {
+                    let _ = context
+                        .change_ledger
+                        .set_change_set_status(id, ChangeSetStatus::RolledBack)
+                        .await;
+                }
+                return ToolResult::failure(
+                    "FILE_WRITE_ERROR",
+                    format!("提交前无法再次读取文件：{error}"),
+                    context.started_at,
+                    json!({"path":path_text}),
+                );
+            }
+        };
+        if current.as_deref().map(sha256) != pre_hash {
+            if let Some(id) = transaction_id {
+                let _ = context
+                    .change_ledger
+                    .set_change_set_status(id, ChangeSetStatus::RolledBack)
+                    .await;
+            }
+            return ToolResult::failure(
+                "HASH_MISMATCH",
+                "文件在提交前发生变化，拒绝覆盖。",
+                context.started_at,
+                json!({"path":path_text}),
+            );
+        }
+        if let Err(error) = write_image(&resolved, Some(content.as_bytes()), pre_mode).await {
+            if let Some(id) = transaction_id {
+                let _ = context
+                    .change_ledger
+                    .set_change_set_status(id, ChangeSetStatus::RolledBack)
+                    .await;
+            }
             return ToolResult::failure(
                 "FILE_WRITE_ERROR",
                 error.to_string(),
@@ -237,41 +356,39 @@ impl Tool for FileWriteTool {
             );
         }
         let old_text = old_bytes.as_deref().map(String::from_utf8_lossy);
-        let post_hash = sha256(content.as_bytes());
-        let change_id = match context
-            .change_ledger
-            .record_file_change(FileChangeDraft {
-                session_id: context.session_id,
-                tool_call_id: context.call_id,
-                path: Path::new(path_text).to_path_buf(),
-                pre_image: old_bytes.clone(),
-                pre_image_sha256: pre_hash.clone(),
-                post_image_sha256: post_hash.clone(),
-            })
-            .await
+        if let Some(id) = transaction_id
+            && let Err(error) = context
+                .change_ledger
+                .set_change_set_status(id, ChangeSetStatus::Applied)
+                .await
         {
-            Ok(change_id) => change_id,
-            Err(error) => {
-                let rollback = if let Some(old_bytes) = &old_bytes {
-                    fs::write(&resolved, old_bytes).await
-                } else {
-                    fs::remove_file(&resolved).await
-                };
-                let message = match rollback {
-                    Ok(()) => format!("记录变更失败，已恢复原文件：{}", error.message),
-                    Err(rollback_error) => format!(
+            let rollback = write_image(&resolved, old_bytes.as_deref(), pre_mode).await;
+            let message = match rollback {
+                Ok(()) => {
+                    let _ = context
+                        .change_ledger
+                        .set_change_set_status(id, ChangeSetStatus::RolledBack)
+                        .await;
+                    format!("记录变更失败，已恢复原文件：{}", error.message)
+                }
+                Err(rollback_error) => {
+                    let _ = context
+                        .change_ledger
+                        .set_change_set_status(id, ChangeSetStatus::Conflict)
+                        .await;
+                    format!(
                         "记录变更失败且恢复原文件失败：{}；恢复错误：{rollback_error}",
                         error.message
-                    ),
-                };
-                return ToolResult::failure(
-                    "CHANGE_LEDGER_ERROR",
-                    message,
-                    context.started_at,
-                    json!({"path":path_text}),
-                );
-            }
-        };
+                    )
+                }
+            };
+            return ToolResult::failure(
+                "CHANGE_LEDGER_ERROR",
+                message,
+                context.started_at,
+                json!({"path":path_text}),
+            );
+        }
         ToolResult::success(
             json!({
                 "path": path_text,
@@ -279,7 +396,7 @@ impl Tool for FileWriteTool {
                 "preImageSha256": pre_hash,
                 "postImageSha256": post_hash,
                 "unifiedDiff": unified_diff(path_text, old_text.as_deref(), content),
-                "changeId": change_id,
+                "changeId": transaction_id,
             }),
             context.started_at,
             json!({"resolvedPath":resolved,"contentLength":content.len()}),

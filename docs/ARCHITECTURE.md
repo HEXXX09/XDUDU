@@ -15,6 +15,8 @@ Cargo workspace
 ├── crates/xdudu-cli
 │   ├── main.rs          命令、参数、装配、REPL 和退出码
 │   ├── renderer.rs      终端、JSON Lines 和非流式渲染
+│   ├── tui.rs           全屏对话、实时活动、状态栏和 Composer
+│   ├── input_editor.rs  普通行式界面的安全输入编辑
 │   └── doctor.rs        安装、配置、凭据和工作区诊断
 └── crates/xdudu-core
     ├── agent.rs         Agent 主循环和事件发送
@@ -32,7 +34,7 @@ Cargo workspace
     │   ├── stream.rs    流事件、Sink 和 SSE 解码
     │   └── retry.rs     安全重试、退避和请求节流
     ├── permission.rs    显式权限矩阵
-    ├── tools/           注册中心、八个内置工具及路径策略
+    ├── tools/           注册中心、九个内置工具及路径策略
     ├── session.rs       会话领域模型与兼容 JSON 读取
     ├── sqlite_session.rs SQLite、迁移、恢复与工作区锁
     ├── prompt.rs        中文系统提示词
@@ -62,7 +64,7 @@ Agent + ToolRegistry + SessionStore + EventSink
 ## 4. Agent 运行数据流
 
 1. CLI 创建或恢复会话并选择 Renderer；
-2. Agent 按 Token 预算构建历史消息、压缩摘要、中文系统提示词和工具 JSON Schema；
+2. Agent 按 Token 预算构建历史消息、压缩摘要和中文系统提示词；工具 JSON Schema 仅通过 Provider 的结构化 `tools` 字段发送；
 3. Provider 通过统一流接口发送文本、工具调用、用量和终止原因；
 4. Agent 将文本增量和状态变化转为 `AgentEvent`，自身不写 stdout；
 5. 工具调用参数聚合完成后，ToolRegistry 检查权限并严格校验输入；
@@ -70,8 +72,18 @@ Agent + ToolRegistry + SessionStore + EventSink
 7. 工具执行路径或命令级安全检查，并接受超时和取消信号；
 8. 长工具通过有界非阻塞通道发布 `ToolProgress`；进度只实时渲染，不进入会话上下文；
 9. 文件写入先保存 `Prepared` 事务，再进入 `Applying` 和原子提交，成功后标记 `Applied`；
-10. 持久化和渲染前统一脱敏，然后进入下一轮模型请求；
-11. 正常结束、达到轮次、输出截断、中断和错误保存为明确终态。
+10. 持久化和渲染前统一脱敏，状态由 `Observing` 进入下一轮 `Reflecting`；
+11. 正常结束、达到轮次、输出截断、未解决工具失败、中断和错误保存为明确终态。
+
+单次任务采用隐藏推理的 ReAct 运行方式：
+
+```text
+Planning → Acting → Observing → Reflecting
+              ↑                       │
+              └───────────────────────┘
+```
+
+内部推理不作为 `Thought` 文本输出。工具拒绝后，同批后续副作用调用会被运行时阻止，不能借助另一工具绕过审批；不产生副作用的检查仍可继续。
 
 ## 5. 核心接口
 
@@ -132,7 +144,7 @@ Agent 发出以下领域事件：
 - `UsageUpdated`：Token 用量；
 - `Warning`：可恢复告警。
 
-CLI Renderer 决定具体表现：默认终端流式输出，`--no-stream` 聚合文本，`--json` 输出 JSON Lines，`--no-color` 或 `NO_COLOR` 禁用颜色。领域层不感知 TTY 样式。
+CLI Renderer 决定具体表现：交互 TTY 使用 alternate screen 全屏界面，固定展示对话时间线、实时工具活动、状态规则和 Composer；非交互任务继续使用终端流式输出，`--no-stream` 聚合文本，`--json` 输出 JSON Lines。`--no-color` 或 `NO_COLOR` 禁用颜色，领域层不感知 TTY 样式。
 
 ## 9. 权限、审批与安全边界
 
@@ -155,7 +167,9 @@ PermissionMode 显式允许矩阵
 
 `search_text` 使用 Rust `ignore`、`globset` 和 `regex`，不依赖外部 `rg`；它遵守 `.gitignore`，跳过二进制、符号链接及内部目录，并对扫描文件数、字节数和结果体积设硬上限。`git_status` 与 `git_diff` 只运行内部固定参数 Git 命令，仓库根必须位于工作区，且禁用外部 diff 和 textconv。
 
-`web_fetch` 在三种权限模式下都能提出调用，但 `NetworkAccess` 始终进入独立审批。每一跳 URL 都必须是无认证信息的 HTTPS；DNS 返回的全部地址都要通过公网检查，并使用已经验证的地址固定连接，TLS SNI 与证书校验仍使用原域名。系统 DNS 结果全部落入 `198.18.0.0/15` Fake-IP 网段时，使用固定公网地址的 HTTPS DoH 获取真实记录，结果仍执行同一公网校验。客户端不转发代理凭据、Cookie、认证、自定义 Header 或请求体，也不自动重试，只接收 HTML、纯文本与 JSON。
+`web_search` 和 `web_fetch` 在三种权限模式下都能提出调用，但 `NetworkAccess` 始终进入独立审批。`web_search` 通过固定公网搜索入口返回有界的标题、HTTPS 链接和摘要；Agent 对通用知识、研究或时效性问题可以先搜索候选来源，再用 `web_fetch` 阅读相关页面。本地搜索无结果时，如果任务不限于本地资料，ReAct 循环会优先尝试网络检索而不是直接结束。
+
+`web_fetch` 的每一跳 URL 都必须是无认证信息的 HTTPS；DNS 返回的全部地址都要通过公网检查，并使用已经验证的地址固定连接，TLS SNI 与证书校验仍使用原域名。系统 DNS 结果全部落入 `198.18.0.0/15` Fake-IP 网段时，使用固定公网地址的 HTTPS DoH 获取真实记录，结果仍执行同一公网校验。网络客户端不转发代理凭据、Cookie、认证、自定义 Header 或请求体，也不自动重试。
 
 会话、终端文本、JSON 事件、工具输入输出和顶层错误在持久化或展示前经过同一脱敏函数。文件变更前镜像只存于 `.xdudu/changes/json`，Unix 权限设为 `0600`，不进入模型上下文。
 

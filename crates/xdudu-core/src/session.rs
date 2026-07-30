@@ -44,6 +44,7 @@ pub enum AgentLoopState {
     WaitingApproval,
     Incomplete,
     Completed,
+    Interrupted,
     Error,
 }
 

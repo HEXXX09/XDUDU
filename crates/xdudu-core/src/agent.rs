@@ -1,6 +1,9 @@
-//! Agent 主循环：规划、行动、观察，直到模型明确结束或达到限制。
+//! Agent 主循环：规划、行动、观察、反思，直到模型明确结束或达到限制。
 
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeSet,
+    path::{Path, PathBuf},
+};
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -21,7 +24,7 @@ use crate::{
         AgentLoopState, Message, Session, SessionStatus, SessionStore, ToolCallRecord,
         ToolCallStatus,
     },
-    tools::ToolRegistry,
+    tools::{ToolRegistry, ToolResult},
 };
 
 const DEFAULT_CONTEXT_INPUT_BUDGET: usize = 24_000;
@@ -282,8 +285,22 @@ fn compact_context(session: &mut Session, system: &str, tools_json: &str) -> boo
 fn denied_tool_result(code: Option<&str>) -> bool {
     matches!(
         code,
-        Some("PERMISSION_DENIED" | "APPROVAL_DENIED" | "UNSAFE_COMMAND" | "PATH_OUTSIDE_WORKSPACE")
+        Some(
+            "PERMISSION_DENIED"
+                | "APPROVAL_DENIED"
+                | "UNSAFE_COMMAND"
+                | "PATH_OUTSIDE_WORKSPACE"
+                | "BATCH_SIDE_EFFECT_SKIPPED"
+        )
     )
+}
+
+fn append_incomplete_reason(message: &str, reason: &str) -> String {
+    if message.trim().is_empty() {
+        reason.to_owned()
+    } else {
+        format!("{message}\n\n{reason}")
+    }
 }
 
 /// 执行一次 Agent 任务。输入校验错误直接返回 `Err`；运行期错误会落入会话并返回结果。
@@ -309,11 +326,12 @@ pub async fn run_agent(config: AgentRunConfig<'_>) -> XduduResult<AgentRunResult
     let mut state = AgentLoopState::Planning;
     let mut final_message = String::new();
     let mut exit_code = 0;
+    let mut unresolved_tool_failures = BTreeSet::new();
 
     while turns < config.max_turns && status == SessionStatus::Running {
         if config.cancellation.is_cancelled() {
             status = SessionStatus::Interrupted;
-            state = AgentLoopState::Error;
+            state = AgentLoopState::Interrupted;
             final_message = "会话已被用户中断。".into();
             exit_code = 1;
             break;
@@ -322,7 +340,7 @@ pub async fn run_agent(config: AgentRunConfig<'_>) -> XduduResult<AgentRunResult
         state = if turns == 1 {
             AgentLoopState::Planning
         } else {
-            AgentLoopState::Acting
+            AgentLoopState::Reflecting
         };
         session.current_state = state;
         emit(config.event_sink, AgentEvent::StateChanged { state }).await;
@@ -372,7 +390,11 @@ pub async fn run_agent(config: AgentRunConfig<'_>) -> XduduResult<AgentRunResult
                 } else {
                     SessionStatus::Error
                 };
-                state = AgentLoopState::Error;
+                state = if status == SessionStatus::Interrupted {
+                    AgentLoopState::Interrupted
+                } else {
+                    AgentLoopState::Error
+                };
                 final_message = if status == SessionStatus::Interrupted {
                     "会话已被用户中断。".into()
                 } else {
@@ -417,9 +439,43 @@ pub async fn run_agent(config: AgentRunConfig<'_>) -> XduduResult<AgentRunResult
 
         match response.finish_reason {
             FinishReason::Stop => {
-                status = SessionStatus::Completed;
-                state = AgentLoopState::Completed;
-                final_message = assistant_text;
+                let has_unexecuted_calls = !response.tool_calls.is_empty()
+                    || session.tool_calls.iter().any(|call| {
+                        matches!(
+                            call.status,
+                            ToolCallStatus::Pending | ToolCallStatus::Running
+                        )
+                    });
+                if has_unexecuted_calls || !unresolved_tool_failures.is_empty() {
+                    status = SessionStatus::Incomplete;
+                    state = AgentLoopState::Incomplete;
+                    exit_code = 1;
+                    let reason = if has_unexecuted_calls {
+                        "模型停止时仍存在未执行或结果未知的工具调用，任务不能确认完成。".to_owned()
+                    } else {
+                        format!(
+                            "仍有未解决的工具失败：{}。任务不能确认完成。",
+                            unresolved_tool_failures
+                                .iter()
+                                .cloned()
+                                .collect::<Vec<_>>()
+                                .join("、")
+                        )
+                    };
+                    final_message = append_incomplete_reason(&assistant_text, &reason);
+                    emit(
+                        config.event_sink,
+                        AgentEvent::Warning {
+                            code: "UNCONFIRMED_COMPLETION".into(),
+                            message: reason,
+                        },
+                    )
+                    .await;
+                } else {
+                    status = SessionStatus::Completed;
+                    state = AgentLoopState::Completed;
+                    final_message = assistant_text;
+                }
             }
             FinishReason::Length => {
                 status = SessionStatus::Incomplete;
@@ -445,10 +501,15 @@ pub async fn run_agent(config: AgentRunConfig<'_>) -> XduduResult<AgentRunResult
             }
             FinishReason::ToolCalls if !response.tool_calls.is_empty() => {
                 state = AgentLoopState::Acting;
+                session.current_state = state;
+                session.updated_at = Utc::now();
+                config.session_store.update(&session).await?;
+                emit(config.event_sink, AgentEvent::StateChanged { state }).await;
+                let mut side_effect_denied_in_batch = false;
                 for call in response.tool_calls {
                     if config.cancellation.is_cancelled() {
                         status = SessionStatus::Interrupted;
-                        state = AgentLoopState::Error;
+                        state = AgentLoopState::Interrupted;
                         final_message = "会话已被用户中断。".into();
                         exit_code = 1;
                         break;
@@ -480,39 +541,58 @@ pub async fn run_agent(config: AgentRunConfig<'_>) -> XduduResult<AgentRunResult
                         },
                     )
                     .await;
-                    let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel(64);
-                    let execution = config.tool_registry.execute_with_progress(
-                        &call.name,
-                        call.input.clone(),
-                        session.id,
-                        &config.cwd,
-                        config.permission_mode,
-                        config.cancellation.child_token(),
-                        Some(progress_tx),
-                    );
-                    tokio::pin!(execution);
-                    let mut progress_open = true;
-                    let result = loop {
-                        tokio::select! {
-                            result = &mut execution => break result,
-                            update = progress_rx.recv(), if progress_open => {
-                                let Some(update) = update else {
-                                    progress_open = false;
-                                    continue;
-                                };
-                                emit(
-                                    config.event_sink,
-                                    AgentEvent::ToolProgress {
-                                        call_id: call.id.clone(),
-                                        name: call.name.clone(),
-                                        phase: update.phase,
-                                        completed: update.completed,
-                                        total: update.total,
-                                        unit: update.unit,
-                                        message: update.message,
-                                    },
-                                )
-                                .await;
+                    let has_side_effect = config
+                        .tool_registry
+                        .get(&call.name)
+                        .is_some_and(|tool| tool.definition().side_effect.requires_approval());
+                    let result = if side_effect_denied_in_batch && has_side_effect {
+                        ToolResult::failure(
+                            "BATCH_SIDE_EFFECT_SKIPPED",
+                            format!(
+                                "同批较早的工具调用已被拒绝，为防止绕过审批，未执行工具“{}”。",
+                                call.name
+                            ),
+                            started_at,
+                            serde_json::json!({
+                                "toolName": call.name,
+                                "reason": "earlier-side-effect-denied",
+                            }),
+                        )
+                    } else {
+                        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel(64);
+                        let execution = config.tool_registry.execute_with_progress(
+                            &call.name,
+                            call.input.clone(),
+                            session.id,
+                            &config.cwd,
+                            config.permission_mode,
+                            config.cancellation.child_token(),
+                            Some(progress_tx),
+                        );
+                        tokio::pin!(execution);
+                        let mut progress_open = true;
+                        loop {
+                            tokio::select! {
+                                result = &mut execution => break result,
+                                update = progress_rx.recv(), if progress_open => {
+                                    let Some(update) = update else {
+                                        progress_open = false;
+                                        continue;
+                                    };
+                                    emit(
+                                        config.event_sink,
+                                        AgentEvent::ToolProgress {
+                                            call_id: call.id.clone(),
+                                            name: call.name.clone(),
+                                            phase: update.phase,
+                                            completed: update.completed,
+                                            total: update.total,
+                                            unit: update.unit,
+                                            message: update.message,
+                                        },
+                                    )
+                                    .await;
+                                }
                             }
                         }
                     };
@@ -533,6 +613,14 @@ pub async fn run_agent(config: AgentRunConfig<'_>) -> XduduResult<AgentRunResult
                     } else {
                         ToolCallStatus::Failed
                     };
+                    if result.success {
+                        unresolved_tool_failures.remove(&call.name);
+                    } else {
+                        unresolved_tool_failures.insert(call.name.clone());
+                    }
+                    if record_status == ToolCallStatus::Denied {
+                        side_effect_denied_in_batch = true;
+                    }
                     let record = &mut session.tool_calls[record_index];
                     record.output = result.output.clone();
                     record.error = result.error.as_ref().map(|error| error.message.clone());
@@ -544,7 +632,12 @@ pub async fn run_agent(config: AgentRunConfig<'_>) -> XduduResult<AgentRunResult
                         serde_json::to_string(&result.output.unwrap_or(Value::Null))?
                     } else {
                         format!(
-                            "Error: {}",
+                            "Error [{}]: {}",
+                            result
+                                .error
+                                .as_ref()
+                                .map(|error| error.code.as_str())
+                                .unwrap_or("UNKNOWN_ERROR"),
                             result
                                 .error
                                 .as_ref()
@@ -564,6 +657,7 @@ pub async fn run_agent(config: AgentRunConfig<'_>) -> XduduResult<AgentRunResult
                     session.current_state = state;
                     session.updated_at = Utc::now();
                     config.session_store.update(&session).await?;
+                    emit(config.event_sink, AgentEvent::StateChanged { state }).await;
                 }
             }
             reason => {
@@ -625,6 +719,32 @@ mod tests {
         responses: Mutex<VecDeque<ProviderResponse>>,
     }
 
+    #[derive(Default)]
+    struct RecordingEventSink {
+        events: Mutex<Vec<AgentEvent>>,
+    }
+
+    #[async_trait]
+    impl EventSink for RecordingEventSink {
+        async fn emit(&self, event: AgentEvent) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
+    impl RecordingEventSink {
+        fn states(&self) -> Vec<AgentLoopState> {
+            self.events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|event| match event {
+                    AgentEvent::StateChanged { state } => Some(*state),
+                    _ => None,
+                })
+                .collect()
+        }
+    }
+
     #[async_trait]
     impl Provider for MockProvider {
         fn name(&self) -> &'static str {
@@ -649,6 +769,27 @@ mod tests {
                 ..Default::default()
             },
             finish_reason: FinishReason::Stop,
+        }
+    }
+
+    fn tool_response(calls: Vec<ToolCall>) -> ProviderResponse {
+        ProviderResponse {
+            message: ProviderMessage {
+                role: MessageRole::Assistant,
+                content: MessageContent::Blocks(
+                    calls
+                        .iter()
+                        .map(|call| ContentBlock::ToolUse {
+                            id: call.id.clone(),
+                            name: call.name.clone(),
+                            input: call.input.clone(),
+                        })
+                        .collect(),
+                ),
+            },
+            tool_calls: calls,
+            usage: TokenUsage::default(),
+            finish_reason: FinishReason::ToolCalls,
         }
     }
 
@@ -736,6 +877,194 @@ mod tests {
         let session = store.get(result.session_id).await.unwrap().unwrap();
         assert_eq!(result.turns, 2);
         assert_eq!(session.tool_calls[0].status, ToolCallStatus::Succeeded);
+    }
+
+    #[tokio::test]
+    async fn 工具结果后的状态依次进入观察和反思() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "hello").unwrap();
+        let provider = MockProvider {
+            responses: Mutex::new(VecDeque::from([
+                tool_response(vec![ToolCall {
+                    id: "call-state".into(),
+                    name: "file_read".into(),
+                    input: json!({"path":"a.txt"}),
+                }]),
+                text_response("读取完成"),
+            ])),
+        };
+        let mut registry = ToolRegistry::new();
+        register_builtins(&mut registry).unwrap();
+        let store = JsonSessionStore::new(dir.path());
+        let sink = RecordingEventSink::default();
+        let mut cfg = config(dir.path(), &provider, &registry, &store);
+        cfg.event_sink = Some(&sink);
+
+        let result = run_agent(cfg).await.unwrap();
+
+        assert_eq!(result.status, SessionStatus::Completed);
+        assert_eq!(
+            sink.states(),
+            vec![
+                AgentLoopState::Planning,
+                AgentLoopState::Acting,
+                AgentLoopState::Observing,
+                AgentLoopState::Reflecting,
+                AgentLoopState::Completed,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn 未解决的工具失败会阻止误报完成() {
+        let dir = tempdir().unwrap();
+        let provider = MockProvider {
+            responses: Mutex::new(VecDeque::from([
+                tool_response(vec![ToolCall {
+                    id: "call-failed".into(),
+                    name: "file_read".into(),
+                    input: json!({"path":"missing.txt"}),
+                }]),
+                text_response("没有找到文件"),
+            ])),
+        };
+        let mut registry = ToolRegistry::new();
+        register_builtins(&mut registry).unwrap();
+        let store = JsonSessionStore::new(dir.path());
+
+        let result = run_agent(config(dir.path(), &provider, &registry, &store))
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, SessionStatus::Incomplete);
+        assert_eq!(result.exit_code, 1);
+        assert!(result.final_message.contains("未解决的工具失败：file_read"));
+    }
+
+    #[tokio::test]
+    async fn 同一工具成功重试后可以完成() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "hello").unwrap();
+        let provider = MockProvider {
+            responses: Mutex::new(VecDeque::from([
+                tool_response(vec![ToolCall {
+                    id: "call-failed".into(),
+                    name: "file_read".into(),
+                    input: json!({"path":"missing.txt"}),
+                }]),
+                tool_response(vec![ToolCall {
+                    id: "call-retry".into(),
+                    name: "file_read".into(),
+                    input: json!({"path":"a.txt"}),
+                }]),
+                text_response("已读取正确文件"),
+            ])),
+        };
+        let mut registry = ToolRegistry::new();
+        register_builtins(&mut registry).unwrap();
+        let store = JsonSessionStore::new(dir.path());
+        let sink = RecordingEventSink::default();
+        let mut cfg = config(dir.path(), &provider, &registry, &store);
+        cfg.event_sink = Some(&sink);
+
+        let result = run_agent(cfg).await.unwrap();
+
+        assert_eq!(result.status, SessionStatus::Completed);
+        assert_eq!(result.turns, 3);
+        assert_eq!(
+            sink.states(),
+            vec![
+                AgentLoopState::Planning,
+                AgentLoopState::Acting,
+                AgentLoopState::Observing,
+                AgentLoopState::Reflecting,
+                AgentLoopState::Acting,
+                AgentLoopState::Observing,
+                AgentLoopState::Reflecting,
+                AgentLoopState::Completed,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn 同批拒绝后跳过后续副作用但保留只读调用() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "hello").unwrap();
+        let provider = MockProvider {
+            responses: Mutex::new(VecDeque::from([
+                tool_response(vec![
+                    ToolCall {
+                        id: "call-write".into(),
+                        name: "file_write".into(),
+                        input: json!({
+                            "path":"blocked.txt",
+                            "content":"blocked",
+                            "createIfMissing":true
+                        }),
+                    },
+                    ToolCall {
+                        id: "call-exec".into(),
+                        name: "terminal_exec".into(),
+                        input: json!({"command":"pwd"}),
+                    },
+                    ToolCall {
+                        id: "call-read".into(),
+                        name: "file_read".into(),
+                        input: json!({"path":"a.txt"}),
+                    },
+                ]),
+                text_response("执行受限"),
+            ])),
+        };
+        let mut registry = ToolRegistry::new();
+        register_builtins(&mut registry).unwrap();
+        let store = JsonSessionStore::new(dir.path());
+
+        let result = run_agent(config(dir.path(), &provider, &registry, &store))
+            .await
+            .unwrap();
+        let session = store.get(result.session_id).await.unwrap().unwrap();
+
+        assert_eq!(result.status, SessionStatus::Incomplete);
+        assert_eq!(session.tool_calls[0].status, ToolCallStatus::Denied);
+        assert_eq!(session.tool_calls[1].status, ToolCallStatus::Denied);
+        assert!(
+            session.tool_calls[1]
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("未执行工具")
+        );
+        assert_eq!(session.tool_calls[2].status, ToolCallStatus::Succeeded);
+        assert!(!dir.path().join("blocked.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn stop_携带未执行工具调用时标记未完成() {
+        let dir = tempdir().unwrap();
+        let call = ToolCall {
+            id: "call-unexecuted".into(),
+            name: "file_read".into(),
+            input: json!({"path":"a.txt"}),
+        };
+        let provider = MockProvider {
+            responses: Mutex::new(VecDeque::from([ProviderResponse {
+                message: ProviderMessage::text(MessageRole::Assistant, "准备读取"),
+                tool_calls: vec![call],
+                usage: TokenUsage::default(),
+                finish_reason: FinishReason::Stop,
+            }])),
+        };
+        let mut registry = ToolRegistry::new();
+        register_builtins(&mut registry).unwrap();
+        let store = JsonSessionStore::new(dir.path());
+
+        let result = run_agent(config(dir.path(), &provider, &registry, &store))
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, SessionStatus::Incomplete);
+        assert!(result.final_message.contains("未执行或结果未知"));
     }
 
     #[tokio::test]

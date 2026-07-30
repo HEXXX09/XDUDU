@@ -1,12 +1,16 @@
 //! XDUDU Rust 命令行入口。
 
+mod approval_prompt;
 mod doctor;
+mod input_editor;
 mod renderer;
+mod tui;
+mod ui;
 
 use std::{
     collections::BTreeSet,
     env,
-    io::{self, IsTerminal, Write},
+    io::{self, IsTerminal},
     path::PathBuf,
     process::ExitCode,
     sync::Arc,
@@ -14,21 +18,25 @@ use std::{
 
 use async_trait::async_trait;
 use clap::{Args, Parser, Subcommand};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use xdudu_core::{
     AgentRunConfig, AgentRunResult, AllowAllApprovalGate, ApprovalDecision, ApprovalGate,
     ApprovalMode, ApprovalRequest, ApprovalRule, ApprovalScope, ConfigOverrides,
-    DefaultProviderFactory, DenyAllApprovalGate, JsonApprovalRuleStore, JsonChangeLedger,
-    KeyringSecretStore, PermissionMode, Provider, ProviderFactory, ResolvedConfig, SecretSource,
-    SecretStore, SecretString, SessionStore, SqliteSessionStore, ToolRegistry, WorkspaceLock,
-    XduduError, approval_rules_path, config_paths, load_config, redact_text, redact_value,
-    register_builtins, resolve_secret, run_agent, write_config_value,
+    DefaultProviderFactory, DenyAllApprovalGate, EventSink, JsonApprovalRuleStore,
+    JsonChangeLedger, KeyringSecretStore, PermissionMode, Provider, ProviderFactory,
+    ResolvedConfig, SecretSource, SecretStore, SecretString, SessionStore, SqliteSessionStore,
+    ToolRegistry, WorkspaceLock, XduduError, approval_rules_path, config_paths, load_config,
+    redact_text, redact_value, register_builtins, resolve_secret, run_agent, write_config_value,
 };
 
+use crate::approval_prompt::{ApprovalMenuChoice, read_approval_menu};
 use crate::doctor::run_doctor;
+use crate::input_editor::{InputEditor, ReadResult};
 use crate::renderer::ConsoleRenderer;
+use crate::tui::{InputOutcome, TuiApp, TuiContext};
+use crate::ui::TerminalTheme;
 
 #[derive(Debug, Parser)]
 #[command(name = "xdudu", version, about = "终端原生 AI 编程助手")]
@@ -194,6 +202,7 @@ struct Runtime {
     store: SqliteSessionStore,
     renderer: ConsoleRenderer,
     stream: bool,
+    color: bool,
 }
 
 fn overrides(cli: &Cli) -> ConfigOverrides {
@@ -222,14 +231,23 @@ fn provider_label(name: &str) -> String {
 #[derive(Debug)]
 struct ConsoleApprovalGate {
     can_prompt: bool,
+    fullscreen: bool,
+    theme: TerminalTheme,
     session_rules: tokio::sync::Mutex<BTreeSet<(Uuid, ApprovalRule)>>,
     persistent_rules: JsonApprovalRuleStore,
 }
 
 impl ConsoleApprovalGate {
-    fn new(can_prompt: bool, persistent_rules: JsonApprovalRuleStore) -> Self {
+    fn new(
+        can_prompt: bool,
+        persistent_rules: JsonApprovalRuleStore,
+        theme: TerminalTheme,
+        fullscreen: bool,
+    ) -> Self {
         Self {
             can_prompt,
+            fullscreen,
+            theme,
             session_rules: tokio::sync::Mutex::new(BTreeSet::new()),
             persistent_rules,
         }
@@ -262,54 +280,55 @@ impl ApprovalGate for ConsoleApprovalGate {
         }
         let input = serde_json::to_string_pretty(&redact_value(&request.input))
             .unwrap_or_else(|_| "<无法显示输入>".into());
+        let theme = self.theme;
+        let fullscreen = self.fullscreen;
+        let input = input
+            .lines()
+            .map(|line| format!("  {} {line}", theme.muted("│")))
+            .collect::<Vec<_>>()
+            .join("\n");
         let prompt = format!(
-            "\n  待审批工具：{}\n  副作用：{}\n  输入：{}\n\
-             请选择：\n\
-             1) Allow once（仅本次）\n\
-             2) Allow this session（本会话同类工具）\n\
-             3) Allow always（永久允许同类工具）\n\
-             0) Deny（默认）\n\
-             选择 [0-3]：",
+            "\n  {} {}\n\
+             \x20 {} 工具  {}\n\
+             \x20 {} 风险  {}\n\
+             {input}\n\
+             \x20 {} {}\n",
+            theme.warning("◆"),
+            theme.strong("需要你的批准"),
+            theme.muted("│"),
             request.tool_name,
+            theme.muted("│"),
             request.side_effect.as_str(),
-            input
+            theme.muted("╰"),
+            theme.muted("↑/↓ 或 j/k 选择 · Enter 确认 · Esc 拒绝"),
         );
-        match tokio::task::spawn_blocking(move || {
-            eprint!("{prompt}");
-            io::stderr().flush()?;
-            let mut answer = String::new();
-            io::stdin().read_line(&mut answer)?;
-            Ok::<_, io::Error>(answer)
-        })
-        .await
+        match tokio::task::spawn_blocking(move || read_approval_menu(theme, &prompt, fullscreen))
+            .await
         {
-            Ok(Ok(answer)) => match answer.trim().to_ascii_lowercase().as_str() {
-                "1" | "y" | "yes" => ApprovalDecision::approve_with_scope(
-                    "用户批准当前工具调用。",
-                    ApprovalScope::Once,
+            Ok(Ok(ApprovalMenuChoice::Once)) => {
+                ApprovalDecision::approve_with_scope("用户批准当前工具调用。", ApprovalScope::Once)
+            }
+            Ok(Ok(ApprovalMenuChoice::Session)) => {
+                self.session_rules
+                    .lock()
+                    .await
+                    .insert((request.session_id, rule));
+                ApprovalDecision::approve_with_scope(
+                    "用户批准本会话中的同类工具调用。",
+                    ApprovalScope::Session,
+                )
+            }
+            Ok(Ok(ApprovalMenuChoice::Always)) => match self.persistent_rules.allow(rule).await {
+                Ok(()) => ApprovalDecision::approve_with_scope(
+                    "用户永久批准同类工具调用。",
+                    ApprovalScope::Always,
                 ),
-                "2" | "s" | "session" => {
-                    self.session_rules
-                        .lock()
-                        .await
-                        .insert((request.session_id, rule));
-                    ApprovalDecision::approve_with_scope(
-                        "用户批准本会话中的同类工具调用。",
-                        ApprovalScope::Session,
-                    )
-                }
-                "3" | "a" | "always" => match self.persistent_rules.allow(rule).await {
-                    Ok(()) => ApprovalDecision::approve_with_scope(
-                        "用户永久批准同类工具调用。",
-                        ApprovalScope::Always,
-                    ),
-                    Err(error) => ApprovalDecision::deny(format!(
-                        "无法保存永久审批规则，本次未执行：{}",
-                        error.message
-                    )),
-                },
-                _ => ApprovalDecision::deny("用户拒绝或未明确批准。"),
+                Err(error) => ApprovalDecision::deny(format!(
+                    "无法保存永久审批规则，本次未执行：{}",
+                    error.message
+                )),
             },
+            Ok(Ok(ApprovalMenuChoice::Deny)) => ApprovalDecision::deny("用户拒绝或未明确批准。"),
             Ok(Err(error)) => ApprovalDecision::deny(format!("读取审批输入失败：{error}")),
             Err(error) => ApprovalDecision::deny(format!("审批任务失败：{error}")),
         }
@@ -327,12 +346,20 @@ async fn create_runtime(
     let (secret, _) = resolve_secret(&resolved.config.provider.name, &store).await?;
     let provider = DefaultProviderFactory.create(&resolved.config.provider, secret)?;
     let approval_mode = resolved.config.agent.approval_mode()?;
+    let color = resolved.config.output.color && io::stdout().is_terminal();
+    let theme = TerminalTheme::new(color);
+    let fullscreen = interactive
+        && io::stdin().is_terminal()
+        && io::stdout().is_terminal()
+        && env::var("TERM").is_ok_and(|term| term != "dumb");
     let approval_gate: Arc<dyn ApprovalGate> = match approval_mode {
         ApprovalMode::Always => Arc::new(AllowAllApprovalGate),
         ApprovalMode::Never => Arc::new(DenyAllApprovalGate),
         ApprovalMode::Ask => Arc::new(ConsoleApprovalGate::new(
             interactive && !resolved.config.output.json,
             JsonApprovalRuleStore::open(approval_rules_path()?).await?,
+            theme,
+            fullscreen,
         )),
     };
     let mut registry = ToolRegistry::with_runtime(approval_gate, change_ledger);
@@ -350,9 +377,10 @@ async fn create_runtime(
         renderer: ConsoleRenderer::new(
             resolved.config.output.json,
             !resolved.config.output.no_stream,
-            resolved.config.output.color && io::stdout().is_terminal(),
+            color,
         ),
         stream: !resolved.config.output.no_stream,
+        color,
     })
 }
 
@@ -362,6 +390,16 @@ async fn execute_prompt(
     session_id: Option<Uuid>,
 ) -> Result<AgentRunResult, XduduError> {
     runtime.renderer.begin_run();
+    execute_prompt_with_sink(runtime, prompt, session_id, &runtime.renderer, true).await
+}
+
+async fn execute_prompt_with_sink(
+    runtime: &Runtime,
+    prompt: String,
+    session_id: Option<Uuid>,
+    event_sink: &dyn EventSink,
+    print_interrupt: bool,
+) -> Result<AgentRunResult, XduduError> {
     let cancellation = CancellationToken::new();
     let run = run_agent(AgentRunConfig {
         prompt,
@@ -374,7 +412,7 @@ async fn execute_prompt(
         permission_mode: runtime.permission_mode,
         cancellation: cancellation.clone(),
         session_id,
-        event_sink: Some(&runtime.renderer),
+        event_sink: Some(event_sink),
         stream: runtime.stream,
     });
     tokio::pin!(run);
@@ -382,7 +420,9 @@ async fn execute_prompt(
         result = &mut run => result,
         signal = tokio::signal::ctrl_c() => {
             if signal.is_ok() {
-                eprintln!("\n  ⏸  已中断，正在保存...");
+                if print_interrupt {
+                    eprintln!("\n  ⏸  已中断，正在保存...");
+                }
                 cancellation.cancel();
             }
             run.await
@@ -391,41 +431,153 @@ async fn execute_prompt(
 }
 
 fn print_banner(runtime: &Runtime, interactive: bool) {
-    println!(
-        "\n  XDUDU v{} — Rust AI 编程助手",
-        env!("CARGO_PKG_VERSION")
-    );
-    println!(
-        "  Provider: {}  |  模型: {}",
-        runtime.provider_display, runtime.model
-    );
-    println!("  工作目录: {}", runtime.cwd.display());
-    println!("  权限模式: {}", runtime.permission_mode.as_str());
-    println!("  审批模式: {}", runtime.approval_mode.as_str());
-    if interactive {
-        println!("  输入 /help 查看命令，/exit 退出\n");
+    if !interactive {
+        println!(
+            "{}",
+            ui::compact_banner(
+                TerminalTheme::new(runtime.color),
+                env!("CARGO_PKG_VERSION"),
+                &runtime.provider_display,
+                &runtime.model,
+            )
+        );
     }
 }
 
 async fn interactive_loop(
+    runtime: Runtime,
+    initial_prompt: Option<String>,
+    initial_session: Option<Uuid>,
+) -> Result<u8, XduduError> {
+    let tui_supported = io::stdin().is_terminal()
+        && io::stdout().is_terminal()
+        && env::var("TERM").is_ok_and(|term| term != "dumb");
+    if tui_supported {
+        tui_interactive_loop(runtime, initial_prompt, initial_session).await
+    } else {
+        plain_interactive_loop(runtime, initial_prompt, initial_session).await
+    }
+}
+
+async fn tui_interactive_loop(
+    mut runtime: Runtime,
+    initial_prompt: Option<String>,
+    initial_session: Option<Uuid>,
+) -> Result<u8, XduduError> {
+    let available_tools = runtime
+        .registry
+        .definitions()
+        .into_iter()
+        .map(|definition| definition.name.to_owned())
+        .collect();
+    let context = TuiContext {
+        provider: runtime.provider_display.clone(),
+        model: runtime.model.clone(),
+        cwd: runtime.cwd.clone(),
+        permission: runtime.permission_mode.as_str().to_owned(),
+        approval: runtime.approval_mode.as_str().to_owned(),
+        available_tools,
+        skills: Vec::new(),
+        color: runtime.color,
+    };
+    let (app, _screen) = TuiApp::enter(context).map_err(XduduError::from)?;
+    let renderer = app.renderer();
+    let mut session_id = initial_session;
+
+    if let Some(prompt) = initial_prompt {
+        app.begin_prompt(&prompt).map_err(XduduError::from)?;
+        let result =
+            execute_prompt_with_sink(&runtime, prompt, session_id, &renderer, false).await?;
+        app.finish_prompt(&result).map_err(XduduError::from)?;
+        session_id = Some(result.session_id);
+    }
+
+    loop {
+        match app.read_input().map_err(XduduError::from)? {
+            InputOutcome::Exit => break,
+            InputOutcome::Interrupted => {
+                app.notice("再次按 Ctrl+D 或输入 /exit 可退出。")
+                    .map_err(XduduError::from)?;
+            }
+            InputOutcome::Submit(prompt) => {
+                app.begin_prompt(&prompt).map_err(XduduError::from)?;
+                let result =
+                    execute_prompt_with_sink(&runtime, prompt, session_id, &renderer, false)
+                        .await?;
+                app.finish_prompt(&result).map_err(XduduError::from)?;
+                session_id = Some(result.session_id);
+            }
+            InputOutcome::Command(command) => {
+                let input = command.trim();
+                match input {
+                    "/exit" | "/quit" | "/q" => break,
+                    "/help" | "/h" => {
+                        app.notice(
+                            "/new  新会话  ·  /model NAME  切换模型  ·  /turns N  最大循环次数  ·  /exit  退出",
+                        )
+                        .map_err(XduduError::from)?;
+                    }
+                    "/new" => {
+                        session_id = None;
+                        app.notice("已开始新会话。").map_err(XduduError::from)?;
+                    }
+                    _ => {
+                        if let Some(model) = input
+                            .strip_prefix("/model ")
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                        {
+                            runtime.model = model.to_owned();
+                            app.set_model(&runtime.model).map_err(XduduError::from)?;
+                        } else if let Some(turns) = input.strip_prefix("/turns ") {
+                            match turns.trim().parse::<u32>() {
+                                Ok(value) if (1..=100).contains(&value) => {
+                                    runtime.max_turns = value;
+                                    app.notice(format!("最大循环次数已设为 {value}。"))
+                                        .map_err(XduduError::from)?;
+                                }
+                                _ => app
+                                    .notice("最大循环次数必须是 1 到 100 之间的整数。")
+                                    .map_err(XduduError::from)?,
+                            }
+                        } else {
+                            app.notice(format!("未知命令：{input}"))
+                                .map_err(XduduError::from)?;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(0)
+}
+
+async fn plain_interactive_loop(
     mut runtime: Runtime,
     initial_prompt: Option<String>,
     initial_session: Option<Uuid>,
 ) -> Result<u8, XduduError> {
     let mut session_id = initial_session;
+    let mut editor = InputEditor::default();
     if let Some(prompt) = initial_prompt {
         let result = execute_prompt(&runtime, prompt, session_id).await?;
         runtime.renderer.finish_run(&result)?;
         session_id = Some(result.session_id);
     }
 
-    let stdin = tokio::io::stdin();
-    let mut lines = BufReader::new(stdin).lines();
     loop {
-        print!("\n❯ ");
-        io::stdout().flush().map_err(XduduError::from)?;
-        let Some(line) = lines.next_line().await.map_err(XduduError::from)? else {
-            break;
+        println!();
+        let prompt = ui::prompt(TerminalTheme::new(runtime.color));
+        let line = match editor.read_line(&prompt).map_err(XduduError::from)? {
+            ReadResult::Line(line) => line,
+            ReadResult::Interrupted => {
+                println!(
+                    "  {}",
+                    TerminalTheme::new(runtime.color).muted("已取消当前输入。")
+                );
+                continue;
+            }
+            ReadResult::Eof => break,
         };
         let input = line.trim();
         if input.is_empty() {
@@ -433,13 +585,14 @@ async fn interactive_loop(
         }
         match input {
             "/exit" | "/quit" | "/q" => {
-                println!("  再见！");
+                println!(
+                    "  {}",
+                    TerminalTheme::new(runtime.color).muted("再见，期待下次一起写代码。")
+                );
                 break;
             }
             "/help" | "/h" => {
-                println!(
-                    "  /help        显示帮助\n  /exit        退出\n  /new         开始新会话\n  /model NAME  切换模型\n  /turns N     修改最大循环次数"
-                );
+                print!("{}", ui::help(TerminalTheme::new(runtime.color)));
                 continue;
             }
             "/new" => {
@@ -749,7 +902,7 @@ async fn run() -> Result<u8, XduduError> {
         ));
     }
     let runtime = create_runtime(cwd, &resolved, interactive).await?;
-    if !resolved.config.output.json {
+    if !resolved.config.output.json && !interactive {
         print_banner(&runtime, interactive);
     }
     if interactive {

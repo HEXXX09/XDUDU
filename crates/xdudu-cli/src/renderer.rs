@@ -12,6 +12,8 @@ use async_trait::async_trait;
 use serde_json::json;
 use xdudu_core::{AgentEvent, AgentRunResult, EventSink, XduduError, redact_text, redact_value};
 
+use crate::ui::TerminalTheme;
+
 pub struct ConsoleRenderer {
     json: bool,
     stream: bool,
@@ -33,14 +35,6 @@ impl ConsoleRenderer {
 
     pub fn begin_run(&self) {
         self.emitted_assistant.store(false, Ordering::Release);
-    }
-
-    fn style(&self, code: &str, text: &str) -> String {
-        if self.color {
-            format!("\x1b[{code}m{text}\x1b[0m")
-        } else {
-            text.to_owned()
-        }
     }
 
     pub fn finish_run(&self, result: &AgentRunResult) -> Result<(), XduduError> {
@@ -82,6 +76,7 @@ impl EventSink for ConsoleRenderer {
             }
             return;
         }
+        let theme = TerminalTheme::new(self.color);
         match event {
             AgentEvent::AssistantDelta { text } if self.stream => {
                 self.emitted_assistant.store(true, Ordering::Release);
@@ -89,10 +84,10 @@ impl EventSink for ConsoleRenderer {
                 let _ = io::stdout().flush();
             }
             AgentEvent::ToolStarted { name, .. } => {
-                eprintln!("\n  {} {name}", self.style("36", "→"));
+                eprintln!("\n  {} {}", theme.accent("◆"), theme.strong(&name));
             }
             AgentEvent::ToolProgress {
-                name,
+                name: _,
                 phase,
                 completed,
                 total,
@@ -112,18 +107,22 @@ impl EventSink for ConsoleRenderer {
                     .map(redact_text)
                     .map(|message| format!("：{message}"))
                     .unwrap_or_default();
-                eprintln!("  {} {name}/{phase}{count}{message}", self.style("36", "·"));
+                eprintln!("  {} {phase}{count}{message}", theme.muted("│"));
             }
             AgentEvent::ToolFinished { name, result, .. } => {
                 let marker = if result.success {
-                    self.style("32", "✓")
+                    theme.success("✓")
                 } else {
-                    self.style("31", "✗")
+                    theme.danger("✗")
                 };
-                eprintln!("  {marker} {name}（{} ms）", result.duration_ms);
+                eprintln!(
+                    "  {} {marker} {name} {}",
+                    theme.muted("└"),
+                    theme.muted(&format!("{} ms", result.duration_ms))
+                );
             }
             AgentEvent::Warning { message, .. } => {
-                eprintln!("  {} {}", self.style("33", "警告："), redact_text(&message));
+                eprintln!("  {} {}", theme.warning("⚠ 警告"), redact_text(&message));
             }
             _ => {}
         }

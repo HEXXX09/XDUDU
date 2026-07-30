@@ -10,6 +10,7 @@ mod path_policy;
 mod search_text;
 mod terminal_exec;
 mod web_fetch;
+mod web_search;
 
 use std::{
     collections::HashMap,
@@ -44,6 +45,7 @@ pub use git_status::GitStatusTool;
 pub use search_text::SearchTextTool;
 pub use terminal_exec::TerminalExecTool;
 pub use web_fetch::WebFetchTool;
+pub use web_search::WebSearchTool;
 
 #[derive(Debug, Clone)]
 pub struct ToolDefinition {
@@ -426,6 +428,7 @@ pub fn register_builtins(registry: &mut ToolRegistry) -> XduduResult<()> {
     registry.register(SearchTextTool)?;
     registry.register(TerminalExecTool)?;
     registry.register(WebFetchTool)?;
+    registry.register(WebSearchTool)?;
     Ok(())
 }
 

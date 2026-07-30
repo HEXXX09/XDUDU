@@ -115,6 +115,7 @@ M2 已由 `main` 的 macOS、Linux 和 Windows CI 矩阵确认。
 
 ## M7：Plan 模式与任务执行
 
+- [x] M7-T00：优化系统提示词，建立 Planning、Acting、Observing、Reflecting 的 ReAct 运行基线，并实现本地无结果后的受控网络检索闭环；
 - [ ] M7-T01：定义 Plan、Step、依赖和状态；
 - [ ] M7-T02：实现规划提示词与结构化解析；
 - [ ] M7-T03：实现执行前审批和计划修改；

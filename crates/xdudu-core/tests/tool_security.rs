@@ -53,7 +53,7 @@ async fn 默认审批策略拒绝副作用工具() {
 #[test]
 fn 内置工具定义完整() {
     let definitions = registry().definitions();
-    assert_eq!(definitions.len(), 8);
+    assert_eq!(definitions.len(), 9);
     assert_eq!(
         definitions.iter().map(|item| item.name).collect::<Vec<_>>(),
         [
@@ -64,7 +64,8 @@ fn 内置工具定义完整() {
             "git_status",
             "search_text",
             "terminal_exec",
-            "web_fetch"
+            "web_fetch",
+            "web_search"
         ]
     );
 }
@@ -350,6 +351,24 @@ async fn search_text_遵守忽略规则并返回_unicode_列号() {
     assert_eq!(output["matches"].as_array().unwrap().len(), 1);
     assert_eq!(output["matches"][0]["path"], ".github/workflows/ci.yml");
     assert_eq!(output["matches"][0]["column"], 4);
+    assert!(output["nextActionHint"].is_null());
+
+    let empty = execute(
+        &registry(),
+        "search_text",
+        json!({"query":"不存在的外部知识"}),
+        dir.path(),
+        PermissionMode::ReadOnly,
+    )
+    .await;
+    let empty_output = empty.output.unwrap();
+    assert!(empty_output["matches"].as_array().unwrap().is_empty());
+    assert!(
+        empty_output["nextActionHint"]
+            .as_str()
+            .unwrap()
+            .contains("web_search")
+    );
 }
 
 #[tokio::test]
@@ -495,6 +514,28 @@ async fn web_fetch_所有权限模式都必须经过网络审批() {
             &denied_registry,
             "web_fetch",
             json!({"url":"https://example.com"}),
+            dir.path(),
+            mode,
+        )
+        .await;
+        assert_eq!(denied.error.unwrap().code, "APPROVAL_DENIED");
+    }
+}
+
+#[tokio::test]
+async fn web_search_所有权限模式都必须经过网络审批() {
+    let dir = tempdir().unwrap();
+    for mode in [
+        PermissionMode::ReadOnly,
+        PermissionMode::AutoSafe,
+        PermissionMode::FullAccess,
+    ] {
+        let mut denied_registry = ToolRegistry::new();
+        register_builtins(&mut denied_registry).unwrap();
+        let denied = execute(
+            &denied_registry,
+            "web_search",
+            json!({"query":"Rust programming language"}),
             dir.path(),
             mode,
         )

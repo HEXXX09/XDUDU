@@ -13,6 +13,7 @@ rust-version = "1.85"
 async-trait = "0.1.88"
 chrono = { version = "0.4.41", default-features = false, features = ["clock", "serde"] }
 clap = { version = "4.5.41", features = ["derive"] }
+crossterm = "0.29"
 futures-util = "0.3.33"
 fs2 = "0.4.3"
 globset = "0.4"
@@ -33,6 +34,7 @@ tokio = { version = "1.46.1", features = ["fs", "io-std", "io-util", "macros", "
 tokio-util = "0.7.15"
 toml = "1.1.3"
 url = { version = "2", features = ["serde"] }
+unicode-width = "0.2"
 uuid = { version = "1.17.0", features = ["v4", "serde"] }
 zeroize = "1.9.0"
 

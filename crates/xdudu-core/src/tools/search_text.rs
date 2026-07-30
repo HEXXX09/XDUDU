@@ -247,12 +247,16 @@ fn run_search(
         }
     }
 
+    let next_action_hint = matches.is_empty().then_some(
+        "本地未找到匹配项。若用户询问通用知识、查询、研究或时效性信息且未限制仅使用本地资料，请改用 web_search；若问题明确属于当前项目，请调整关键词或搜索范围。",
+    );
     Ok(json!({
         "matches": matches,
         "matchedFiles": matched_files.len(),
         "scannedFiles": scanned_files,
         "truncated": truncated,
         "truncationReason": truncation_reason,
+        "nextActionHint": next_action_hint,
     }))
 }
 

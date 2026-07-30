@@ -197,7 +197,7 @@ async fn doh_addresses(
     Ok(addresses.into_iter().collect())
 }
 
-async fn pinned_client(url: &Url, timeout: Duration) -> Result<Client, String> {
+pub(super) async fn pinned_client(url: &Url, timeout: Duration) -> Result<Client, String> {
     let started = Instant::now();
     validate_url(url)?;
     let host = url

@@ -117,26 +117,29 @@ Anthropic 按 content block 索引聚合文本、工具名和 `input_json_delta`
 状态机：
 
 ```text
-Idle → Planning → Acting → Observing
-                 ↑         │
-                 └─────────┘
+Idle → Planning → Acting → Observing → Reflecting
+                 ↑                       │
+                 └───────────────────────┘
 
 任意运行态 → Completed | Incomplete | Interrupted | Error
 ```
 
-Agent 将状态、文本增量、工具开始、工具进度、工具结束、用量和告警发送为 `AgentEvent`。每个工具调用拥有容量为 64 的非阻塞进度通道；通道满时丢弃中间更新，工具执行不能因 UI 变慢而阻塞。Renderer 只是消费者，不能改变 Agent 领域状态。达到最大轮次或模型长度截断均为 `Incomplete`。
+首轮模型请求处于 `Planning`，执行工具时进入 `Acting`，工具结果落入上下文后进入 `Observing`，下一次携带观察结果请求模型时进入 `Reflecting`。系统提示词只提供简短工具索引；结构化输入 Schema 只通过 Provider 的 `tools` 字段发送，避免重复占用上下文。模型不输出内部思维链，只通过工具调用、进度和最终结论表现 ReAct 循环。
+
+Agent 将状态、文本增量、工具开始、工具进度、工具结束、用量和告警发送为 `AgentEvent`。每个工具调用拥有容量为 64 的非阻塞进度通道；通道满时丢弃中间更新，工具执行不能因 UI 变慢而阻塞。同批工具中一旦出现拒绝，后续副作用工具会被阻止，只读工具仍可执行。Renderer 只是消费者，不能改变 Agent 领域状态。达到最大轮次、模型长度截断、未执行工具调用或仍有未解决的工具失败均为 `Incomplete`。
 
 ## 8. Renderer
 
-CLI Renderer 有三种输出策略：
+CLI Renderer 有四种输出策略：
 
 | 模式 | 行为 |
 | --- | --- |
-| 默认 | 文本增量立即写终端，工具事件给出已脱敏的阶段提示 |
+| 交互 TTY | 全屏对话时间线；文本、工具、状态和用量事件原位更新，底部 Composer 独占输入 |
+| 非交互默认 | 文本增量立即写终端，工具事件给出已脱敏的阶段提示 |
 | `--no-stream` | 缓存助手文本，但仍实时显示工具阶段 |
 | `--json` | 每个事件一行 JSON，末尾输出运行结果 |
 
-`--no-color` 和 `NO_COLOR` 禁用颜色。JSON 字段不包含 ANSI，并适合管道消费。CLI 的打印错误也不得包含 Secret 原文。
+所有模式先经过统一脱敏。交互 TTY 不允许核心层直接写终端，TUI 根据 `AgentEvent` 维护静态对话、流式回复、工具活动和底部状态；不支持 TUI 的终端自动降级为行式输入。`--no-color` 和 `NO_COLOR` 禁用颜色。JSON 字段不包含 ANSI，并适合管道消费。CLI 的打印错误也不得包含 Secret 原文。
 
 ## 9. 工具和权限
 
@@ -167,7 +170,9 @@ ToolRegistry 的固定顺序是：
 
 `xdudu approval list/revoke/clear` 用于管理永久规则。`never` 始终拒绝，显式全局 `--approval always` 仍表示调用方批准全部当前运行操作，不依赖细粒度规则。
 
-`web_fetch` 是只读工具，因此三种权限模式都可以提出调用；其 `NetworkAccess` 副作用始终进入 ApprovalGate，由 `ask`、`never`、`always` 单独决定是否联网。实现仅发起 GET，不转发代理凭据并禁用自动重定向；每一跳重新解析 DNS、拒绝任一非公网地址并把已验证地址固定给 reqwest，防止 DNS 重绑定。系统 DNS 使用代理 Fake-IP 时通过固定公网 DoH 获取真实记录，结果仍接受同一公网检查。响应只接受 HTML、纯文本和 JSON，大小、超时、重定向次数均有硬限制。
+`web_search` 和 `web_fetch` 都是本地只读、网络有副作用的工具，因此三种权限模式都可以提出调用；其 `NetworkAccess` 副作用始终进入 ApprovalGate，由 `ask`、`never`、`always` 单独决定是否联网。`web_search` 使用固定搜索入口，查询、结果数量、响应大小和超时均有硬限制，只返回可继续抓取的 HTTPS 链接。Agent 遇到通用查询或本地搜索无结果时，可在 ReAct 循环中执行“网络搜索 → 抓取相关来源 → 综合回答”，网络拒绝或无可靠资料时才结束并说明限制。
+
+`web_fetch` 仅发起 GET，不转发代理凭据并禁用自动重定向；每一跳重新解析 DNS、拒绝任一非公网地址并把已验证地址固定给 reqwest，防止 DNS 重绑定。系统 DNS 使用代理 Fake-IP 时通过固定公网 DoH 获取真实记录，结果仍接受同一公网检查。响应只接受 HTML、纯文本和 JSON，大小、超时、重定向次数均有硬限制。
 
 ## 10. 会话、脱敏与变更账本
 

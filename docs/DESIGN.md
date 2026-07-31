@@ -187,6 +187,33 @@ ToolRegistry 的固定顺序是：
 - `session list/show/resume` 提供查询和恢复入口；
 - 输入预算超限后压缩较早上下文，但完整原始消息仍保存在数据库。
 
+交互 TTY 支持在当前界面输入 `/resume` 打开最近会话选择器，使用上下键选择、Enter 恢复、Esc 取消；`/resume <UUID>` 可直接恢复。恢复只读取当前工作区数据库，并重建用户与助手时间线；工具结果仍保存在会话中，但不会作为普通对话块重复展示。
+
+## 10.1 Plan 领域基础
+
+M7 显式计划使用独立的 `Plan`、`PlanStep` 和 `PlanStore`，与单次 Agent 请求内部的隐藏 ReAct 状态分离。`Plan` 当前 Schema 版本为 1，包含会话 ID、目标、计划状态、步骤、审批和完成时间；步骤包含依赖、完成条件、执行结果和错误。
+
+计划依赖必须引用同一计划中存在的步骤，不允许自身依赖、重复依赖或环，单个计划最多 100 个步骤。领域层只允许显式状态迁移：
+
+```text
+draft → pending_approval → approved → running
+  ↑            │                         ├─ completed
+  └────────────┘                         ├─ failed
+                                        └─ cancelled
+```
+
+步骤状态为 `pending`、`ready`、`running`、`completed`、`failed`、`blocked`、`skipped` 或 `cancelled`。只有全部依赖已完成或跳过的待执行步骤才会被识别为可运行；计划存在未完成步骤时不能标记为完成。
+
+SQLite Schema v2 增加独立 `plans` 表和按会话、更新时间排序的索引。`PlanStore` 提供创建、更新、按 ID 查询和获取会话最近计划；落盘前对目标、描述、完成条件、结果和错误统一脱敏。旧会话中的 `plan` JSON 字段继续保留用于兼容，不会被破坏性转换。
+
+## 10.2 结构化计划生成
+
+M7.2 使用独立于普通 ReAct Agent 的规划 Prompt。规划请求只向 Provider 暴露一个协议工具 `submit_plan`；该工具不会注册进 `ToolRegistry`，不能读取文件、执行命令、访问网络或产生其他副作用。
+
+`submit_plan` 返回步骤 key、标题、描述、依赖 key 和完成条件。解析器要求 Provider 以 `tool_calls` 结束、只调用一次正确工具且不夹带普通文本；DTO 启用未知字段拒绝。随后运行时将稳定 key 映射为 UUID，校验数量、文本上限、重复 key、未知依赖、自身依赖、重复依赖和循环依赖。只有全部校验通过，才通过 `PlanStore` 原子创建 `draft` 计划；截断、内容过滤或协议错误不会留下计划记录。
+
+这一阶段不审批也不执行计划。`pending_approval` 迁移、计划修改和执行调度属于 M7.3 及后续阶段，不能由模型普通文本触发。
+
 `redact_text` 和 `redact_value` 覆盖 `sk-`、GitHub Token、Bearer Token、PEM 私钥以及 key、token、secret、password、authorization 等敏感结构字段。会话保存、Renderer 和顶层错误共用该边界，避免只在 UI 层遮盖。
 
 `JsonChangeLedger` 的新记录使用 `schemaVersion: 2`，一个工具调用只生成一个事务 ID。事务保存文件操作、原权限、前后镜像和 SHA-256，并经历 `Prepared → Applying → Applied`；失败可进入 `RolledBack`，用户冲突进入 `Conflict`，撤销后进入 `Undone`。启动恢复会检查未完成事务全部文件的当前哈希；只在内容可判定时恢复前镜像，不能判定时不覆盖用户文件。`undo` 先预检全部后哈希再整批恢复，同时保持 v1 单文件账本兼容。终端命令与网络访问的外部副作用不可通用撤销。

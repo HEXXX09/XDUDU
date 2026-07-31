@@ -201,7 +201,7 @@ M1 已完成 Rust Agent、工具、权限、会话和两个 Provider 的基础�
 - `session list/show/resume`、工作区跨进程锁和崩溃恢复；
 - 工具调用防重放记录、Token 预算和长上下文压缩。
 
-Provider 扩展与 fallback 按当前产品决定暂缓，DeepSeek 为主用路径。尚未完成的主要需求包括 Plan 模式、MCP、插件和 RAG。`web_fetch` 当前只处理 HTML 可读文本、纯文本和 JSON，不是文件下载器，也不使用浏览器登录状态。
+Provider 扩展与 fallback 按当前产品决定暂缓，DeepSeek 为主用路径。M7 已建立会话内 `/resume`、版本化 Plan/Step 领域模型、依赖 DAG 校验、SQLite 持久化和严格的结构化计划生成；当前只保存 Draft，不会自动审批或执行。执行前审批、计划修改和步骤调度尚未实现。其余主要需求包括 MCP、插件和 RAG。`web_fetch` 当前只处理 HTML 可读文本、纯文本和 JSON，不是文件下载器，也不使用浏览器登录状态。
 
 ## 7. 暂不包含
 

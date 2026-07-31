@@ -346,7 +346,7 @@ impl JsonChangeLedger {
         &self,
         path: &Path,
         image_hex: Option<&str>,
-        mode: Option<u32>,
+        _mode: Option<u32>,
     ) -> XduduResult<()> {
         if let Some(image_hex) = image_hex {
             let bytes = hex::decode(image_hex)
@@ -358,7 +358,7 @@ impl JsonChangeLedger {
             let temporary = path.with_extension(format!("xdudu-restore-{}", Uuid::new_v4()));
             fs::write(&temporary, bytes).await?;
             #[cfg(unix)]
-            if let Some(mode) = mode {
+            if let Some(mode) = _mode {
                 use std::os::unix::fs::PermissionsExt;
                 fs::set_permissions(&temporary, std::fs::Permissions::from_mode(mode)).await?;
             }

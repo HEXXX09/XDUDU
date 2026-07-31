@@ -26,16 +26,17 @@ use xdudu_core::{
     ApprovalMode, ApprovalRequest, ApprovalRule, ApprovalScope, ConfigOverrides,
     DefaultProviderFactory, DenyAllApprovalGate, EventSink, JsonApprovalRuleStore,
     JsonChangeLedger, KeyringSecretStore, PermissionMode, Provider, ProviderFactory,
-    ResolvedConfig, SecretSource, SecretStore, SecretString, SessionStore, SqliteSessionStore,
-    ToolRegistry, WorkspaceLock, XduduError, approval_rules_path, config_paths, load_config,
-    redact_text, redact_value, register_builtins, resolve_secret, run_agent, write_config_value,
+    ResolvedConfig, SecretSource, SecretStore, SecretString, Session, SessionStore,
+    SqliteSessionStore, ToolRegistry, WorkspaceLock, XduduError, approval_rules_path, config_paths,
+    load_config, redact_text, redact_value, register_builtins, resolve_secret, run_agent,
+    write_config_value,
 };
 
 use crate::approval_prompt::{ApprovalMenuChoice, read_approval_menu};
 use crate::doctor::run_doctor;
 use crate::input_editor::{InputEditor, ReadResult};
 use crate::renderer::ConsoleRenderer;
-use crate::tui::{InputOutcome, TuiApp, TuiContext};
+use crate::tui::{InputOutcome, SessionChoice, TuiApp, TuiContext};
 use crate::ui::TerminalTheme;
 
 #[derive(Debug, Parser)]
@@ -484,6 +485,10 @@ async fn tui_interactive_loop(
     let renderer = app.renderer();
     let mut session_id = initial_session;
 
+    if let Some(id) = session_id {
+        let session = session_for_resume(&runtime, id).await?;
+        app.load_session(&session).map_err(XduduError::from)?;
+    }
     if let Some(prompt) = initial_prompt {
         app.begin_prompt(&prompt).map_err(XduduError::from)?;
         let result =
@@ -513,7 +518,7 @@ async fn tui_interactive_loop(
                     "/exit" | "/quit" | "/q" => break,
                     "/help" | "/h" => {
                         app.notice(
-                            "/new  新会话  ·  /model NAME  切换模型  ·  /turns N  最大循环次数  ·  /exit  退出",
+                            "/new  新会话  ·  /resume  恢复会话  ·  /model NAME  切换模型  ·  /turns N  最大循环次数  ·  /exit  退出",
                         )
                         .map_err(XduduError::from)?;
                     }
@@ -521,8 +526,42 @@ async fn tui_interactive_loop(
                         session_id = None;
                         app.notice("已开始新会话。").map_err(XduduError::from)?;
                     }
+                    "/resume" => {
+                        let sessions = runtime.store.list(20).await?;
+                        if sessions.is_empty() {
+                            app.notice("当前工作区还没有可恢复的历史会话。")
+                                .map_err(XduduError::from)?;
+                            continue;
+                        }
+                        let choices = sessions.iter().map(session_choice).collect();
+                        if let Some(id) = app.select_session(choices).map_err(XduduError::from)? {
+                            let session = session_for_resume(&runtime, id).await?;
+                            app.load_session(&session).map_err(XduduError::from)?;
+                            session_id = Some(id);
+                        }
+                    }
                     _ => {
-                        if let Some(model) = input
+                        if let Some(raw_id) = input
+                            .strip_prefix("/resume ")
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                        {
+                            match Uuid::parse_str(raw_id) {
+                                Ok(id) => match session_for_resume(&runtime, id).await {
+                                    Ok(session) => {
+                                        app.load_session(&session).map_err(XduduError::from)?;
+                                        session_id = Some(id);
+                                    }
+                                    Err(error) => {
+                                        app.notice(error.message).map_err(XduduError::from)?;
+                                    }
+                                },
+                                Err(_) => {
+                                    app.notice("会话 ID 必须是完整 UUID。")
+                                        .map_err(XduduError::from)?;
+                                }
+                            }
+                        } else if let Some(model) = input
                             .strip_prefix("/model ")
                             .map(str::trim)
                             .filter(|value| !value.is_empty())
@@ -550,6 +589,31 @@ async fn tui_interactive_loop(
         }
     }
     Ok(0)
+}
+
+async fn session_for_resume(runtime: &Runtime, id: Uuid) -> Result<Session, XduduError> {
+    let session = runtime
+        .store
+        .get(id)
+        .await?
+        .ok_or_else(|| XduduError::validation(format!("找不到会话：{id}")))?;
+    if session.cwd != runtime.cwd {
+        return Err(XduduError::validation("不能在不同工作目录中恢复已有会话。"));
+    }
+    Ok(session)
+}
+
+fn session_choice(session: &Session) -> SessionChoice {
+    let status = serde_json::to_string(&session.status)
+        .unwrap_or_else(|_| "\"unknown\"".into())
+        .trim_matches('"')
+        .to_owned();
+    SessionChoice {
+        id: session.id,
+        title: session.title.clone(),
+        status,
+        updated_at: session.updated_at.format("%m-%d %H:%M").to_string(),
+    }
 }
 
 async fn plain_interactive_loop(
@@ -600,7 +664,23 @@ async fn plain_interactive_loop(
                 println!("  已开始新会话。");
                 continue;
             }
+            "/resume" => {
+                println!("  当前终端不支持会话选择器，请使用 /resume <会话UUID>。");
+                continue;
+            }
             _ => {}
+        }
+        if let Some(raw_id) = input
+            .strip_prefix("/resume ")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let id = Uuid::parse_str(raw_id)
+                .map_err(|_| XduduError::validation("会话 ID 必须是完整 UUID。"))?;
+            let session = session_for_resume(&runtime, id).await?;
+            session_id = Some(id);
+            println!("  已恢复会话：{}", session.title);
+            continue;
         }
         if let Some(model) = input
             .strip_prefix("/model ")

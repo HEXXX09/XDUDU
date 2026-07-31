@@ -27,6 +27,7 @@ XDUDU 是一个使用 Rust 实现的终端 AI 编程助手。它把自然语言�
 - SQLite 会话存储、旧 JSON 自动迁移、跨进程锁和崩溃恢复；
 - `session list/show/resume` 会话查询与恢复命令；
 - 长会话 Token 预算、上下文压缩和关键计划保留；
+- 结构化 Plan 生成协议、严格依赖校验和 Draft 持久化基础；
 - 密钥、Bearer Token、私钥和敏感结构字段的统一输出及会话脱敏；
 - macOS、Linux、Windows CI 与多平台 Release 归档工作流。
 
@@ -150,6 +151,15 @@ xdudu session resume <会话UUID> "继续完成刚才的任务"
 xdudu session resume <会话UUID>  # 进入交互模式
 ```
 
+在全屏交互界面中也可以直接输入：
+
+```text
+/resume
+/resume <会话UUID>
+```
+
+不带 ID 时会显示最近会话列表，可使用 `↑/↓` 选择、Enter 恢复、Esc 取消。恢复后当前界面会重新加载历史用户和助手消息。
+
 同一工作区只允许一个会修改状态的 XDUDU 进程运行。进程异常退出后，操作系统会自动释放锁；下次启动会把遗留的运行中会话标记为 `interrupted`。执行前已经记录但结果未知的工具调用会标记为 `cancelled`，不会被自动重放。
 
 较长会话超过输入预算时，XDUDU 会压缩较早上下文并保留计划、关键消息和工具摘要。原始消息仍完整保存在 SQLite 中。
@@ -247,6 +257,7 @@ xdudu-core
   ├── file_read / file_write / search_text / apply_patch
   ├── git_status / git_diff / web_search / web_fetch / terminal_exec
   ├── SqliteSessionStore + WorkspaceLock + Context Compression
+  ├── Plan + PlanStep + PlanStore + PlanGenerator
   └── JsonChangeLedger + Undo
 ```
 
@@ -258,6 +269,7 @@ xdudu-core
 - [v0.4.0 安全治理设计与验收](docs/SAFETY_GOVERNANCE_DESIGN.md)
 - [v0.5.0 会话恢复与上下文设计](docs/M5_SESSION_RECOVERY_DESIGN.md)
 - [v0.6.0 工具与网络安全设计](docs/M6_TOOLING_WEB_DESIGN.md)
+- [M7 Plan 基础设计](docs/M7_PLAN_FOUNDATION_DESIGN.md)
 - [产品需求](docs/PRD.md)
 - [任务路线图](docs/TASKS.md)
 - [Rust 迁移记录](docs/RUST_MIGRATION.md)

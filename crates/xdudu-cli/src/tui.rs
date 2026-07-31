@@ -22,7 +22,10 @@ use crossterm::{
     },
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
-use xdudu_core::{AgentEvent, AgentLoopState, AgentRunResult, EventSink, redact_text};
+use xdudu_core::{
+    AgentEvent, AgentLoopState, AgentRunResult, EventSink, Session, provider::MessageRole,
+    redact_text,
+};
 
 use crate::ui::{model_display_name, supports_true_color};
 
@@ -86,7 +89,7 @@ struct SlashCommand {
     requires_argument: bool,
 }
 
-const SLASH_COMMANDS: [SlashCommand; 5] = [
+const SLASH_COMMANDS: [SlashCommand; 6] = [
     SlashCommand {
         name: "/help",
         usage: "/help",
@@ -97,6 +100,12 @@ const SLASH_COMMANDS: [SlashCommand; 5] = [
         name: "/new",
         usage: "/new",
         description: "开始新会话",
+        requires_argument: false,
+    },
+    SlashCommand {
+        name: "/resume",
+        usage: "/resume [id]",
+        description: "浏览并恢复历史会话",
         requires_argument: false,
     },
     SlashCommand {
@@ -144,6 +153,21 @@ struct TuiState {
     available_tools: Vec<String>,
     skills: Vec<String>,
     show_intro: bool,
+    session_picker: Option<SessionPicker>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SessionChoice {
+    pub(crate) id: uuid::Uuid,
+    pub(crate) title: String,
+    pub(crate) status: String,
+    pub(crate) updated_at: String,
+}
+
+#[derive(Debug)]
+struct SessionPicker {
+    choices: Vec<SessionChoice>,
+    selected: usize,
 }
 
 #[derive(Clone)]
@@ -247,6 +271,7 @@ impl TuiApp {
             available_tools: context.available_tools,
             skills: context.skills,
             show_intro: true,
+            session_picker: None,
         };
         let app = Self {
             renderer: TuiRenderer {
@@ -276,6 +301,71 @@ impl TuiApp {
         push_block(&mut state, Role::System, message.into());
         drop(state);
         self.renderer.draw()
+    }
+
+    pub(crate) fn load_session(&self, session: &Session) -> io::Result<()> {
+        let mut state = self.renderer.state.lock().unwrap();
+        load_session_state(&mut state, session);
+        drop(state);
+        self.renderer.draw()
+    }
+
+    pub(crate) fn select_session(
+        &self,
+        choices: Vec<SessionChoice>,
+    ) -> io::Result<Option<uuid::Uuid>> {
+        if choices.is_empty() {
+            return Ok(None);
+        }
+        let _raw = RawGuard::enter()?;
+        {
+            let mut state = self.renderer.state.lock().unwrap();
+            state.input_active = false;
+            state.session_picker = Some(SessionPicker {
+                choices,
+                selected: 0,
+            });
+        }
+        self.renderer.draw()?;
+
+        let selected = loop {
+            let Event::Key(key) = read()? else {
+                continue;
+            };
+            if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+                continue;
+            }
+            let mut state = self.renderer.state.lock().unwrap();
+            let Some(picker) = state.session_picker.as_mut() else {
+                break None;
+            };
+            match key.code {
+                KeyCode::Up => {
+                    picker.selected = if picker.selected == 0 {
+                        picker.choices.len() - 1
+                    } else {
+                        picker.selected - 1
+                    };
+                }
+                KeyCode::Down => {
+                    picker.selected = (picker.selected + 1) % picker.choices.len();
+                }
+                KeyCode::Enter => break Some(picker.choices[picker.selected].id),
+                KeyCode::Esc => break None,
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break None,
+                _ => {}
+            }
+            drop(state);
+            self.renderer.draw()?;
+        };
+
+        {
+            let mut state = self.renderer.state.lock().unwrap();
+            state.session_picker = None;
+            state.input_active = true;
+        }
+        self.renderer.draw()?;
+        Ok(selected)
     }
 
     pub(crate) fn begin_prompt(&self, prompt: &str) -> io::Result<()> {
@@ -353,6 +443,9 @@ impl TuiRenderer {
         }
         draw_transcript(&mut stdout, &state, columns, rows, self.color)?;
         draw_chrome(&mut stdout, &state, columns, rows, self.color)?;
+        if state.session_picker.is_some() {
+            draw_session_picker(&mut stdout, &state, columns, rows, self.color)?;
+        }
         stdout.flush()
     }
 }
@@ -602,6 +695,29 @@ fn load_history(state: &mut TuiState, index: usize) {
     state.cursor = state.input.len();
     state.history_index = Some(index);
     state.command_selection = 0;
+}
+
+fn load_session_state(state: &mut TuiState, session: &Session) {
+    state.transcript.clear();
+    state.streaming.clear();
+    state.tools.clear();
+    state.input.clear();
+    state.cursor = 0;
+    state.history_index = None;
+    state.show_intro = false;
+    state.status = "已恢复会话".into();
+    state.usage = Some((session.total_input_tokens, session.total_output_tokens));
+    for message in &session.messages {
+        let role = match message.role {
+            MessageRole::User => Role::User,
+            MessageRole::Assistant => Role::Assistant,
+            MessageRole::System => Role::System,
+            MessageRole::Tool => continue,
+        };
+        if !message.content.trim().is_empty() {
+            push_block(state, role, redact_text(&message.content));
+        }
+    }
 }
 
 fn replace_input(state: &mut TuiState, value: &str) {
@@ -1172,6 +1288,72 @@ fn draw_command_suggestions(
     Ok(())
 }
 
+fn draw_session_picker(
+    writer: &mut impl Write,
+    state: &TuiState,
+    columns: u16,
+    rows: u16,
+    color: bool,
+) -> io::Result<()> {
+    let Some(picker) = &state.session_picker else {
+        return Ok(());
+    };
+    let top = 1;
+    let bottom = rows.saturating_sub(2);
+    for row in top..=bottom {
+        queue!(writer, MoveTo(0, row), Clear(ClearType::CurrentLine))?;
+    }
+
+    set_color(writer, color, PRIMARY)?;
+    queue!(
+        writer,
+        MoveTo(2, top),
+        SetAttribute(Attribute::Bold),
+        Print("恢复历史会话"),
+        SetAttribute(Attribute::Reset)
+    )?;
+    set_color(writer, color, MUTED)?;
+    queue!(
+        writer,
+        MoveTo(2, top + 1),
+        Print("↑↓ 选择 · Enter 恢复 · Esc 取消")
+    )?;
+
+    let visible = usize::from(rows.saturating_sub(6)).max(1);
+    let start = picker
+        .selected
+        .saturating_sub(visible.saturating_sub(1))
+        .min(picker.choices.len().saturating_sub(visible));
+    for (offset, choice) in picker.choices.iter().skip(start).take(visible).enumerate() {
+        let index = start + offset;
+        let row = top + 3 + offset as u16;
+        let selected = index == picker.selected;
+        set_color(writer, color, if selected { PRIMARY } else { TEXT })?;
+        if selected {
+            queue!(writer, SetAttribute(Attribute::Bold))?;
+        }
+        let id = choice.id.to_string();
+        let line = format!(
+            "{} {}  {}  {:<11}  {}",
+            if selected { "›" } else { " " },
+            &id[..8],
+            choice.updated_at,
+            choice.status,
+            choice.title.replace(['\r', '\n'], " ")
+        );
+        queue!(
+            writer,
+            MoveTo(2, row),
+            Print(truncate_to_width(
+                &line,
+                usize::from(columns.saturating_sub(4))
+            )),
+            SetAttribute(Attribute::Reset)
+        )?;
+    }
+    reset_color(writer, color)
+}
+
 fn truncate_to_width(value: &str, width: usize) -> String {
     if UnicodeWidthStr::width(value) <= width {
         return value.to_owned();
@@ -1282,6 +1464,7 @@ mod tests {
             available_tools: vec!["file_read".into(), "git_status".into()],
             skills: Vec::new(),
             show_intro: true,
+            session_picker: None,
         }
     }
 
@@ -1329,6 +1512,66 @@ mod tests {
         }
         assert_eq!(handle_input_key(&mut state, key(KeyCode::Enter)), None);
         assert_eq!(state.input.iter().collect::<String>(), "/model ");
+    }
+
+    #[test]
+    fn resume_可以通过斜杠候选定位() {
+        let input = "/r".chars().collect::<Vec<_>>();
+        let commands = matching_commands(&input);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].name, "/resume");
+    }
+
+    #[test]
+    fn 恢复会话会重建用户和助手时间线() {
+        let session: Session = serde_json::from_value(serde_json::json!({
+            "id": uuid::Uuid::new_v4(),
+            "title": "历史会话",
+            "cwd": "/work",
+            "status": "completed",
+            "currentState": "COMPLETED",
+            "plan": {},
+            "providerName": "deepseek",
+            "model": "deepseek-chat",
+            "messages": [
+                {
+                    "id": uuid::Uuid::new_v4(),
+                    "role": "user",
+                    "content": "问题",
+                    "sequence": 0,
+                    "createdAt": "2026-07-30T00:00:00Z"
+                },
+                {
+                    "id": uuid::Uuid::new_v4(),
+                    "role": "assistant",
+                    "content": "回答",
+                    "sequence": 1,
+                    "createdAt": "2026-07-30T00:00:01Z"
+                },
+                {
+                    "id": uuid::Uuid::new_v4(),
+                    "role": "tool",
+                    "content": "工具结果",
+                    "toolCallId": "call-1",
+                    "sequence": 2,
+                    "createdAt": "2026-07-30T00:00:02Z"
+                }
+            ],
+            "toolCalls": [],
+            "totalInputTokens": 12,
+            "totalOutputTokens": 8,
+            "createdAt": "2026-07-30T00:00:00Z",
+            "updatedAt": "2026-07-30T00:00:02Z",
+            "completedAt": "2026-07-30T00:00:02Z"
+        }))
+        .unwrap();
+        let mut state = state();
+        load_session_state(&mut state, &session);
+        assert_eq!(state.transcript.len(), 2);
+        assert_eq!(state.transcript[0].role, Role::User);
+        assert_eq!(state.transcript[1].role, Role::Assistant);
+        assert_eq!(state.usage, Some((12, 8)));
+        assert!(!state.show_intro);
     }
 
     #[test]

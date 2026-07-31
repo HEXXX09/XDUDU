@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 use crate::{
     XduduError, XduduResult,
+    plan::{Plan, PlanStore, sanitized_plan},
     provider::MessageRole,
     session::{
         AgentLoopState, Message, Session, SessionStatus, SessionStore, ToolCallStatus,
@@ -131,8 +132,23 @@ impl SqliteSessionStore {
                 );
                 CREATE INDEX IF NOT EXISTS sessions_updated_at_idx
                     ON sessions(updated_at DESC);
+                CREATE TABLE IF NOT EXISTS plans (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    schema_version INTEGER NOT NULL,
+                    plan_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS plans_session_updated_idx
+                    ON plans(session_id, updated_at DESC);
                 INSERT OR IGNORE INTO schema_migrations(version, applied_at)
                     VALUES (1, CURRENT_TIMESTAMP);
+                INSERT OR IGNORE INTO schema_migrations(version, applied_at)
+                    VALUES (2, CURRENT_TIMESTAMP);
                 ",
             )
             .map_err(|error| XduduError::tool(format!("初始化会话数据库失败：{error}")))?;
@@ -411,6 +427,66 @@ fn update_session(connection: &Connection, session: &Session) -> XduduResult<()>
     Ok(())
 }
 
+fn plan_values(plan: &Plan) -> XduduResult<(Plan, String)> {
+    plan.validate()?;
+    let sanitized = sanitized_plan(plan);
+    let raw = serde_json::to_string(&sanitized)?;
+    Ok((sanitized, raw))
+}
+
+fn insert_plan(connection: &Connection, plan: &Plan) -> XduduResult<()> {
+    let (plan, raw) = plan_values(plan)?;
+    connection
+        .execute(
+            "INSERT INTO plans (
+                id, session_id, status, schema_version, plan_json,
+                created_at, updated_at, completed_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                plan.id.to_string(),
+                plan.session_id.to_string(),
+                enum_name(plan.status)?,
+                i64::from(plan.schema_version),
+                raw,
+                plan.created_at.to_rfc3339(),
+                plan.updated_at.to_rfc3339(),
+                plan.completed_at.map(|value| value.to_rfc3339()),
+            ],
+        )
+        .map_err(|error| XduduError::tool(format!("创建计划失败：{error}")))?;
+    Ok(())
+}
+
+fn update_plan(connection: &Connection, plan: &Plan) -> XduduResult<()> {
+    let (plan, raw) = plan_values(plan)?;
+    let changed = connection
+        .execute(
+            "UPDATE plans SET
+                status = ?3, schema_version = ?4, plan_json = ?5,
+                created_at = ?6, updated_at = ?7,
+                completed_at = ?8
+             WHERE id = ?1 AND session_id = ?2",
+            params![
+                plan.id.to_string(),
+                plan.session_id.to_string(),
+                enum_name(plan.status)?,
+                i64::from(plan.schema_version),
+                raw,
+                plan.created_at.to_rfc3339(),
+                plan.updated_at.to_rfc3339(),
+                plan.completed_at.map(|value| value.to_rfc3339()),
+            ],
+        )
+        .map_err(|error| XduduError::tool(format!("更新计划失败：{error}")))?;
+    if changed == 0 {
+        return Err(XduduError::validation(format!(
+            "找不到要更新的计划：{}",
+            plan.id
+        )));
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl SessionStore for SqliteSessionStore {
     async fn create(&self, session: &Session) -> XduduResult<()> {
@@ -479,6 +555,71 @@ impl SessionStore for SqliteSessionStore {
     }
 }
 
+#[async_trait]
+impl PlanStore for SqliteSessionStore {
+    async fn create_plan(&self, plan: &Plan) -> XduduResult<()> {
+        let plan = plan.clone();
+        self.run_blocking(move |mut connection| {
+            let transaction = connection
+                .transaction()
+                .map_err(|error| XduduError::tool(format!("开始创建计划事务失败：{error}")))?;
+            insert_plan(&transaction, &plan)?;
+            transaction
+                .commit()
+                .map_err(|error| XduduError::tool(format!("提交创建计划事务失败：{error}")))
+        })
+        .await
+    }
+
+    async fn update_plan(&self, plan: &Plan) -> XduduResult<()> {
+        let plan = plan.clone();
+        self.run_blocking(move |mut connection| {
+            let transaction = connection
+                .transaction()
+                .map_err(|error| XduduError::tool(format!("开始更新计划事务失败：{error}")))?;
+            update_plan(&transaction, &plan)?;
+            transaction
+                .commit()
+                .map_err(|error| XduduError::tool(format!("提交更新计划事务失败：{error}")))
+        })
+        .await
+    }
+
+    async fn get_plan(&self, plan_id: Uuid) -> XduduResult<Option<Plan>> {
+        self.run_blocking(move |connection| {
+            let raw = connection
+                .query_row(
+                    "SELECT plan_json FROM plans WHERE id = ?1",
+                    [plan_id.to_string()],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|error| XduduError::tool(format!("读取计划失败：{error}")))?;
+            raw.map(|value| serde_json::from_str(&value).map_err(XduduError::from))
+                .transpose()
+        })
+        .await
+    }
+
+    async fn latest_plan_for_session(&self, session_id: Uuid) -> XduduResult<Option<Plan>> {
+        self.run_blocking(move |connection| {
+            let raw = connection
+                .query_row(
+                    "SELECT plan_json FROM plans
+                     WHERE session_id = ?1
+                     ORDER BY updated_at DESC LIMIT 1",
+                    [session_id.to_string()],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|error| XduduError::tool(format!("读取会话计划失败：{error}")))?;
+            raw.map(|value| serde_json::from_str(&value).map_err(XduduError::from))
+                .transpose()
+        })
+        .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -508,6 +649,15 @@ mod tests {
         }
     }
 
+    fn sample_plan(session_id: Uuid) -> Plan {
+        Plan::new(
+            session_id,
+            "完成 SQLite 计划测试",
+            vec![crate::plan::PlanStep::new("验证计划", "检查持久化结果")],
+        )
+        .unwrap()
+    }
+
     #[tokio::test]
     async fn sqlite_创建更新查询和列表() {
         let dir = tempdir().unwrap();
@@ -522,6 +672,72 @@ mod tests {
             SessionStatus::Completed
         );
         assert_eq!(store.list(10).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn sqlite_创建更新并按会话读取计划() {
+        let dir = tempdir().unwrap();
+        let store = SqliteSessionStore::new(dir.path()).unwrap();
+        let session = sample_session(dir.path());
+        store.create(&session).await.unwrap();
+        let mut plan = sample_plan(session.id);
+        store.create_plan(&plan).await.unwrap();
+        plan.transition_to(crate::plan::PlanStatus::PendingApproval)
+            .unwrap();
+        store.update_plan(&plan).await.unwrap();
+
+        assert_eq!(
+            store.get_plan(plan.id).await.unwrap().unwrap().status,
+            crate::plan::PlanStatus::PendingApproval
+        );
+        assert_eq!(
+            store
+                .latest_plan_for_session(session.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            plan.id
+        );
+
+        plan.session_id = Uuid::new_v4();
+        assert!(store.update_plan(&plan).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn sqlite_计划落盘前脱敏秘密() {
+        let dir = tempdir().unwrap();
+        let store = SqliteSessionStore::new(dir.path()).unwrap();
+        let session = sample_session(dir.path());
+        store.create(&session).await.unwrap();
+        let mut plan = sample_plan(session.id);
+        plan.goal = "使用 sk-abcdefghijklmnopqrstuvwxyz 完成任务".into();
+        store.create_plan(&plan).await.unwrap();
+        let loaded = store.get_plan(plan.id).await.unwrap().unwrap();
+        assert!(!loaded.goal.contains("sk-abcdefghijklmnopqrstuvwxyz"));
+        assert!(loaded.goal.contains("[已脱敏]"));
+    }
+
+    #[tokio::test]
+    async fn sqlite_v1_数据库会自动补建计划表() {
+        let dir = tempdir().unwrap();
+        {
+            let _store = SqliteSessionStore::new(dir.path()).unwrap();
+        }
+        {
+            let connection = Connection::open(dir.path().join(DATABASE_PATH)).unwrap();
+            connection.execute("DROP TABLE plans", []).unwrap();
+            connection
+                .execute("DELETE FROM schema_migrations WHERE version = 2", [])
+                .unwrap();
+        }
+
+        let store = SqliteSessionStore::new(dir.path()).unwrap();
+        let session = sample_session(dir.path());
+        store.create(&session).await.unwrap();
+        let plan = sample_plan(session.id);
+        store.create_plan(&plan).await.unwrap();
+        assert_eq!(store.get_plan(plan.id).await.unwrap().unwrap().id, plan.id);
     }
 
     #[tokio::test]

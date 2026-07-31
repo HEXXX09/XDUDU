@@ -108,12 +108,15 @@ pub(crate) fn help(theme: TerminalTheme) -> String {
          \x20   {:<16} {}\n\
          \x20   {:<16} {}\n\
          \x20   {:<16} {}\n\
+         \x20   {:<16} {}\n\
          \x20   {:<16} {}\n",
         theme.muted("────────────────────────────────────────"),
         command("/help"),
         "显示此帮助",
         command("/new"),
         "开始新会话",
+        command("/resume [ID]"),
+        "浏览或恢复历史会话",
         command("/model NAME"),
         "切换当前模型",
         command("/turns N"),

@@ -98,6 +98,8 @@ Planning → Acting → Observing → Reflecting
 | `ApprovalGate` | 对工作区写入、进程执行和网络访问作出可审计决策 |
 | `ChangeLedger` | 记录可恢复、可整批撤销的文件事务，隔离具体存储 |
 | `SessionStore` | 会话创建、更新、读取和列表 |
+| `PlanStore` | 版本化计划的创建、更新、读取和会话关联查询 |
+| `generate_plan` | 通过隔离的 Provider 协议生成、校验并持久化 Draft 计划 |
 | `run_agent` | 驱动模型与工具之间的多轮闭环 |
 
 依赖通过结构体字段或 trait 引用传入，不使用全局单例，因此可以使用 MockProvider、内存 EventSink 和临时会话目录完成离线测试。
@@ -198,4 +200,4 @@ Cargo 是唯一构建入口。CI 在 Linux、macOS 和 Windows 执行格式、Cl
 
 ## 12. 后续演进
 
-Provider 扩展按当前决定暂缓，DeepSeek 保持主路径。M6 已完成；下一阶段进入 M7 Plan 模式和任务执行。Plan 必须复用现有会话、权限、审批、工具进度、事务恢复与脱敏边界。
+Provider 扩展按当前决定暂缓，DeepSeek 保持主路径。M6 功能已完成，Windows CI 条件编译警告已在本地修复，待推送复验。M7 已完成会话内 `/resume`、Plan 领域基础和结构化计划生成：显式计划采用独立 `plans` 表、版本化 Schema、依赖 DAG 和状态迁移；`generate_plan` 使用只提供给 Provider 的 `submit_plan` 协议，拒绝普通文本和未通过校验的计划，并只保存 `draft`。Plan 不保存隐藏推理，也不替代单次请求内部的 ReAct。后续审批和执行必须复用现有会话、权限、工具进度、事务恢复与脱敏边界。

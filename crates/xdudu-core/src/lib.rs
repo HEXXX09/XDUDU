@@ -11,6 +11,8 @@ pub mod credentials;
 pub mod error;
 pub mod events;
 pub mod permission;
+pub mod plan;
+pub mod plan_generation;
 pub mod prompt;
 pub mod provider;
 pub mod redaction;
@@ -39,6 +41,10 @@ pub use credentials::{
 pub use error::{ErrorKind, XduduError, XduduResult};
 pub use events::{AgentEvent, EventSink, NoopEventSink};
 pub use permission::{PermissionLevel, PermissionMode};
+pub use plan::{PLAN_SCHEMA_VERSION, Plan, PlanStatus, PlanStep, PlanStore, StepStatus};
+pub use plan_generation::{
+    PlanGenerationConfig, PlanGenerationResult, build_planning_prompt, generate_plan,
+};
 pub use provider::{
     AnthropicProvider, DeepSeekProvider, DefaultProviderFactory, Provider, ProviderFactory,
 };

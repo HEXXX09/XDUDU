@@ -100,12 +100,12 @@ async fn read_optional(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
     }
 }
 
-async fn write_image(path: &Path, image: Option<&[u8]>, mode: Option<u32>) -> std::io::Result<()> {
+async fn write_image(path: &Path, image: Option<&[u8]>, _mode: Option<u32>) -> std::io::Result<()> {
     if let Some(bytes) = image {
         let temporary = path.with_extension(format!("xdudu-write-{}", Uuid::new_v4()));
         fs::write(&temporary, bytes).await?;
         #[cfg(unix)]
-        if let Some(mode) = mode {
+        if let Some(mode) = _mode {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&temporary, std::fs::Permissions::from_mode(mode)).await?;
         }

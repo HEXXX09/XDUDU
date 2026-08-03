@@ -27,6 +27,7 @@ const LEGACY_SESSIONS_DIR: &str = ".xycli/sessions/json";
 pub enum SessionStatus {
     Running,
     WaitingApproval,
+    PlanReady,
     Completed,
     Incomplete,
     Error,
@@ -60,6 +61,20 @@ pub struct Message {
     pub tool_call_id: Option<String>,
     pub sequence: usize,
     pub created_at: DateTime<Utc>,
+}
+
+impl Message {
+    pub fn text(role: MessageRole, content: impl Into<String>, sequence: usize) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            role,
+            content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            sequence,
+            created_at: Utc::now(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,6 +129,50 @@ pub struct Session {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
+}
+
+impl Session {
+    pub fn new(
+        cwd: PathBuf,
+        provider_name: impl Into<String>,
+        model: impl Into<String>,
+        first_user_message: impl Into<String>,
+    ) -> Self {
+        let message = first_user_message.into();
+        let now = Utc::now();
+        Self {
+            id: Uuid::new_v4(),
+            title: message.chars().take(80).collect(),
+            cwd,
+            status: SessionStatus::Running,
+            current_state: AgentLoopState::Idle,
+            plan: Value::Object(Default::default()),
+            provider_name: provider_name.into(),
+            model: model.into(),
+            messages: vec![Message::text(MessageRole::User, message, 0)],
+            tool_calls: Vec::new(),
+            context_summary: String::new(),
+            summarized_message_count: 0,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            created_at: now,
+            updated_at: now,
+            completed_at: None,
+        }
+    }
+
+    pub fn append_user_message(&mut self, content: impl Into<String>) {
+        self.messages.push(Message::text(
+            MessageRole::User,
+            content,
+            self.messages.len(),
+        ));
+        self.updated_at = Utc::now();
+    }
+
+    pub fn touch(&mut self) {
+        self.updated_at = Utc::now();
+    }
 }
 
 pub(crate) fn sanitized_session(session: &Session) -> Session {

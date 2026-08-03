@@ -2,7 +2,7 @@ use std::{
     fs,
     io::{Read, Write},
     net::TcpListener,
-    process::Command,
+    process::{Command, Stdio},
     thread,
     time::Duration,
 };
@@ -150,6 +150,66 @@ fn one_turn_anthropic_server(text: &'static str) -> String {
                 "content":[{"type":"text","text":text}],
                 "stop_reason":"end_turn",
                 "usage":{"input_tokens":1,"output_tokens":1}
+            }),
+        );
+    });
+    format!("http://{address}")
+}
+
+fn plan_anthropic_server() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        read_http_request(&mut stream);
+        write_http_json(
+            &mut stream,
+            json!({
+                "content":[{
+                    "type":"tool_use",
+                    "id":"plan-1",
+                    "name":"submit_plan",
+                    "input":{
+                        "steps":[{
+                            "key":"verify",
+                            "title":"验证实现",
+                            "description":"运行相关质量检查",
+                            "dependencies":[],
+                            "completionCriteria":["检查全部通过"]
+                        }]
+                    }
+                }],
+                "stop_reason":"tool_use",
+                "usage":{"input_tokens":4,"output_tokens":8}
+            }),
+        );
+    });
+    format!("http://{address}")
+}
+
+fn complete_plan_anthropic_server() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        read_http_request(&mut stream);
+        write_http_json(
+            &mut stream,
+            json!({
+                "content":[{
+                    "type":"tool_use",
+                    "id":"complete-1",
+                    "name":"complete_step",
+                    "input":{
+                        "summary":"质量检查完成",
+                        "evidence":[{
+                            "criterionIndex":1,
+                            "evidence":"模拟验收确认检查全部通过"
+                        }]
+                    }
+                }],
+                "stop_reason":"tool_use",
+                "usage":{"input_tokens":3,"output_tokens":5}
             }),
         );
     });
@@ -441,6 +501,101 @@ fn session_可以列出显示并恢复会话() {
     assert!(String::from_utf8_lossy(&resumed.stdout).contains("恢复完成"));
     let after = session_show(dir.path(), &id);
     assert_eq!(after["messages"].as_array().unwrap().len(), 4);
+}
+
+#[test]
+fn 非_tty_plan_生成后保持等待审批() {
+    let dir = tempdir().unwrap();
+    let mut child = xdudu()
+        .current_dir(dir.path())
+        .env("ANTHROPIC_API_KEY", "test-key")
+        .env("ANTHROPIC_BASE_URL", plan_anthropic_server())
+        .arg("--interactive")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all("/plan 完成 M7 验收\n".as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("等待审批"));
+    let id = first_session_id(dir.path());
+    let session = session_show(dir.path(), &id);
+    assert_eq!(session["status"], "waiting_approval");
+    assert_eq!(session["currentState"], "WAITING_APPROVAL");
+
+    let listed = xdudu()
+        .current_dir(dir.path())
+        .env_remove("ANTHROPIC_API_KEY")
+        .args(["plan", "list"])
+        .output()
+        .unwrap();
+    assert!(
+        listed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    let plans: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(plans[0]["status"], "pending_approval");
+    assert_eq!(plans[0]["schemaVersion"], 3);
+}
+
+#[test]
+fn plan_cli_完成创建批准和执行闭环() {
+    let dir = tempdir().unwrap();
+    let created = xdudu()
+        .current_dir(dir.path())
+        .env("ANTHROPIC_API_KEY", "test-key")
+        .env("ANTHROPIC_BASE_URL", plan_anthropic_server())
+        .args(["plan", "create", "完成 CLI 计划闭环"])
+        .output()
+        .unwrap();
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let created: serde_json::Value = serde_json::from_slice(&created.stdout).unwrap();
+    let plan_id = created["plan"]["id"].as_str().unwrap();
+
+    let approved = xdudu()
+        .current_dir(dir.path())
+        .env_remove("ANTHROPIC_API_KEY")
+        .args(["plan", "approve", plan_id, "--reason", "E2E 批准"])
+        .output()
+        .unwrap();
+    assert!(
+        approved.status.success(),
+        "{}",
+        String::from_utf8_lossy(&approved.stderr)
+    );
+
+    let completed = xdudu()
+        .current_dir(dir.path())
+        .env("ANTHROPIC_API_KEY", "test-key")
+        .env("ANTHROPIC_BASE_URL", complete_plan_anthropic_server())
+        .args(["plan", "run", plan_id])
+        .output()
+        .unwrap();
+    assert!(
+        completed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&completed.stderr)
+    );
+    let plan: serde_json::Value = serde_json::from_slice(&completed.stdout).unwrap();
+    assert_eq!(plan["status"], "completed");
+    assert_eq!(plan["steps"][0]["status"], "completed");
+    assert_eq!(plan["steps"][0]["attempts"][0]["attempt"], 1);
 }
 
 #[test]

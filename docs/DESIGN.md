@@ -1,6 +1,6 @@
 # XDUDU 详细设计
 
-> 当前版本：Rust-only v0.6.0。本文描述已经实现并通过本地验收的设计边界。
+> 当前版本：Rust-only v0.7.0。本文描述已经实现并通过本地验收的设计边界。
 
 ## 1. 依赖方向
 
@@ -191,7 +191,7 @@ ToolRegistry 的固定顺序是：
 
 ## 10.1 Plan 领域基础
 
-M7 显式计划使用独立的 `Plan`、`PlanStep` 和 `PlanStore`，与单次 Agent 请求内部的隐藏 ReAct 状态分离。`Plan` 当前 Schema 版本为 1，包含会话 ID、目标、计划状态、步骤、审批和完成时间；步骤包含依赖、完成条件、执行结果和错误。
+M7 显式计划使用独立的 `Plan`、`PlanStep`、`PlanRevision` 和 `PlanStore`，与单次 Agent 请求内部的隐藏 ReAct 状态分离。`Plan` 当前 Schema 版本为 3，除 revision 和审阅信息外还包含 executionVersion、当前步骤、开始时间和暂停原因；步骤通过 `PlanStepAttempt` 保存每次尝试、工具调用 ID、结果、错误及逐项完成证据。每个内容 revision 保存完整不可变快照。
 
 计划依赖必须引用同一计划中存在的步骤，不允许自身依赖、重复依赖或环，单个计划最多 100 个步骤。领域层只允许显式状态迁移：
 
@@ -204,7 +204,7 @@ draft → pending_approval → approved → running
 
 步骤状态为 `pending`、`ready`、`running`、`completed`、`failed`、`blocked`、`skipped` 或 `cancelled`。只有全部依赖已完成或跳过的待执行步骤才会被识别为可运行；计划存在未完成步骤时不能标记为完成。
 
-SQLite Schema v2 增加独立 `plans` 表和按会话、更新时间排序的索引。`PlanStore` 提供创建、更新、按 ID 查询和获取会话最近计划；落盘前对目标、描述、完成条件、结果和错误统一脱敏。旧会话中的 `plan` JSON 字段继续保留用于兼容，不会被破坏性转换。
+SQLite Schema v4 在 `plans` 表同时保存 revision 和 execution_version，并保留 `plan_revisions` 快照表。审阅阶段使用 revision/status 乐观并发保护；执行阶段使用 revision/execution_version/status 的条件更新，在同一事务中写入 Plan 和 Session 检查点。落盘前对目标、描述、完成条件、审阅原因、执行摘要、证据和错误统一脱敏。旧会话中的 `plan` JSON 字段仅保留兼容，不再重复保存完整 Plan。
 
 ## 10.2 结构化计划生成
 
@@ -212,7 +212,11 @@ M7.2 使用独立于普通 ReAct Agent 的规划 Prompt。规划请求只向 Pro
 
 `submit_plan` 返回步骤 key、标题、描述、依赖 key 和完成条件。解析器要求 Provider 以 `tool_calls` 结束、只调用一次正确工具且不夹带普通文本；DTO 启用未知字段拒绝。随后运行时将稳定 key 映射为 UUID，校验数量、文本上限、重复 key、未知依赖、自身依赖、重复依赖和循环依赖。只有全部校验通过，才通过 `PlanStore` 原子创建 `draft` 计划；截断、内容过滤或协议错误不会留下计划记录。
 
-这一阶段不审批也不执行计划。`pending_approval` 迁移、计划修改和执行调度属于 M7.3 及后续阶段，不能由模型普通文本触发。
+M7.3 在结构化生成之后加入独立的整份 Plan 审阅服务。`/plan <目标>` 生成 Draft 后提交为 `pending_approval`；用户可在 TUI 中批准、请求自然语言修订或拒绝，Esc 只关闭界面。自然语言修订使用仅供 Provider 的 `revise_plan` 协议，新版本重新生成 Step UUID、revision 加一并重新审批。审批和修订都使用 revision/status 乐观并发保护，协议失败不会改变原计划。
+
+Plan 审批与工具审批是两条不同边界：`approved` 仅表示用户认可方案，不授予文件、进程或网络能力。`PlanExecutor` 按原始顺序串行选择 DAG 中 Ready 的步骤，真实工具仍由 ToolRegistry、PermissionMode 和 ApprovalGate 控制。模型必须单独调用内部 `complete_step`，并为全部完成条件提交唯一、有效的证据索引；普通文本、未处理工具失败或缺失证据都不能完成步骤。
+
+执行中的 Provider 错误、审批拒绝、协议错误、轮次上限和 Ctrl+C 会立即把当前 attempt 与 Plan 持久化为失败/中断和 Paused。启动时发现 Running Plan 会将运行中 attempt 标记 Interrupted、步骤标记 Blocked，并保留现场；恢复只在用户明确选择后创建新 attempt，绝不自动重放未知结果工具。
 
 `redact_text` 和 `redact_value` 覆盖 `sk-`、GitHub Token、Bearer Token、PEM 私钥以及 key、token、secret、password、authorization 等敏感结构字段。会话保存、Renderer 和顶层错误共用该边界，避免只在 UI 层遮盖。
 

@@ -23,7 +23,7 @@ use crossterm::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use xdudu_core::{
-    AgentEvent, AgentLoopState, AgentRunResult, EventSink, Session, provider::MessageRole,
+    AgentEvent, AgentLoopState, AgentRunResult, EventSink, Plan, Session, provider::MessageRole,
     redact_text,
 };
 
@@ -89,7 +89,7 @@ struct SlashCommand {
     requires_argument: bool,
 }
 
-const SLASH_COMMANDS: [SlashCommand; 6] = [
+const SLASH_COMMANDS: [SlashCommand; 13] = [
     SlashCommand {
         name: "/help",
         usage: "/help",
@@ -106,6 +106,48 @@ const SLASH_COMMANDS: [SlashCommand; 6] = [
         name: "/resume",
         usage: "/resume [id]",
         description: "浏览并恢复历史会话",
+        requires_argument: false,
+    },
+    SlashCommand {
+        name: "/plan",
+        usage: "/plan <目标>",
+        description: "生成或审阅执行计划",
+        requires_argument: false,
+    },
+    SlashCommand {
+        name: "/plan new",
+        usage: "/plan new <目标>",
+        description: "创建结构化计划",
+        requires_argument: true,
+    },
+    SlashCommand {
+        name: "/plan status",
+        usage: "/plan status",
+        description: "查看当前计划状态",
+        requires_argument: false,
+    },
+    SlashCommand {
+        name: "/plan run",
+        usage: "/plan run",
+        description: "执行已批准计划",
+        requires_argument: false,
+    },
+    SlashCommand {
+        name: "/plan retry",
+        usage: "/plan retry",
+        description: "重试暂停步骤",
+        requires_argument: false,
+    },
+    SlashCommand {
+        name: "/plan cancel",
+        usage: "/plan cancel",
+        description: "取消当前计划",
+        requires_argument: false,
+    },
+    SlashCommand {
+        name: "/plan revisions",
+        usage: "/plan revisions",
+        description: "查看修订版本",
         requires_argument: false,
     },
     SlashCommand {
@@ -154,6 +196,7 @@ struct TuiState {
     skills: Vec<String>,
     show_intro: bool,
     session_picker: Option<SessionPicker>,
+    plan_review: Option<PlanReviewView>,
 }
 
 #[derive(Debug, Clone)]
@@ -168,6 +211,35 @@ pub(crate) struct SessionChoice {
 struct SessionPicker {
     choices: Vec<SessionChoice>,
     selected: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PlanReviewChoice {
+    Approve,
+    RequestChanges,
+    Reject,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PlanRecoveryChoice {
+    Continue,
+    Retry,
+    ViewDetails,
+    Cancel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlanDialogMode {
+    Review,
+    Recovery,
+}
+
+#[derive(Debug)]
+struct PlanReviewView {
+    plan: Plan,
+    selected: usize,
+    scroll: usize,
+    mode: PlanDialogMode,
 }
 
 #[derive(Clone)]
@@ -272,6 +344,7 @@ impl TuiApp {
             skills: context.skills,
             show_intro: true,
             session_picker: None,
+            plan_review: None,
         };
         let app = Self {
             renderer: TuiRenderer {
@@ -368,6 +441,131 @@ impl TuiApp {
         Ok(selected)
     }
 
+    pub(crate) fn review_plan(&self, plan: &Plan) -> io::Result<Option<PlanReviewChoice>> {
+        let _raw = RawGuard::enter()?;
+        {
+            let mut state = self.renderer.state.lock().unwrap();
+            state.input_active = false;
+            state.plan_review = Some(PlanReviewView {
+                plan: plan.clone(),
+                selected: 2,
+                scroll: 0,
+                mode: PlanDialogMode::Review,
+            });
+        }
+        self.renderer.draw()?;
+
+        let decision = loop {
+            let Event::Key(key) = read()? else {
+                continue;
+            };
+            if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+                continue;
+            }
+            let mut state = self.renderer.state.lock().unwrap();
+            let Some(review) = state.plan_review.as_mut() else {
+                break None;
+            };
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    review.selected = if review.selected == 0 {
+                        2
+                    } else {
+                        review.selected - 1
+                    };
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    review.selected = (review.selected + 1) % 3;
+                }
+                KeyCode::PageUp => review.scroll = review.scroll.saturating_sub(5),
+                KeyCode::PageDown => review.scroll = review.scroll.saturating_add(5),
+                KeyCode::Enter => {
+                    break Some(match review.selected {
+                        0 => PlanReviewChoice::Approve,
+                        1 => PlanReviewChoice::RequestChanges,
+                        _ => PlanReviewChoice::Reject,
+                    });
+                }
+                KeyCode::Esc => break None,
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break None,
+                _ => {}
+            }
+            drop(state);
+            self.renderer.draw()?;
+        };
+
+        {
+            let mut state = self.renderer.state.lock().unwrap();
+            state.plan_review = None;
+            state.input_active = true;
+        }
+        self.renderer.draw()?;
+        Ok(decision)
+    }
+
+    pub(crate) fn recover_plan(&self, plan: &Plan) -> io::Result<Option<PlanRecoveryChoice>> {
+        let _raw = RawGuard::enter()?;
+        {
+            let mut state = self.renderer.state.lock().unwrap();
+            state.input_active = false;
+            state.plan_review = Some(PlanReviewView {
+                plan: plan.clone(),
+                selected: 2,
+                scroll: 0,
+                mode: PlanDialogMode::Recovery,
+            });
+        }
+        self.renderer.draw()?;
+
+        let decision = loop {
+            let Event::Key(key) = read()? else {
+                continue;
+            };
+            if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+                continue;
+            }
+            let mut state = self.renderer.state.lock().unwrap();
+            let Some(view) = state.plan_review.as_mut() else {
+                break None;
+            };
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    view.selected = if view.selected == 0 {
+                        3
+                    } else {
+                        view.selected - 1
+                    };
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    view.selected = (view.selected + 1) % 4;
+                }
+                KeyCode::PageUp => view.scroll = view.scroll.saturating_sub(5),
+                KeyCode::PageDown => view.scroll = view.scroll.saturating_add(5),
+                KeyCode::Enter => {
+                    break Some(match view.selected {
+                        0 => PlanRecoveryChoice::Continue,
+                        1 => PlanRecoveryChoice::Retry,
+                        2 => PlanRecoveryChoice::ViewDetails,
+                        _ => PlanRecoveryChoice::Cancel,
+                    });
+                }
+                KeyCode::Esc => break None,
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break None,
+                _ => {}
+            }
+            drop(state);
+            self.renderer.draw()?;
+        };
+
+        {
+            let mut state = self.renderer.state.lock().unwrap();
+            state.plan_review = None;
+            state.input_active = true;
+        }
+        self.renderer.draw()?;
+        Ok(decision)
+    }
+
     pub(crate) fn begin_prompt(&self, prompt: &str) -> io::Result<()> {
         let mut state = self.renderer.state.lock().unwrap();
         state.input_active = false;
@@ -446,6 +644,9 @@ impl TuiRenderer {
         if state.session_picker.is_some() {
             draw_session_picker(&mut stdout, &state, columns, rows, self.color)?;
         }
+        if state.plan_review.is_some() {
+            draw_plan_review(&mut stdout, &state, columns, rows, self.color)?;
+        }
         stdout.flush()
     }
 }
@@ -519,6 +720,29 @@ impl EventSink for TuiRenderer {
                 AgentEvent::Warning { message, .. } => {
                     push_block(&mut state, Role::Warning, redact_text(&message));
                 }
+                AgentEvent::PlanStarted { .. } => state.status = "执行计划".into(),
+                AgentEvent::PlanStepStarted { title, attempt, .. } => {
+                    state.status = format!("步骤 {title} · 第 {attempt} 次");
+                }
+                AgentEvent::PlanStepCompleted { summary, .. } => {
+                    push_block(
+                        &mut state,
+                        Role::System,
+                        format!("步骤完成：{}", redact_text(&summary)),
+                    );
+                }
+                AgentEvent::PlanStepFailed { error, .. } => {
+                    push_block(
+                        &mut state,
+                        Role::Warning,
+                        format!("步骤失败：{}", redact_text(&error)),
+                    );
+                }
+                AgentEvent::PlanPaused { reason, .. } => {
+                    state.status = "计划暂停".into();
+                    push_block(&mut state, Role::Warning, redact_text(&reason));
+                }
+                AgentEvent::PlanCompleted { .. } => state.status = "计划完成".into(),
             }
         }
         let _ = self.draw();
@@ -729,7 +953,10 @@ fn replace_input(state: &mut TuiState, value: &str) {
 
 fn matching_commands(input: &[char]) -> Vec<&'static SlashCommand> {
     let value = input.iter().collect::<String>();
-    if !value.starts_with('/') || value.chars().any(char::is_whitespace) {
+    if !value.starts_with('/') {
+        return Vec::new();
+    }
+    if value.chars().any(char::is_whitespace) && !value.starts_with("/plan ") {
         return Vec::new();
     }
     SLASH_COMMANDS
@@ -1354,6 +1581,188 @@ fn draw_session_picker(
     reset_color(writer, color)
 }
 
+fn draw_plan_review(
+    writer: &mut impl Write,
+    state: &TuiState,
+    columns: u16,
+    rows: u16,
+    color: bool,
+) -> io::Result<()> {
+    let Some(review) = &state.plan_review else {
+        return Ok(());
+    };
+    let recovery = review.mode == PlanDialogMode::Recovery;
+    for row in 0..rows {
+        queue!(writer, MoveTo(0, row), Clear(ClearType::CurrentLine))?;
+    }
+
+    let width = usize::from(columns.saturating_sub(4)).max(20);
+    let mut lines = Vec::new();
+    append_wrapped(
+        &mut lines,
+        Role::System,
+        &format!("目标：{}", review.plan.goal),
+        width,
+    );
+    lines.push((Role::System, format!("修订版本：{}", review.plan.revision)));
+    lines.push((Role::System, format!("状态：{:?}", review.plan.status)));
+    if let Some(reason) = &review.plan.paused_reason {
+        append_wrapped(
+            &mut lines,
+            Role::Warning,
+            &format!("暂停原因：{reason}"),
+            width,
+        );
+    }
+    lines.push((Role::System, String::new()));
+    let indexes = review
+        .plan
+        .steps
+        .iter()
+        .enumerate()
+        .map(|(index, step)| (step.id, index + 1))
+        .collect::<std::collections::HashMap<_, _>>();
+    for (index, step) in review.plan.steps.iter().enumerate() {
+        append_wrapped(
+            &mut lines,
+            Role::Assistant,
+            &format!("{}. {} [{:?}]", index + 1, step.title, step.status),
+            width,
+        );
+        if !step.description.trim().is_empty() {
+            append_wrapped(
+                &mut lines,
+                Role::System,
+                &format!("   {}", step.description),
+                width,
+            );
+        }
+        if !step.dependencies.is_empty() {
+            let dependencies = step
+                .dependencies
+                .iter()
+                .filter_map(|id| indexes.get(id))
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("、");
+            lines.push((Role::System, format!("   依赖步骤：{dependencies}")));
+        }
+        for criterion in &step.completion_criteria {
+            append_wrapped(
+                &mut lines,
+                Role::System,
+                &format!("   ✓ {criterion}"),
+                width,
+            );
+        }
+        if let Some(attempt) = step.attempts.last() {
+            lines.push((
+                Role::System,
+                format!("   执行尝试：#{} [{:?}]", attempt.attempt, attempt.status),
+            ));
+            if let Some(summary) = &attempt.summary {
+                append_wrapped(
+                    &mut lines,
+                    Role::System,
+                    &format!("   结果：{summary}"),
+                    width,
+                );
+            }
+            if let Some(error) = &attempt.error {
+                append_wrapped(
+                    &mut lines,
+                    Role::Warning,
+                    &format!("   错误：{error}"),
+                    width,
+                );
+            }
+            for evidence in &attempt.evidence {
+                append_wrapped(
+                    &mut lines,
+                    Role::System,
+                    &format!(
+                        "   证据 {}：{}",
+                        evidence.criterion_index, evidence.evidence
+                    ),
+                    width,
+                );
+            }
+        }
+        lines.push((Role::System, String::new()));
+    }
+
+    set_color(writer, color, PRIMARY)?;
+    queue!(
+        writer,
+        MoveTo(2, 0),
+        SetAttribute(Attribute::Bold),
+        Print(if recovery {
+            "恢复暂停计划"
+        } else {
+            "审阅执行计划"
+        }),
+        SetAttribute(Attribute::Reset)
+    )?;
+    set_color(writer, color, MUTED)?;
+    if rows > 1 {
+        queue!(
+            writer,
+            MoveTo(2, 1),
+            Print(truncate_to_width(
+                if recovery {
+                    "↑↓/j/k 选择 · Enter 确认 · PgUp/PgDn 滚动 · Esc 保持暂停"
+                } else {
+                    "↑↓/j/k 选择 · Enter 确认 · PgUp/PgDn 滚动 · Esc 保留待审"
+                },
+                width
+            ))
+        )?;
+    }
+
+    let option_rows = 4_u16;
+    let content_top = 3_u16;
+    let content_height = usize::from(rows.saturating_sub(content_top + option_rows));
+    let max_scroll = lines.len().saturating_sub(content_height);
+    let start = review.scroll.min(max_scroll);
+    for (offset, (role, line)) in lines.iter().skip(start).take(content_height).enumerate() {
+        let row = content_top + offset as u16;
+        let line_color = match role {
+            Role::Assistant => TEXT,
+            Role::Warning => WARNING,
+            _ => MUTED,
+        };
+        set_color(writer, color, line_color)?;
+        queue!(
+            writer,
+            MoveTo(2, row),
+            Print(truncate_to_width(line, width))
+        )?;
+    }
+
+    let options: &[&str] = if recovery {
+        &["继续", "重试当前步骤", "查看详情", "取消计划"]
+    } else {
+        &["批准计划", "请求修改", "拒绝计划"]
+    };
+    let options_top = rows.saturating_sub(3);
+    for (index, option) in options.iter().enumerate() {
+        let selected = index == review.selected;
+        set_color(writer, color, if selected { PRIMARY } else { MUTED })?;
+        if selected {
+            queue!(writer, SetAttribute(Attribute::Bold))?;
+        }
+        let column = 2 + (index as u16 * columns.saturating_sub(4) / options.len() as u16);
+        queue!(
+            writer,
+            MoveTo(column, options_top),
+            Print(if selected { "› " } else { "  " }),
+            Print(option),
+            SetAttribute(Attribute::Reset)
+        )?;
+    }
+    reset_color(writer, color)
+}
+
 fn truncate_to_width(value: &str, width: usize) -> String {
     if UnicodeWidthStr::width(value) <= width {
         return value.to_owned();
@@ -1465,6 +1874,7 @@ mod tests {
             skills: Vec::new(),
             show_intro: true,
             session_picker: None,
+            plan_review: None,
         }
     }
 
@@ -1520,6 +1930,25 @@ mod tests {
         let commands = matching_commands(&input);
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].name, "/resume");
+    }
+
+    #[test]
+    fn plan_可以通过斜杠候选定位并直接打开审阅() {
+        let commands = matching_commands(&['/', 'p']);
+        let plan = commands
+            .iter()
+            .find(|command| command.name == "/plan")
+            .expect("应包含通用 /plan 命令");
+        assert!(!plan.requires_argument);
+
+        let commands = matching_commands(&"/plan r".chars().collect::<Vec<_>>());
+        assert!(commands.iter().any(|command| command.name == "/plan run"));
+        assert!(commands.iter().any(|command| command.name == "/plan retry"));
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.name == "/plan revisions")
+        );
     }
 
     #[test]

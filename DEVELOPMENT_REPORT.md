@@ -1,11 +1,11 @@
 # XDUDU 开发报告
 
 > 更新时间：2026-07-29
-> 当前版本：v0.6.0
+> 当前版本：v0.7.0
 
 ## 总结
 
-XDUDU 已完成 M6 搜索、补丁、Git 与受限 Web 的本地实现和自动化测试。仓库保持 Rust-only，DeepSeek 是默认主用 Provider，Anthropic 适配继续保留但不扩展 Provider 范围。
+XDUDU 已完成 M6 搜索、补丁、Git 与受限 Web，以及 M7 的会话恢复、Plan 领域、结构化生成、整份审批、自然语言修订、串行执行和中断恢复。仓库保持 Rust-only，DeepSeek 是默认主用 Provider，Anthropic 适配继续保留但不扩展 Provider 范围。
 
 本阶段把新工具统一纳入既有权限、审批、取消、脱敏、会话和恢复边界。旧 TypeScript 实现不再参与构建、测试或发布。
 
@@ -40,6 +40,10 @@ XDUDU 已完成 M6 搜索、补丁、Git 与受限 Web 的本地实现和自动�
 | 非阻塞工具进度事件与终端/JSON 渲染 | 已完成 |
 | 网络权限、逐跳 SSRF 防御和受限 `web_fetch` | 已完成 |
 | once/session/always 分级审批与永久规则管理 | 已完成 |
+| Plan Schema v3、attempt/evidence、revision 快照与 SQLite Schema v4 迁移 | 已完成 |
+| `submit_plan` 结构化生成与 `revise_plan` 完整修订协议 | 已完成 |
+| `/plan` 最小 TUI 整份审批、修改、拒绝与 `/resume` 恢复审阅 | 已完成 |
+| revision/status 乐观并发保护与 `PLAN_CONFLICT` | 已完成 |
 
 ## 当前架构
 
@@ -53,6 +57,7 @@ CLI 命令与 Renderer
             → file_read / file_write / search_text / apply_patch
             → git_status / git_diff / web_fetch / terminal_exec
           → SqliteSessionStore + WorkspaceLock + Context Compression
+          → PlanGenerator + PlanReviewer + PlanRevision Store
           → Transactional JsonChangeLedger + ToolProgress + Redaction
 ```
 
@@ -76,6 +81,9 @@ CLI 命令与 Renderer
 - 结果未知的工具调用恢复为取消状态，不自动重放；
 - 长会话只压缩 Provider 输入窗口，不删除本地原始消息；
 - CI 和默认测试不需要真实 API Key，也不请求公网模型。
+- Plan 审批不授予工具权限，批准计划不会绕过文件、进程或网络审批；
+- 当前 Plan 与 revision 快照原子写入，陈旧审批不会覆盖较新决定；
+- Provider 修订失败时原 PendingApproval 计划保持不变。
 
 ## 验收命令
 
@@ -95,9 +103,9 @@ cargo install --path crates/xdudu-cli --locked --force
 - 当前主用 DeepSeek，Provider 扩展、熔断和 fallback 按产品决定暂缓；
 - `undo` 覆盖 `file_write` 与 `apply_patch`，无法通用撤销终端命令或网络的外部副作用；
 - `web_fetch` 只读取 HTML、纯文本和 JSON，不支持登录态、文件下载或私网；
-- 尚未实现 Plan 模式、MCP 与插件；
-- Release 工作流已定义，实际各平台结果需在 GitHub Actions 运行后确认。
+- Plan 已支持串行 DAG 执行、`complete_step` 证据、暂停/重试/取消和崩溃恢复；
+- MCP、插件和 RAG 尚未实现。
 
 ## 下一阶段建议
 
-用户完成本地 M6 运行验收并确认推送后，进入 M7 Plan 模式。M7 只编排当前已经受控的工具，新增计划状态必须持久化、可恢复并继续遵守权限、审批、脱敏与事务边界。
+下一阶段进入 M8 前，先完成本地 `/plan` 人工执行验收和三平台 CI。M8 的 MCP/Skills 等能力仍必须复用现有工具权限、审批、脱敏、计划检查点和文件事务边界。

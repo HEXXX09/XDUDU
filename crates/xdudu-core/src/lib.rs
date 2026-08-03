@@ -12,7 +12,9 @@ pub mod error;
 pub mod events;
 pub mod permission;
 pub mod plan;
+pub mod plan_executor;
 pub mod plan_generation;
+pub mod plan_review;
 pub mod prompt;
 pub mod provider;
 pub mod redaction;
@@ -41,9 +43,18 @@ pub use credentials::{
 pub use error::{ErrorKind, XduduError, XduduResult};
 pub use events::{AgentEvent, EventSink, NoopEventSink};
 pub use permission::{PermissionLevel, PermissionMode};
-pub use plan::{PLAN_SCHEMA_VERSION, Plan, PlanStatus, PlanStep, PlanStore, StepStatus};
+pub use plan::{
+    CompletionEvidence, PLAN_SCHEMA_VERSION, Plan, PlanReviewDecision, PlanReviewRecord,
+    PlanRevision, PlanStatus, PlanStep, PlanStepAttempt, PlanStore, StepAttemptStatus, StepStatus,
+    validate_completion_evidence,
+};
+pub use plan_executor::{PlanExecutionResult, PlanExecutorConfig, run_plan};
 pub use plan_generation::{
     PlanGenerationConfig, PlanGenerationResult, build_planning_prompt, generate_plan,
+};
+pub use plan_review::{
+    PlanRevisionConfig, PlanRevisionResult, approve_plan, build_revision_prompt, reject_plan,
+    revise_plan, submit_plan_for_review,
 };
 pub use provider::{
     AnthropicProvider, DeepSeekProvider, DefaultProviderFactory, Provider, ProviderFactory,

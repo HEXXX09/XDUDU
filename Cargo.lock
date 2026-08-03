@@ -3164,7 +3164,7 @@ dependencies = [
 
 [[package]]
 name = "xdudu"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "clap",
@@ -3182,7 +3182,7 @@ dependencies = [
 
 [[package]]
 name = "xdudu-core"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "chrono",

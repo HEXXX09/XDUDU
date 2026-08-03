@@ -1,6 +1,6 @@
 # XDUDU 系统架构
 
-> 当前基线：Rust-only v0.6.0。旧 TypeScript 实现已退役，可通过 Git 历史审计。
+> 当前基线：Rust-only v0.7.0。旧 TypeScript 实现已退役，可通过 Git 历史审计。
 
 ## 1. 系统定位
 
@@ -98,7 +98,7 @@ Planning → Acting → Observing → Reflecting
 | `ApprovalGate` | 对工作区写入、进程执行和网络访问作出可审计决策 |
 | `ChangeLedger` | 记录可恢复、可整批撤销的文件事务，隔离具体存储 |
 | `SessionStore` | 会话创建、更新、读取和列表 |
-| `PlanStore` | 版本化计划的创建、更新、读取和会话关联查询 |
+| `PlanStore` | 当前计划、不可变 revision 快照、乐观并发更新和会话关联查询 |
 | `generate_plan` | 通过隔离的 Provider 协议生成、校验并持久化 Draft 计划 |
 | `run_agent` | 驱动模型与工具之间的多轮闭环 |
 
@@ -200,4 +200,4 @@ Cargo 是唯一构建入口。CI 在 Linux、macOS 和 Windows 执行格式、Cl
 
 ## 12. 后续演进
 
-Provider 扩展按当前决定暂缓，DeepSeek 保持主路径。M6 功能已完成，Windows CI 条件编译警告已在本地修复，待推送复验。M7 已完成会话内 `/resume`、Plan 领域基础和结构化计划生成：显式计划采用独立 `plans` 表、版本化 Schema、依赖 DAG 和状态迁移；`generate_plan` 使用只提供给 Provider 的 `submit_plan` 协议，拒绝普通文本和未通过校验的计划，并只保存 `draft`。Plan 不保存隐藏推理，也不替代单次请求内部的 ReAct。后续审批和执行必须复用现有会话、权限、工具进度、事务恢复与脱敏边界。
+Provider 扩展按当前决定暂缓，DeepSeek 保持主路径。M6 功能与 macOS、Linux、Windows CI 验收已完成。M7 已完成会话恢复、Plan Schema v3、SQLite Schema v4、结构化生成、整份审批/修订、串行 DAG 执行和恢复。`submit_plan` 创建 Draft，`revise_plan` 生成完整新 revision，`complete_step` 以逐项证据确认当前步骤；执行期通过 `revision + execution_version + status` 原子检查点避免并发覆盖。Plan 不保存隐藏推理，也不替代单次请求内部的 ReAct；批准 Plan 不放行任何工具副作用，崩溃后也不会自动重放结果未知的工具。

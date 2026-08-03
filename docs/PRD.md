@@ -1,6 +1,6 @@
 # XDUDU 产品需求文档
 
-> 当前技术基线：v0.6.0 使用 Rust 核心库与 Rust CLI，旧 TypeScript 实现已经退役。
+> 当前技术基线：v0.7.0 使用 Rust 核心库与 Rust CLI，旧 TypeScript 实现已经退役。
 
 ## 1. 产品概述
 
@@ -201,7 +201,7 @@ M1 已完成 Rust Agent、工具、权限、会话和两个 Provider 的基础�
 - `session list/show/resume`、工作区跨进程锁和崩溃恢复；
 - 工具调用防重放记录、Token 预算和长上下文压缩。
 
-Provider 扩展与 fallback 按当前产品决定暂缓，DeepSeek 为主用路径。M7 已建立会话内 `/resume`、版本化 Plan/Step 领域模型、依赖 DAG 校验、SQLite 持久化和严格的结构化计划生成；当前只保存 Draft，不会自动审批或执行。执行前审批、计划修改和步骤调度尚未实现。其余主要需求包括 MCP、插件和 RAG。`web_fetch` 当前只处理 HTML 可读文本、纯文本和 JSON，不是文件下载器，也不使用浏览器登录状态。
+Provider 扩展与 fallback 按当前产品决定暂缓，DeepSeek 为主用路径。M7 已建立会话内 `/resume`、Plan/Step/Revision/Attempt 领域模型、依赖 DAG 校验、SQLite v4 原子检查点、严格结构化生成、整份审批/修订、串行执行、暂停恢复以及交互式和非交互 Plan CLI。批准 Plan 不会绕过工具权限；未知结果工具不会自动重放。其余主要需求包括 MCP、插件和 RAG。`web_fetch` 当前只处理 HTML 可读文本、纯文本和 JSON，不是文件下载器，也不使用浏览器登录状态。
 
 ## 7. 暂不包含
 

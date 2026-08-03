@@ -4,7 +4,7 @@ XDUDU 是一个使用 Rust 实现的终端 AI 编程助手。它把自然语言�
 
 ## 当前状态
 
-当前版本为 Rust-only 的 `v0.6.0`：
+当前版本为 Rust-only 的 `v0.7.0`：
 
 - DeepSeek Chat Completions API 为当前主用 Provider，保留已验证的 Anthropic 适配；
 - 支持文本和工具调用的 SSE 流式响应；
@@ -27,7 +27,7 @@ XDUDU 是一个使用 Rust 实现的终端 AI 编程助手。它把自然语言�
 - SQLite 会话存储、旧 JSON 自动迁移、跨进程锁和崩溃恢复；
 - `session list/show/resume` 会话查询与恢复命令；
 - 长会话 Token 预算、上下文压缩和关键计划保留；
-- 结构化 Plan 生成协议、严格依赖校验和 Draft 持久化基础；
+- 结构化 Plan 生成、整份审批、自然语言修订、串行 DAG 执行、暂停恢复与并发保护；
 - 密钥、Bearer Token、私钥和敏感结构字段的统一输出及会话脱敏；
 - macOS、Linux、Windows CI 与多平台 Release 归档工作流。
 
@@ -87,7 +87,7 @@ Anthropic 对应 `anthropic` 和 `ANTHROPIC_API_KEY`：
 交互 TTY 默认进入全屏界面；重定向输入、`TERM=dumb` 或不支持 TUI 的环境自动使用普通行式界面。
 输入支持左右移动、Home/End、Ctrl+A/E、Ctrl+U/K/W、上下浏览本会话历史、
 Ctrl+C 清空当前输入和空行 Ctrl+D 退出。历史仅保存在当前进程内，不会把输入写入额外的历史文件。
-交互命令包括 `/help`、`/new`、`/model <name>`、`/turns <n>` 和 `/exit`。
+交互命令包括 `/help`、`/new`、`/resume`、`/plan <目标>`、`/model <name>`、`/turns <n>` 和 `/exit`。
 
 ## 安装为全局命令
 
@@ -163,6 +163,29 @@ xdudu session resume <会话UUID>  # 进入交互模式
 同一工作区只允许一个会修改状态的 XDUDU 进程运行。进程异常退出后，操作系统会自动释放锁；下次启动会把遗留的运行中会话标记为 `interrupted`。执行前已经记录但结果未知的工具调用会标记为 `cancelled`，不会被自动重放。
 
 较长会话超过输入预算时，XDUDU 会压缩较早上下文并保留计划、关键消息和工具摘要。原始消息仍完整保存在 SQLite 中。
+
+## 计划生成与审阅
+
+在全屏交互界面输入：
+
+```text
+/plan 为当前项目设计一套可靠的发布检查流程
+```
+
+XDUDU 会生成结构化步骤并展示整份计划。你可以批准、请求自然语言修改或拒绝；Esc 只关闭审阅，之后使用 `/plan` 或 `/resume` 可以重新打开。批准后使用 `/plan run` 串行执行 DAG；步骤只有通过内部 `complete_step` 提交覆盖全部完成条件的证据后才会完成。文件、命令和网络操作始终经过原有工具权限与审批。
+
+计划因审批拒绝、模型/协议错误、Ctrl+C 或未知工具结果暂停后，使用 `/resume` 查看现场，也可以使用 `/plan retry` 创建新的步骤尝试。XDUDU 不会自动重放结果未知的工具调用，取消计划也不会撤销已经产生的副作用。
+
+```bash
+xdudu plan create "分析并修复登录失败"
+xdudu plan list
+xdudu plan show <PLAN_ID>
+xdudu plan approve <PLAN_ID> --reason "方案确认"
+xdudu plan run <PLAN_ID>
+xdudu plan retry <PLAN_ID>
+xdudu plan revisions <PLAN_ID>
+xdudu plan cancel <PLAN_ID>
+```
 
 ## 输出模式
 
@@ -257,7 +280,7 @@ xdudu-core
   ├── file_read / file_write / search_text / apply_patch
   ├── git_status / git_diff / web_search / web_fetch / terminal_exec
   ├── SqliteSessionStore + WorkspaceLock + Context Compression
-  ├── Plan + PlanStep + PlanStore + PlanGenerator
+  ├── Plan + PlanStep + PlanRevision + PlanStore + PlanGenerator/Reviewer
   └── JsonChangeLedger + Undo
 ```
 

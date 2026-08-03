@@ -70,15 +70,7 @@ pub struct AgentRunResult {
 }
 
 fn new_message(role: MessageRole, content: impl Into<String>, sequence: usize) -> Message {
-    Message {
-        id: Uuid::new_v4(),
-        role,
-        content: content.into(),
-        tool_calls: Vec::new(),
-        tool_call_id: None,
-        sequence,
-        created_at: Utc::now(),
-    }
+    Message::text(role, content, sequence)
 }
 
 async fn load_or_create_session(config: &AgentRunConfig<'_>) -> XduduResult<Session> {
@@ -105,26 +97,12 @@ async fn load_or_create_session(config: &AgentRunConfig<'_>) -> XduduResult<Sess
         return Ok(session);
     }
 
-    let now = Utc::now();
-    let session = Session {
-        id: Uuid::new_v4(),
-        title: config.prompt.chars().take(80).collect(),
-        cwd: config.cwd.clone(),
-        status: SessionStatus::Running,
-        current_state: AgentLoopState::Idle,
-        plan: Value::Object(Default::default()),
-        provider_name: config.provider.name().to_owned(),
-        model: config.model.clone(),
-        messages: vec![new_message(MessageRole::User, &config.prompt, 0)],
-        tool_calls: Vec::new(),
-        context_summary: String::new(),
-        summarized_message_count: 0,
-        total_input_tokens: 0,
-        total_output_tokens: 0,
-        created_at: now,
-        updated_at: now,
-        completed_at: None,
-    };
+    let session = Session::new(
+        config.cwd.clone(),
+        config.provider.name(),
+        config.model.clone(),
+        &config.prompt,
+    );
     config.session_store.create(&session).await?;
     Ok(session)
 }

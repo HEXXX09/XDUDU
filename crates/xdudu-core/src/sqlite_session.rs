@@ -13,7 +13,10 @@ use uuid::Uuid;
 
 use crate::{
     XduduError, XduduResult,
-    plan::{Plan, PlanStore, sanitized_plan},
+    plan::{
+        Plan, PlanRevision, PlanStatus, PlanStore, deserialize_plan_compatible, sanitized_plan,
+        sanitized_plan_revision,
+    },
     provider::MessageRole,
     session::{
         AgentLoopState, Message, Session, SessionStatus, SessionStore, ToolCallStatus,
@@ -137,6 +140,8 @@ impl SqliteSessionStore {
                     session_id TEXT NOT NULL,
                     status TEXT NOT NULL,
                     schema_version INTEGER NOT NULL,
+                    revision INTEGER NOT NULL DEFAULT 1,
+                    execution_version INTEGER NOT NULL DEFAULT 0,
                     plan_json TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
@@ -152,6 +157,8 @@ impl SqliteSessionStore {
                 ",
             )
             .map_err(|error| XduduError::tool(format!("初始化会话数据库失败：{error}")))?;
+        migrate_plan_schema_v3(&mut connection)?;
+        migrate_plan_schema_v4(&mut connection)?;
         self.import_json_sessions(&mut connection, cwd)?;
         self.recover_interrupted_sessions(&mut connection)?;
         Ok(())
@@ -243,6 +250,24 @@ impl SqliteSessionStore {
             .map_err(|error| XduduError::tool(format!("开始崩溃恢复失败：{error}")))?;
         for raw in rows {
             let mut session: Session = serde_json::from_str(&raw)?;
+            if session.status == SessionStatus::WaitingApproval {
+                let waiting_for_plan = transaction
+                    .query_row(
+                        "SELECT 1 FROM plans
+                         WHERE session_id = ?1 AND status = 'pending_approval'
+                         LIMIT 1",
+                        [session.id.to_string()],
+                        |_| Ok(()),
+                    )
+                    .optional()
+                    .map_err(|error| {
+                        XduduError::tool(format!("检查待审批计划恢复状态失败：{error}"))
+                    })?
+                    .is_some();
+                if waiting_for_plan {
+                    continue;
+                }
+            }
             let recovered_at = Utc::now();
             let interrupted_calls = session
                 .tool_calls
@@ -280,8 +305,44 @@ impl SqliteSessionStore {
                     });
                 }
             }
+            let running_plan = transaction
+                .query_row(
+                    "SELECT plan_json FROM plans
+                     WHERE session_id = ?1 AND status = 'running'
+                     ORDER BY updated_at DESC LIMIT 1",
+                    [session.id.to_string()],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|error| XduduError::tool(format!("读取运行中计划失败：{error}")))?;
+            if let Some(raw_plan) = running_plan {
+                let value = serde_json::from_str(&raw_plan)?;
+                let mut plan = deserialize_plan_compatible(value)?;
+                if let Some(step_id) = plan.current_step_id
+                    && let Some(step) = plan.steps.iter_mut().find(|step| step.id == step_id)
+                    && step.status == crate::StepStatus::Running
+                {
+                    if let Some(attempt) = step.attempts.last_mut()
+                        && attempt.status == crate::StepAttemptStatus::Running
+                    {
+                        attempt.status = crate::StepAttemptStatus::Interrupted;
+                        attempt.error =
+                            Some("上次进程在步骤完成前退出，工具副作用结果可能未知。".into());
+                        attempt.ended_at = Some(recovered_at);
+                    }
+                    step.error =
+                        Some("上次进程在步骤完成前退出，XDUDU 不会自动重放该步骤。".into());
+                    step.transition_to(crate::StepStatus::Blocked)?;
+                }
+                plan.transition_to(PlanStatus::Paused)?;
+                plan.paused_reason =
+                    Some("检测到上次执行异常中断；现场已保留，结果未知的工具不会自动重放。".into());
+                plan.execution_version = plan.execution_version.saturating_add(1);
+                plan.updated_at = recovered_at;
+                update_plan(&transaction, &plan)?;
+            }
             session.status = SessionStatus::Interrupted;
-            session.current_state = AgentLoopState::Error;
+            session.current_state = AgentLoopState::Interrupted;
             session.updated_at = recovered_at;
             session.completed_at = Some(session.updated_at);
             update_session(&transaction, &session)?;
@@ -304,6 +365,224 @@ impl SqliteSessionStore {
         .await
         .map_err(|error| XduduError::tool(format!("数据库任务异常结束：{error}")))?
     }
+}
+
+fn migrate_plan_schema_v4(connection: &mut Connection) -> XduduResult<()> {
+    let applied = connection
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version = 4",
+            [],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|error| XduduError::tool(format!("检查执行迁移状态失败：{error}")))?
+        .is_some();
+    if applied {
+        return Ok(());
+    }
+    let has_column = {
+        let mut statement = connection
+            .prepare("PRAGMA table_info(plans)")
+            .map_err(|error| XduduError::tool(format!("检查 plans 表结构失败：{error}")))?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|error| XduduError::tool(format!("读取 plans 表结构失败：{error}")))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| XduduError::tool(format!("读取 plans 列名失败：{error}")))?
+            .iter()
+            .any(|name| name == "execution_version")
+    };
+    let transaction = connection
+        .transaction()
+        .map_err(|error| XduduError::tool(format!("开始计划 Schema v4 迁移失败：{error}")))?;
+    if !has_column {
+        transaction
+            .execute(
+                "ALTER TABLE plans ADD COLUMN execution_version INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|error| XduduError::tool(format!("增加执行版本列失败：{error}")))?;
+    }
+    let plans = {
+        let mut statement = transaction
+            .prepare("SELECT id, plan_json FROM plans")
+            .map_err(|error| XduduError::tool(format!("准备执行迁移查询失败：{error}")))?;
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| XduduError::tool(format!("查询执行迁移计划失败：{error}")))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| XduduError::tool(format!("读取执行迁移计划失败：{error}")))?
+    };
+    for (id, raw) in plans {
+        let value = serde_json::from_str(&raw)?;
+        let plan = deserialize_plan_compatible(value)?;
+        let raw = serde_json::to_string(&sanitized_plan(&plan))?;
+        transaction
+            .execute(
+                "UPDATE plans SET schema_version = ?2, execution_version = ?3,
+                 plan_json = ?4 WHERE id = ?1",
+                params![
+                    id,
+                    i64::from(plan.schema_version),
+                    plan.execution_version as i64,
+                    raw
+                ],
+            )
+            .map_err(|error| XduduError::tool(format!("迁移当前计划失败：{error}")))?;
+    }
+    let revisions = {
+        let mut statement = transaction
+            .prepare("SELECT plan_id, revision, revision_json FROM plan_revisions")
+            .map_err(|error| XduduError::tool(format!("准备修订迁移查询失败：{error}")))?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|error| XduduError::tool(format!("查询修订迁移失败：{error}")))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| XduduError::tool(format!("读取修订迁移失败：{error}")))?
+    };
+    for (plan_id, revision, raw) in revisions {
+        let mut value: serde_json::Value = serde_json::from_str(&raw)?;
+        value["schemaVersion"] = serde_json::Value::from(crate::PLAN_SCHEMA_VERSION);
+        let snapshot: PlanRevision = serde_json::from_value(value)?;
+        snapshot.validate()?;
+        transaction
+            .execute(
+                "UPDATE plan_revisions SET revision_json = ?3
+                 WHERE plan_id = ?1 AND revision = ?2",
+                params![plan_id, revision, serde_json::to_string(&snapshot)?],
+            )
+            .map_err(|error| XduduError::tool(format!("迁移计划修订失败：{error}")))?;
+    }
+    transaction
+        .execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (4, CURRENT_TIMESTAMP)",
+            [],
+        )
+        .map_err(|error| XduduError::tool(format!("记录计划 Schema v4 失败：{error}")))?;
+    transaction
+        .commit()
+        .map_err(|error| XduduError::tool(format!("提交计划 Schema v4 迁移失败：{error}")))
+}
+
+fn migrate_plan_schema_v3(connection: &mut Connection) -> XduduResult<()> {
+    let already_applied = connection
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version = 3",
+            [],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|error| XduduError::tool(format!("检查计划迁移状态失败：{error}")))?
+        .is_some();
+    if already_applied {
+        return Ok(());
+    }
+
+    let has_revision = {
+        let mut statement = connection
+            .prepare("PRAGMA table_info(plans)")
+            .map_err(|error| XduduError::tool(format!("检查 plans 表结构失败：{error}")))?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|error| XduduError::tool(format!("读取 plans 表结构失败：{error}")))?;
+        let mut found = false;
+        for column in columns {
+            if column.map_err(|error| XduduError::tool(format!("读取 plans 列名失败：{error}")))?
+                == "revision"
+            {
+                found = true;
+                break;
+            }
+        }
+        found
+    };
+
+    let transaction = connection
+        .transaction()
+        .map_err(|error| XduduError::tool(format!("开始计划 Schema v3 迁移失败：{error}")))?;
+    if !has_revision {
+        transaction
+            .execute(
+                "ALTER TABLE plans ADD COLUMN revision INTEGER NOT NULL DEFAULT 1",
+                [],
+            )
+            .map_err(|error| XduduError::tool(format!("增加计划 revision 列失败：{error}")))?;
+    }
+    transaction
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS plan_revisions (
+                plan_id TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                revision_json TEXT NOT NULL,
+                change_request TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(plan_id, revision),
+                FOREIGN KEY(plan_id) REFERENCES plans(id) ON DELETE CASCADE
+             );
+             CREATE INDEX IF NOT EXISTS plan_revisions_created_idx
+                ON plan_revisions(plan_id, revision ASC);",
+        )
+        .map_err(|error| XduduError::tool(format!("创建计划修订表失败：{error}")))?;
+
+    let stored_plans = {
+        let mut statement = transaction
+            .prepare("SELECT id, plan_json FROM plans ORDER BY created_at ASC")
+            .map_err(|error| XduduError::tool(format!("准备计划迁移查询失败：{error}")))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| XduduError::tool(format!("查询待迁移计划失败：{error}")))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| XduduError::tool(format!("读取待迁移计划失败：{error}")))?
+    };
+
+    for (stored_id, raw) in stored_plans {
+        let value = serde_json::from_str(&raw)
+            .map_err(|error| XduduError::tool(format!("计划 {stored_id} JSON 损坏：{error}")))?;
+        let plan = deserialize_plan_compatible(value).map_err(|error| {
+            XduduError::tool(format!("计划 {stored_id} 无法迁移：{}", error.message))
+        })?;
+        if plan.id.to_string() != stored_id {
+            return Err(XduduError::tool(format!(
+                "计划 {stored_id} 的 JSON ID 不一致，拒绝迁移。"
+            )));
+        }
+        let sanitized = sanitized_plan(&plan);
+        let plan_raw = serde_json::to_string(&sanitized)?;
+        transaction
+            .execute(
+                "UPDATE plans SET status = ?2, schema_version = ?3,
+                    revision = ?4, plan_json = ?5 WHERE id = ?1",
+                params![
+                    stored_id,
+                    enum_name(sanitized.status)?,
+                    i64::from(sanitized.schema_version),
+                    i64::from(sanitized.revision),
+                    plan_raw,
+                ],
+            )
+            .map_err(|error| XduduError::tool(format!("更新迁移计划失败：{error}")))?;
+        let revision = PlanRevision::from_plan(&sanitized, None)?;
+        insert_plan_revision(&transaction, &revision)?;
+    }
+    transaction
+        .execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (3, CURRENT_TIMESTAMP)",
+            [],
+        )
+        .map_err(|error| XduduError::tool(format!("记录计划 Schema v3 失败：{error}")))?;
+    transaction
+        .commit()
+        .map_err(|error| XduduError::tool(format!("提交计划 Schema v3 迁移失败：{error}")))
 }
 
 #[cfg(unix)]
@@ -434,19 +713,47 @@ fn plan_values(plan: &Plan) -> XduduResult<(Plan, String)> {
     Ok((sanitized, raw))
 }
 
+fn revision_values(revision: &PlanRevision) -> XduduResult<(PlanRevision, String)> {
+    revision.validate()?;
+    let sanitized = sanitized_plan_revision(revision);
+    let raw = serde_json::to_string(&sanitized)?;
+    Ok((sanitized, raw))
+}
+
+fn insert_plan_revision(connection: &Connection, revision: &PlanRevision) -> XduduResult<()> {
+    let (revision, raw) = revision_values(revision)?;
+    connection
+        .execute(
+            "INSERT INTO plan_revisions (
+                plan_id, revision, revision_json, change_request, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                revision.plan_id.to_string(),
+                i64::from(revision.revision),
+                raw,
+                revision.change_request,
+                revision.created_at.to_rfc3339(),
+            ],
+        )
+        .map_err(|error| XduduError::tool(format!("保存计划修订快照失败：{error}")))?;
+    Ok(())
+}
+
 fn insert_plan(connection: &Connection, plan: &Plan) -> XduduResult<()> {
     let (plan, raw) = plan_values(plan)?;
     connection
         .execute(
             "INSERT INTO plans (
-                id, session_id, status, schema_version, plan_json,
+                id, session_id, status, schema_version, revision, execution_version, plan_json,
                 created_at, updated_at, completed_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 plan.id.to_string(),
                 plan.session_id.to_string(),
                 enum_name(plan.status)?,
                 i64::from(plan.schema_version),
+                i64::from(plan.revision),
+                plan.execution_version as i64,
                 raw,
                 plan.created_at.to_rfc3339(),
                 plan.updated_at.to_rfc3339(),
@@ -462,15 +769,17 @@ fn update_plan(connection: &Connection, plan: &Plan) -> XduduResult<()> {
     let changed = connection
         .execute(
             "UPDATE plans SET
-                status = ?3, schema_version = ?4, plan_json = ?5,
-                created_at = ?6, updated_at = ?7,
-                completed_at = ?8
+                status = ?3, schema_version = ?4, revision = ?5,
+                execution_version = ?6, plan_json = ?7,
+                created_at = ?8, updated_at = ?9, completed_at = ?10
              WHERE id = ?1 AND session_id = ?2",
             params![
                 plan.id.to_string(),
                 plan.session_id.to_string(),
                 enum_name(plan.status)?,
                 i64::from(plan.schema_version),
+                i64::from(plan.revision),
+                plan.execution_version as i64,
                 raw,
                 plan.created_at.to_rfc3339(),
                 plan.updated_at.to_rfc3339(),
@@ -564,6 +873,8 @@ impl PlanStore for SqliteSessionStore {
                 .transaction()
                 .map_err(|error| XduduError::tool(format!("开始创建计划事务失败：{error}")))?;
             insert_plan(&transaction, &plan)?;
+            let revision = PlanRevision::from_plan(&plan, None)?;
+            insert_plan_revision(&transaction, &revision)?;
             transaction
                 .commit()
                 .map_err(|error| XduduError::tool(format!("提交创建计划事务失败：{error}")))
@@ -595,8 +906,11 @@ impl PlanStore for SqliteSessionStore {
                 )
                 .optional()
                 .map_err(|error| XduduError::tool(format!("读取计划失败：{error}")))?;
-            raw.map(|value| serde_json::from_str(&value).map_err(XduduError::from))
-                .transpose()
+            raw.map(|raw| {
+                let value = serde_json::from_str(&raw)?;
+                deserialize_plan_compatible(value)
+            })
+            .transpose()
         })
         .await
     }
@@ -613,8 +927,201 @@ impl PlanStore for SqliteSessionStore {
                 )
                 .optional()
                 .map_err(|error| XduduError::tool(format!("读取会话计划失败：{error}")))?;
-            raw.map(|value| serde_json::from_str(&value).map_err(XduduError::from))
-                .transpose()
+            raw.map(|raw| {
+                let value = serde_json::from_str(&raw)?;
+                deserialize_plan_compatible(value)
+            })
+            .transpose()
+        })
+        .await
+    }
+
+    async fn list_plans(&self, limit: usize) -> XduduResult<Vec<Plan>> {
+        self.run_blocking(move |connection| {
+            let mut statement = connection
+                .prepare("SELECT plan_json FROM plans ORDER BY updated_at DESC LIMIT ?1")
+                .map_err(|error| XduduError::tool(format!("准备计划列表查询失败：{error}")))?;
+            let rows = statement
+                .query_map([limit as i64], |row| row.get::<_, String>(0))
+                .map_err(|error| XduduError::tool(format!("列出计划失败：{error}")))?;
+            rows.map(|row| {
+                let raw =
+                    row.map_err(|error| XduduError::tool(format!("读取计划失败：{error}")))?;
+                deserialize_plan_compatible(serde_json::from_str(&raw)?)
+            })
+            .collect()
+        })
+        .await
+    }
+
+    async fn update_plan_if_current(
+        &self,
+        plan: &Plan,
+        expected_revision: u32,
+        expected_status: PlanStatus,
+    ) -> XduduResult<bool> {
+        let plan = plan.clone();
+        self.run_blocking(move |mut connection| {
+            let transaction = connection
+                .transaction()
+                .map_err(|error| XduduError::tool(format!("开始计划并发更新事务失败：{error}")))?;
+            let (plan, raw) = plan_values(&plan)?;
+            let changed = transaction
+                .execute(
+                    "UPDATE plans SET
+                        status = ?3, schema_version = ?4, revision = ?5,
+                        execution_version = ?6, plan_json = ?7,
+                        created_at = ?8, updated_at = ?9, completed_at = ?10
+                     WHERE id = ?1 AND session_id = ?2
+                       AND revision = ?11 AND status = ?12",
+                    params![
+                        plan.id.to_string(),
+                        plan.session_id.to_string(),
+                        enum_name(plan.status)?,
+                        i64::from(plan.schema_version),
+                        i64::from(plan.revision),
+                        plan.execution_version as i64,
+                        raw,
+                        plan.created_at.to_rfc3339(),
+                        plan.updated_at.to_rfc3339(),
+                        plan.completed_at.map(|value| value.to_rfc3339()),
+                        i64::from(expected_revision),
+                        enum_name(expected_status)?,
+                    ],
+                )
+                .map_err(|error| XduduError::tool(format!("并发更新计划失败：{error}")))?;
+            transaction
+                .commit()
+                .map_err(|error| XduduError::tool(format!("提交计划并发更新失败：{error}")))?;
+            Ok(changed == 1)
+        })
+        .await
+    }
+
+    async fn append_revision_if_current(
+        &self,
+        plan: &Plan,
+        revision: &PlanRevision,
+        expected_revision: u32,
+        expected_status: PlanStatus,
+    ) -> XduduResult<bool> {
+        let plan = plan.clone();
+        let revision = revision.clone();
+        self.run_blocking(move |mut connection| {
+            let transaction = connection
+                .transaction()
+                .map_err(|error| XduduError::tool(format!("开始追加计划修订事务失败：{error}")))?;
+            let (plan, raw) = plan_values(&plan)?;
+            let changed = transaction
+                .execute(
+                    "UPDATE plans SET
+                        status = ?3, schema_version = ?4, revision = ?5,
+                        execution_version = ?6, plan_json = ?7,
+                        created_at = ?8, updated_at = ?9, completed_at = ?10
+                     WHERE id = ?1 AND session_id = ?2
+                       AND revision = ?11 AND status = ?12",
+                    params![
+                        plan.id.to_string(),
+                        plan.session_id.to_string(),
+                        enum_name(plan.status)?,
+                        i64::from(plan.schema_version),
+                        i64::from(plan.revision),
+                        plan.execution_version as i64,
+                        raw,
+                        plan.created_at.to_rfc3339(),
+                        plan.updated_at.to_rfc3339(),
+                        plan.completed_at.map(|value| value.to_rfc3339()),
+                        i64::from(expected_revision),
+                        enum_name(expected_status)?,
+                    ],
+                )
+                .map_err(|error| XduduError::tool(format!("并发更新计划修订失败：{error}")))?;
+            if changed == 0 {
+                transaction.rollback().map_err(|error| {
+                    XduduError::tool(format!("回滚陈旧计划修订事务失败：{error}"))
+                })?;
+                return Ok(false);
+            }
+            insert_plan_revision(&transaction, &revision)?;
+            transaction
+                .commit()
+                .map_err(|error| XduduError::tool(format!("提交计划修订事务失败：{error}")))?;
+            Ok(true)
+        })
+        .await
+    }
+
+    async fn list_plan_revisions(&self, plan_id: Uuid) -> XduduResult<Vec<PlanRevision>> {
+        self.run_blocking(move |connection| {
+            let mut statement = connection
+                .prepare(
+                    "SELECT revision_json FROM plan_revisions
+                     WHERE plan_id = ?1 ORDER BY revision ASC",
+                )
+                .map_err(|error| XduduError::tool(format!("准备计划修订列表查询失败：{error}")))?;
+            let rows = statement
+                .query_map([plan_id.to_string()], |row| row.get::<_, String>(0))
+                .map_err(|error| XduduError::tool(format!("列出计划修订失败：{error}")))?;
+            rows.map(|row| {
+                let raw =
+                    row.map_err(|error| XduduError::tool(format!("读取计划修订失败：{error}")))?;
+                let revision: PlanRevision = serde_json::from_str(&raw)?;
+                revision.validate()?;
+                Ok(revision)
+            })
+            .collect()
+        })
+        .await
+    }
+
+    async fn checkpoint_plan_execution(
+        &self,
+        plan: &Plan,
+        session: &Session,
+        expected_execution_version: u64,
+        expected_status: PlanStatus,
+    ) -> XduduResult<bool> {
+        let plan = plan.clone();
+        let session = session.clone();
+        self.run_blocking(move |mut connection| {
+            let transaction = connection
+                .transaction()
+                .map_err(|error| XduduError::tool(format!("开始计划检查点事务失败：{error}")))?;
+            let (plan, raw) = plan_values(&plan)?;
+            let changed = transaction
+                .execute(
+                    "UPDATE plans SET status = ?3, schema_version = ?4,
+                       revision = ?5, execution_version = ?6, plan_json = ?7,
+                       updated_at = ?8, completed_at = ?9
+                     WHERE id = ?1 AND session_id = ?2
+                       AND revision = ?10 AND execution_version = ?11 AND status = ?12",
+                    params![
+                        plan.id.to_string(),
+                        plan.session_id.to_string(),
+                        enum_name(plan.status)?,
+                        i64::from(plan.schema_version),
+                        i64::from(plan.revision),
+                        plan.execution_version as i64,
+                        raw,
+                        plan.updated_at.to_rfc3339(),
+                        plan.completed_at.map(|value| value.to_rfc3339()),
+                        i64::from(plan.revision),
+                        expected_execution_version as i64,
+                        enum_name(expected_status)?,
+                    ],
+                )
+                .map_err(|error| XduduError::tool(format!("保存计划检查点失败：{error}")))?;
+            if changed == 0 {
+                transaction
+                    .rollback()
+                    .map_err(|error| XduduError::tool(format!("回滚计划检查点失败：{error}")))?;
+                return Ok(false);
+            }
+            update_session(&transaction, &session)?;
+            transaction
+                .commit()
+                .map_err(|error| XduduError::tool(format!("提交计划检查点失败：{error}")))?;
+            Ok(true)
         })
         .await
     }
@@ -705,6 +1212,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sqlite_计划快照与乐观并发更新保持原子() {
+        let dir = tempdir().unwrap();
+        let store = SqliteSessionStore::new(dir.path()).unwrap();
+        let session = sample_session(dir.path());
+        store.create(&session).await.unwrap();
+        let mut plan = sample_plan(session.id);
+        store.create_plan(&plan).await.unwrap();
+        assert_eq!(store.list_plan_revisions(plan.id).await.unwrap().len(), 1);
+
+        plan.transition_to(PlanStatus::PendingApproval).unwrap();
+        assert!(
+            store
+                .update_plan_if_current(&plan, 1, PlanStatus::Draft)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .update_plan_if_current(&plan, 1, PlanStatus::Draft)
+                .await
+                .unwrap()
+        );
+
+        let old_revision = plan.revision;
+        plan.replace_for_revision(
+            plan.goal.clone(),
+            vec![
+                crate::plan::PlanStep::new("新步骤", "完整修订")
+                    .with_completion_criteria(["已完成".to_owned()]),
+            ],
+            "精简计划".into(),
+        )
+        .unwrap();
+        let snapshot = PlanRevision::from_plan(&plan, Some("精简计划".into())).unwrap();
+        assert!(
+            store
+                .append_revision_if_current(
+                    &plan,
+                    &snapshot,
+                    old_revision,
+                    PlanStatus::PendingApproval,
+                )
+                .await
+                .unwrap()
+        );
+        let revisions = store.list_plan_revisions(plan.id).await.unwrap();
+        assert_eq!(
+            revisions
+                .iter()
+                .map(|item| item.revision)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(revisions[1].change_request.as_deref(), Some("精简计划"));
+    }
+
+    #[tokio::test]
+    async fn 删除会话会级联删除计划修订() {
+        let dir = tempdir().unwrap();
+        let store = SqliteSessionStore::new(dir.path()).unwrap();
+        let session = sample_session(dir.path());
+        store.create(&session).await.unwrap();
+        let plan = sample_plan(session.id);
+        store.create_plan(&plan).await.unwrap();
+        drop(store);
+
+        let connection = Connection::open(dir.path().join(DATABASE_PATH)).unwrap();
+        connection.execute("PRAGMA foreign_keys = ON", []).unwrap();
+        connection
+            .execute(
+                "DELETE FROM sessions WHERE id = ?1",
+                [session.id.to_string()],
+            )
+            .unwrap();
+        let count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM plan_revisions WHERE plan_id = ?1",
+                [plan.id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
     async fn sqlite_计划落盘前脱敏秘密() {
         let dir = tempdir().unwrap();
         let store = SqliteSessionStore::new(dir.path()).unwrap();
@@ -738,6 +1330,92 @@ mod tests {
         let plan = sample_plan(session.id);
         store.create_plan(&plan).await.unwrap();
         assert_eq!(store.get_plan(plan.id).await.unwrap().unwrap().id, plan.id);
+    }
+
+    #[tokio::test]
+    async fn sqlite_v2_计划自动升级并回填_revision_1() {
+        let dir = tempdir().unwrap();
+        let (session, plan) = {
+            let store = SqliteSessionStore::new(dir.path()).unwrap();
+            let session = sample_session(dir.path());
+            store.create(&session).await.unwrap();
+            let plan = sample_plan(session.id);
+            store.create_plan(&plan).await.unwrap();
+            (session, plan)
+        };
+        {
+            let connection = Connection::open(dir.path().join(DATABASE_PATH)).unwrap();
+            let mut value = serde_json::to_value(&plan).unwrap();
+            let object = value.as_object_mut().unwrap();
+            object.insert("schemaVersion".into(), serde_json::Value::from(1));
+            object.remove("revision");
+            object.remove("submittedAt");
+            object.remove("reviewHistory");
+            connection
+                .execute("DELETE FROM schema_migrations WHERE version = 3", [])
+                .unwrap();
+            connection.execute("DROP TABLE plan_revisions", []).unwrap();
+            connection
+                .execute(
+                    "UPDATE plans SET schema_version = 1, plan_json = ?2 WHERE id = ?1",
+                    params![plan.id.to_string(), serde_json::to_string(&value).unwrap()],
+                )
+                .unwrap();
+        }
+
+        let store = SqliteSessionStore::new(dir.path()).unwrap();
+        let migrated = store
+            .latest_plan_for_session(session.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(migrated.schema_version, crate::PLAN_SCHEMA_VERSION);
+        assert_eq!(migrated.revision, 1);
+        assert_eq!(store.list_plan_revisions(plan.id).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn sqlite_v3_迁移遇到损坏计划会整体回滚() {
+        let dir = tempdir().unwrap();
+        let plan_id = {
+            let store = SqliteSessionStore::new(dir.path()).unwrap();
+            let session = sample_session(dir.path());
+            store.create(&session).await.unwrap();
+            let plan = sample_plan(session.id);
+            store.create_plan(&plan).await.unwrap();
+            plan.id
+        };
+        {
+            let connection = Connection::open(dir.path().join(DATABASE_PATH)).unwrap();
+            connection
+                .execute("DELETE FROM schema_migrations WHERE version = 3", [])
+                .unwrap();
+            connection.execute("DROP TABLE plan_revisions", []).unwrap();
+            connection
+                .execute(
+                    "UPDATE plans SET plan_json = 'not json' WHERE id = ?1",
+                    [plan_id.to_string()],
+                )
+                .unwrap();
+        }
+        assert!(SqliteSessionStore::new(dir.path()).is_err());
+        let connection = Connection::open(dir.path().join(DATABASE_PATH)).unwrap();
+        let marker: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version = 3",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(marker, 0);
+        let revision_table: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'plan_revisions'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(revision_table, 0);
     }
 
     #[tokio::test]
@@ -846,7 +1524,7 @@ mod tests {
         let store = SqliteSessionStore::new(dir.path()).unwrap();
         let recovered = store.get(session.id).await.unwrap().unwrap();
         assert_eq!(recovered.status, SessionStatus::Interrupted);
-        assert_eq!(recovered.current_state, AgentLoopState::Error);
+        assert_eq!(recovered.current_state, AgentLoopState::Interrupted);
         assert_eq!(recovered.tool_calls[0].status, ToolCallStatus::Cancelled);
         assert!(
             recovered
@@ -854,5 +1532,68 @@ mod tests {
                 .iter()
                 .any(|message| message.tool_call_id.as_deref() == Some("pending-call"))
         );
+    }
+
+    #[tokio::test]
+    async fn 重开数据库会保留等待计划审批的会话() {
+        let dir = tempdir().unwrap();
+        let mut session = sample_session(dir.path());
+        session.status = SessionStatus::WaitingApproval;
+        session.current_state = AgentLoopState::WaitingApproval;
+        let mut plan = sample_plan(session.id);
+        plan.transition_to(PlanStatus::PendingApproval).unwrap();
+        {
+            let store = SqliteSessionStore::new(dir.path()).unwrap();
+            store.create(&session).await.unwrap();
+            store.create_plan(&plan).await.unwrap();
+        }
+        let store = SqliteSessionStore::new(dir.path()).unwrap();
+        let recovered = store.get(session.id).await.unwrap().unwrap();
+        assert_eq!(recovered.status, SessionStatus::WaitingApproval);
+        assert_eq!(recovered.current_state, AgentLoopState::WaitingApproval);
+    }
+
+    #[tokio::test]
+    async fn 重开数据库会暂停运行中计划且不自动重放步骤() {
+        let dir = tempdir().unwrap();
+        let session = sample_session(dir.path());
+        let mut plan = sample_plan(session.id);
+        plan.transition_to(PlanStatus::PendingApproval).unwrap();
+        plan.transition_to(PlanStatus::Approved).unwrap();
+        plan.transition_to(PlanStatus::Running).unwrap();
+        plan.steps[0]
+            .transition_to(crate::StepStatus::Ready)
+            .unwrap();
+        plan.steps[0]
+            .transition_to(crate::StepStatus::Running)
+            .unwrap();
+        plan.current_step_id = Some(plan.steps[0].id);
+        plan.steps[0].attempts.push(crate::PlanStepAttempt {
+            id: Uuid::new_v4(),
+            attempt: 1,
+            status: crate::StepAttemptStatus::Running,
+            summary: None,
+            evidence: Vec::new(),
+            error: None,
+            tool_call_ids: vec!["unknown-call".into()],
+            started_at: Utc::now(),
+            ended_at: None,
+        });
+        {
+            let store = SqliteSessionStore::new(dir.path()).unwrap();
+            store.create(&session).await.unwrap();
+            store.create_plan(&plan).await.unwrap();
+        }
+
+        let store = SqliteSessionStore::new(dir.path()).unwrap();
+        let recovered = store.get_plan(plan.id).await.unwrap().unwrap();
+        assert_eq!(recovered.status, PlanStatus::Paused);
+        assert_eq!(recovered.steps[0].status, crate::StepStatus::Blocked);
+        assert_eq!(
+            recovered.steps[0].attempts[0].status,
+            crate::StepAttemptStatus::Interrupted
+        );
+        assert_eq!(recovered.steps[0].attempts.len(), 1);
+        assert!(recovered.paused_reason.unwrap().contains("不会自动重放"));
     }
 }

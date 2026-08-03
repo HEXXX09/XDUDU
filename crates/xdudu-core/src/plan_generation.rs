@@ -19,7 +19,7 @@ use crate::{
     },
 };
 
-const SUBMIT_PLAN_TOOL: &str = "submit_plan";
+pub(crate) const SUBMIT_PLAN_TOOL: &str = "submit_plan";
 const MAX_GOAL_BYTES: usize = 4096;
 const MAX_CONTEXT_BYTES: usize = 65_536;
 const MAX_KEY_BYTES: usize = 64;
@@ -46,21 +46,21 @@ pub struct PlanGenerationResult {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct PlanDraft {
-    steps: Vec<PlanStepDraft>,
+pub(crate) struct PlanDraft {
+    pub(crate) steps: Vec<PlanStepDraft>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct PlanStepDraft {
-    key: String,
-    title: String,
+pub(crate) struct PlanStepDraft {
+    pub(crate) key: String,
+    pub(crate) title: String,
     #[serde(default)]
-    description: String,
+    pub(crate) description: String,
     #[serde(default)]
-    dependencies: Vec<String>,
+    pub(crate) dependencies: Vec<String>,
     #[serde(default)]
-    completion_criteria: Vec<String>,
+    pub(crate) completion_criteria: Vec<String>,
 }
 
 /// 调用 Provider 生成计划，严格解析后以 Draft 状态持久化。
@@ -85,7 +85,7 @@ pub async fn generate_plan(config: PlanGenerationConfig<'_>) -> XduduResult<Plan
     };
     let response = config.provider.chat(request).await?;
     let usage = response.usage.clone();
-    let draft = parse_plan_response(response)?;
+    let draft = parse_plan_response(response, SUBMIT_PLAN_TOOL)?;
     let plan = draft_into_plan(config.session_id, config.goal, draft)?;
     config.plan_store.create_plan(&plan).await?;
     Ok(PlanGenerationResult { plan, usage })
@@ -145,10 +145,10 @@ fn build_user_request(goal: &str, context: Option<&str>) -> String {
     request
 }
 
-fn submit_plan_definition() -> ProviderToolDefinition {
+pub(crate) fn plan_protocol_definition(name: &str, description: &str) -> ProviderToolDefinition {
     ProviderToolDefinition {
-        name: SUBMIT_PLAN_TOOL.into(),
-        description: "提交完整的结构化执行计划。该协议只保存草稿，不执行任何步骤。".into(),
+        name: name.into(),
+        description: description.into(),
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,
@@ -212,7 +212,17 @@ fn submit_plan_definition() -> ProviderToolDefinition {
     }
 }
 
-fn parse_plan_response(response: ProviderResponse) -> XduduResult<PlanDraft> {
+fn submit_plan_definition() -> ProviderToolDefinition {
+    plan_protocol_definition(
+        SUBMIT_PLAN_TOOL,
+        "提交完整的结构化执行计划。该协议只保存草稿，不执行任何步骤。",
+    )
+}
+
+pub(crate) fn parse_plan_response(
+    response: ProviderResponse,
+    expected_tool: &str,
+) -> XduduResult<PlanDraft> {
     match response.finish_reason {
         FinishReason::ToolCalls => {}
         FinishReason::Length => {
@@ -224,34 +234,38 @@ fn parse_plan_response(response: ProviderResponse) -> XduduResult<PlanDraft> {
             return Err(plan_protocol_error("计划响应被内容策略拦截。"));
         }
         FinishReason::Stop => {
-            return Err(plan_protocol_error(
-                "模型未调用 submit_plan，不能把普通文本当作计划。",
-            ));
+            return Err(plan_protocol_error(format!(
+                "模型未调用 {expected_tool}，不能把普通文本当作计划。"
+            )));
         }
         FinishReason::Error => return Err(plan_protocol_error("模型未能完成计划生成。")),
     }
     if !response.message.text_content().trim().is_empty() {
-        return Err(plan_protocol_error(
-            "计划响应包含 submit_plan 之外的普通文本。",
-        ));
+        return Err(plan_protocol_error(format!(
+            "计划响应包含 {expected_tool} 之外的普通文本。"
+        )));
     }
     if response.tool_calls.len() != 1 {
-        return Err(plan_protocol_error(
-            "计划响应必须且只能包含一次 submit_plan 调用。",
-        ));
+        return Err(plan_protocol_error(format!(
+            "计划响应必须且只能包含一次 {expected_tool} 调用。"
+        )));
     }
     let call = &response.tool_calls[0];
-    if call.name != SUBMIT_PLAN_TOOL {
+    if call.name != expected_tool {
         return Err(plan_protocol_error(format!(
             "计划响应调用了不允许的协议工具：{}。",
             call.name
         )));
     }
     serde_json::from_value(call.input.clone())
-        .map_err(|error| plan_protocol_error(format!("submit_plan 参数无效：{error}")))
+        .map_err(|error| plan_protocol_error(format!("{expected_tool} 参数无效：{error}")))
 }
 
-fn draft_into_plan(session_id: Uuid, goal: String, draft: PlanDraft) -> XduduResult<Plan> {
+pub(crate) fn draft_into_plan(
+    session_id: Uuid,
+    goal: String,
+    draft: PlanDraft,
+) -> XduduResult<Plan> {
     if draft.steps.is_empty() || draft.steps.len() > 100 {
         return Err(plan_protocol_error("计划步骤数量必须为 1 到 100。"));
     }
@@ -367,6 +381,45 @@ mod tests {
         }
 
         async fn latest_plan_for_session(&self, _session_id: Uuid) -> XduduResult<Option<Plan>> {
+            unreachable!()
+        }
+        async fn list_plans(&self, _limit: usize) -> XduduResult<Vec<Plan>> {
+            unreachable!()
+        }
+
+        async fn update_plan_if_current(
+            &self,
+            _plan: &Plan,
+            _expected_revision: u32,
+            _expected_status: PlanStatus,
+        ) -> XduduResult<bool> {
+            unreachable!()
+        }
+
+        async fn append_revision_if_current(
+            &self,
+            _plan: &Plan,
+            _revision: &crate::PlanRevision,
+            _expected_revision: u32,
+            _expected_status: PlanStatus,
+        ) -> XduduResult<bool> {
+            unreachable!()
+        }
+
+        async fn list_plan_revisions(
+            &self,
+            _plan_id: Uuid,
+        ) -> XduduResult<Vec<crate::PlanRevision>> {
+            unreachable!()
+        }
+
+        async fn checkpoint_plan_execution(
+            &self,
+            _plan: &Plan,
+            _session: &crate::Session,
+            _expected_execution_version: u64,
+            _expected_status: PlanStatus,
+        ) -> XduduResult<bool> {
             unreachable!()
         }
     }
@@ -571,7 +624,7 @@ mod tests {
     fn 截断响应不能被保存为计划() {
         let mut provider_response = response(valid_input());
         provider_response.finish_reason = FinishReason::Length;
-        let error = parse_plan_response(provider_response).unwrap_err();
+        let error = parse_plan_response(provider_response, SUBMIT_PLAN_TOOL).unwrap_err();
         assert!(error.message.contains("长度限制"));
         assert!(!error.retryable);
     }
@@ -596,7 +649,7 @@ mod tests {
                 }
             ]
         });
-        let draft = parse_plan_response(response(input)).unwrap();
+        let draft = parse_plan_response(response(input), SUBMIT_PLAN_TOOL).unwrap();
         let error = draft_into_plan(Uuid::new_v4(), "目标".into(), draft).unwrap_err();
         assert!(error.message.contains("形成环"));
     }

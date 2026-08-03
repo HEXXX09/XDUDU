@@ -124,6 +124,33 @@ impl EventSink for ConsoleRenderer {
             AgentEvent::Warning { message, .. } => {
                 eprintln!("  {} {}", theme.warning("⚠ 警告"), redact_text(&message));
             }
+            AgentEvent::PlanStarted { revision, .. } => {
+                eprintln!("  {} 开始执行计划 revision {revision}", theme.accent("◆"));
+            }
+            AgentEvent::PlanStepStarted { title, attempt, .. } => {
+                eprintln!(
+                    "  {} {} {}",
+                    theme.accent("→"),
+                    redact_text(&title),
+                    theme.muted(&format!("（第 {attempt} 次尝试）"))
+                );
+            }
+            AgentEvent::PlanStepCompleted { summary, .. } => {
+                eprintln!("  {} {}", theme.success("✓"), redact_text(&summary));
+            }
+            AgentEvent::PlanStepFailed { error, .. } => {
+                eprintln!("  {} {}", theme.danger("✗"), redact_text(&error));
+            }
+            AgentEvent::PlanPaused { reason, .. } => {
+                eprintln!(
+                    "  {} {}",
+                    theme.warning("Ⅱ 计划已暂停"),
+                    redact_text(&reason)
+                );
+            }
+            AgentEvent::PlanCompleted { .. } => {
+                eprintln!("  {} 计划全部完成", theme.success("✓"));
+            }
             _ => {}
         }
     }

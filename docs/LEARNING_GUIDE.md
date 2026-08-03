@@ -1,8 +1,8 @@
 # XDUDU 实现原理与源码学习指南
 
-> 当前代码基线：Rust-only v0.6.0，已完成 M1～M6、M7.0～M7.2。
-> 文档日期：2026-07-31。
-> 文档性质：本地学习资料，已被 `.gitignore` 排除，不上传 GitHub。
+> 当前代码基线：Rust-only v0.7.0，已完成 M1～M7。
+> 文档日期：2026-08-03。
+> 文档性质：项目学习资料；按当前约定暂时随仓库同步，后续单独删除。
 > 适合读者：希望从 Agent 原理、Rust 工程和 XDUDU 源码三个层面系统学习的开发者。
 
 ---
@@ -23,7 +23,7 @@
 12. [工作区路径隔离与命令安全](#12-工作区路径隔离与命令安全)
 13. [文件事务、补丁、崩溃恢复与 Undo](#13-文件事务补丁崩溃恢复与-undo)
 14. [Session、SQLite 与上下文压缩](#14-sessionsqlite-与上下文压缩)
-15. [Plan DAG 与 M7.2 结构化计划生成](#15-plan-dag-与-m72-结构化计划生成)
+15. [Plan DAG、审批、执行与恢复](#15-plan-dag审批执行与恢复)
 16. [事件系统、Renderer 与 TUI](#16-事件系统renderer-与-tui)
 17. [配置、凭据与敏感信息脱敏](#17-配置凭据与敏感信息脱敏)
 18. [错误模型、终态与“不能误报完成”](#18-错误模型终态与不能误报完成)
@@ -165,14 +165,12 @@ XDUDU 的主要工程价值正是在这些 Runtime 边界。
 - 搜索、Git、受限 Web Search/Web Fetch；
 - Plan/PlanStep、DAG、状态机、SQLite 持久化；
 - M7.2 结构化计划生成和 Draft 保存；
+- M7.3 整份 Plan 审批、拒绝、自然语言修订和 revision 快照；
+- M7.4～M7.6 串行 DAG 执行、完成证据、检查点、恢复和完整 Plan CLI/TUI；
 - macOS、Linux、Windows CI 配置。
 
 ### 2.2 尚未实现
 
-- M7.3 执行前计划审批和计划修改；
-- Plan 步骤调度及 `complete_step` 协议；
-- Plan 中断后的完整执行恢复；
-- 面向用户的完整 Plan CLI/TUI；
 - MCP；
 - 插件系统；
 - Skills Runtime；
@@ -181,7 +179,7 @@ XDUDU 的主要工程价值正是在这些 Runtime 边界。
 - Computer Use；
 - 新 Provider 扩展和自动 fallback。
 
-学习源码时必须区分“领域模型已经存在”和“用户功能已经完整接通”。例如 M7.2 可以生成并保存 Draft，但目前不会自动执行这个 Plan。
+学习源码时仍必须区分“计划已批准”和“计划已执行”：Approved 只代表用户认可方案，只有显式运行后才进入 Running；每个具体工具副作用仍需独立授权。
 
 ---
 
@@ -226,6 +224,7 @@ xdudu-cli → xdudu-core
 | `sqlite_session.rs` | SQLite Schema、迁移、锁和恢复 |
 | `plan.rs` | Plan、PlanStep、DAG 和状态迁移 |
 | `plan_generation.rs` | M7.2 规划 Prompt 和 `submit_plan` 协议 |
+| `plan_review.rs` | M7.3 提交审阅、审批/拒绝、`revise_plan` 协议和并发保护 |
 | `events.rs` | AgentEvent、EventSink |
 | `config.rs` | 分层配置和来源追踪 |
 | `credentials.rs` | 系统凭据库和 SecretString |
@@ -1243,7 +1242,7 @@ Session 保存：
 - `schema_migrations`：结构版本；
 - `data_migrations`：一次性数据导入。
 
-当前 Schema v2 增加 `plans` 表。
+当前 SQLite Schema v4 包含 sessions、plans 和 plan_revisions，并以 executionVersion 保护执行检查点。
 
 ### 14.4 spawn_blocking
 
@@ -1349,7 +1348,7 @@ TUI：
 
 ---
 
-## 15. Plan DAG 与 M7.2 结构化计划生成
+## 15. Plan DAG、审批、执行与恢复
 
 ### 15.1 ReAct 与 Plan 不是一回事
 
@@ -1370,12 +1369,22 @@ Plan：
 
 `Plan`：
 
-- schemaVersion；
+- schemaVersion 2；
 - id、sessionId；
 - goal；
-- status；
+- status、revision；
 - steps；
-- 时间字段。
+- submittedAt 等时间字段；
+- reviewHistory。
+
+`PlanRevision`：
+
+- planId、revision；
+- 当时的完整 goal 和 steps；
+- 可选 changeRequest；
+- createdAt。
+
+当前 Plan 决定未来执行哪一版，旧 revision 只承担审计和查看职责。
 
 `PlanStep`：
 
@@ -1416,13 +1425,14 @@ DAG 是有向无环图：
 ```text
 draft
   → pending_approval
-      → draft
       → approved
           → running
-              → completed | failed | cancelled
+              → completed | paused | failed | cancelled
+      → rejected
+      → revision + 1 → pending_approval
 ```
 
-当前 M7.2 只实际生成和保存 `draft`。
+M7.2 生成 `draft`；M7.3 把它提交为 `pending_approval`，允许整份批准、整份拒绝或生成新 revision。M7.4～M7.6 在批准后迁移到 `running`，按 DAG 串行执行，并在完成、暂停、重试或取消时保存检查点。
 
 ### 15.5 Step 状态
 
@@ -1513,18 +1523,96 @@ Runtime：
 
 只有完整校验通过才创建 Draft。
 
-### 15.10 当前尚未接通的部分
+### 15.10 为什么 Plan 审批不能复用 Tool ApprovalGate
 
-M7.2 不包含：
+两者批准的对象不同：
 
-- 用户审批 Plan；
-- 修改 Plan；
-- 执行步骤；
-- 自动完成步骤；
-- Plan 执行恢复；
-- 完整 Plan CLI。
+```text
+Plan 审批：我认可“准备怎么做”
+Tool 审批：我允许“现在产生这个具体副作用”
+```
 
-这些属于 M7.3 以后。
+如果批准 Plan 就自动放行写文件、命令和网络，那么计划中的抽象步骤会变成无限授权。XDUDU 因此使用独立 Plan 审阅服务；执行每个步骤时，具体工具仍经过 ToolRegistry、PermissionMode 和 ApprovalGate。
+
+### 15.11 revision 与乐观并发控制
+
+用户可能在两个终端或两个异步流程中同时审批同一份计划。只做“读取后覆盖写”会产生丢失更新：后到的陈旧批准可能覆盖已经完成的修订。
+
+SQLite 更新因此携带前置条件：
+
+```sql
+UPDATE plans
+SET status = ?, revision = ?, plan_json = ?
+WHERE id = ? AND revision = ? AND status = ?
+```
+
+受影响行数为 0 表示状态已变化，运行时返回 `PLAN_CONFLICT`。这就是乐观并发：读取时不长期锁住记录，提交时验证自己仍基于最新版本。
+
+修订还必须同时完成两件事：
+
+1. 更新 `plans` 中的当前版本；
+2. 向 `plan_revisions` 插入完整新快照。
+
+两者处于同一个 SQLite 事务，因此不会出现“当前 revision 已变，但历史快照缺失”的半完成状态。
+
+### 15.12 Schema v3 迁移为什么必须整体事务化
+
+旧数据库中的 Plan Schema v1 没有 revision 和 reviewHistory。启动迁移会：
+
+1. 增加 `plans.revision`；
+2. 创建 `plan_revisions`；
+3. 逐条兼容解析 v1 JSON；
+4. 转换为 Plan Schema v2；
+5. 回填 revision 1；
+6. 重写当前 Plan；
+7. 最后写 Schema v3 标记。
+
+任何一条旧记录损坏都回滚整个事务。这样用户不会得到一部分已迁移、一部分仍旧格式的数据库，也不会因为迁移器“跳过坏数据”而静默丢失计划。
+
+### 15.13 `revise_plan` 的零脏数据协议
+
+自然语言修改不是在原 JSON 上做模糊编辑，而是要求 Provider 生成完整新版本。模型必须：
+
+- 以 `FinishReason::ToolCalls` 结束；
+- 只调用一次 `revise_plan`；
+- 不夹带普通文本或 Markdown；
+- 通过与 `submit_plan` 相同的严格 DTO、长度、完成条件和 DAG 校验。
+
+只有 Provider 响应和完整结构都通过后，运行时才调用事务型 PlanStore。失败、截断、内容过滤、取消、未知字段和循环依赖都不会修改数据库。成功修订保留 Plan ID、Session ID 和 createdAt，但重新生成全部 Step UUID，因为步骤还没有开始执行，不存在需要延续的执行身份。
+
+### 15.14 `/plan` 的会话数据流
+
+```text
+/plan <目标>
+  → 创建或复用 Session
+  → Session = Running/Planning
+  → generate_plan / submit_plan
+  → Draft 写入 SQLite + revision 1 快照
+  → submit_plan_for_review
+  → Plan = PendingApproval
+  → Session = WaitingApproval
+  → TUI 整份审阅
+      ├─ Approve → Plan Approved + Session PlanReady
+      ├─ Revise  → Provider 生成 revision + 1 → 再次审阅
+      ├─ Reject  → Plan Rejected + Session Incomplete
+      └─ Esc     → 保持 PendingApproval
+```
+
+规划上下文只取脱敏的会话摘要和最近用户/助手文本，不注入无限工具输出。`/resume` 恢复到存在待审批计划的会话时会重新打开审阅。非 TTY 模式不模拟键盘审批，只保存 PendingApproval 并给出稳定提示。
+
+### 15.15 `complete_step` 与执行证据
+
+批准后的 `PlanExecutor` 按原始顺序选择 DAG 中第一个 Ready 步骤。每次运行创建独立 `PlanStepAttempt`，记录 attempt 编号、真实工具调用 ID、摘要、错误和逐项证据。模型只有单独调用内部 `complete_step`，且证据索引唯一并覆盖所有完成条件，才能把步骤标记 Completed；普通文本、未解决工具失败或缺失证据都不能冒充完成。
+
+### 15.16 executionVersion 与崩溃恢复
+
+SQLite Schema v4 使用 `revision + executionVersion + status` 作为执行期乐观并发条件，并在同一事务中更新 Plan 和 Session。每个关键边界都推进 executionVersion；陈旧执行器遇到 `PLAN_CONFLICT` 后立即停止。
+
+审批拒绝、Provider/协议错误、轮次上限和 Ctrl+C 会把 Plan 持久化为 Paused。启动时若发现 Running Plan，只会把运行中 attempt 改为 Interrupted、步骤改为 Blocked 并保存现场，绝不自动重放结果未知的工具。用户通过 `/resume` 查看，再明确重试或取消。
+
+### 15.17 完整 Plan 命令面
+
+交互模式提供 `/plan new/status/run/retry/cancel/revisions`；非交互模式提供 `xdudu plan create/list/show/revisions/approve/reject/revise/run/retry/cancel`。Plan 批准始终不等于工具授权，所有真实副作用仍经过原有权限和审批链。
 
 ---
 
@@ -2185,25 +2273,13 @@ Planning → Acting → Observing → Reflecting → Completed
 
 ## 25. 当前边界与后续路线
 
-### M7.3
+### M7（已完成）
 
-- Draft 提交审批；
-- 用户拒绝；
-- 计划修改；
-- `PendingApproval` 和 `Approved` 状态接通。
-
-### M7.4
-
-- 步骤调度；
-- 进度持久化；
-- 中断恢复；
-- 内部 `complete_step`；
-- 失败、阻塞和重试语义。
-
-### M7.5/M7.6
-
-- Plan CLI/TUI；
-- 生成、修改、拒绝、执行、恢复 E2E。
+- Draft、整份审批、拒绝和自然语言修订；
+- 串行 DAG 调度和内部 `complete_step`；
+- executionVersion 原子检查点；
+- 失败、阻塞、暂停、重试、取消和崩溃恢复；
+- Plan CLI/TUI 与生成到恢复的测试闭环。
 
 ### M8
 

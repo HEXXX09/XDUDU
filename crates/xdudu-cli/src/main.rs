@@ -22,13 +22,15 @@ use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use xdudu_core::{
-    AgentRunConfig, AgentRunResult, AllowAllApprovalGate, ApprovalDecision, ApprovalGate,
-    ApprovalMode, ApprovalRequest, ApprovalRule, ApprovalScope, ConfigOverrides,
+    AgentLoopState, AgentRunConfig, AgentRunResult, AllowAllApprovalGate, ApprovalDecision,
+    ApprovalGate, ApprovalMode, ApprovalRequest, ApprovalRule, ApprovalScope, ConfigOverrides,
     DefaultProviderFactory, DenyAllApprovalGate, EventSink, JsonApprovalRuleStore,
-    JsonChangeLedger, KeyringSecretStore, PermissionMode, Provider, ProviderFactory,
-    ResolvedConfig, SecretSource, SecretStore, SecretString, Session, SessionStore,
-    SqliteSessionStore, ToolRegistry, WorkspaceLock, XduduError, approval_rules_path, config_paths,
-    load_config, redact_text, redact_value, register_builtins, resolve_secret, run_agent,
+    JsonChangeLedger, KeyringSecretStore, PermissionMode, Plan, PlanExecutorConfig,
+    PlanGenerationConfig, PlanRevisionConfig, PlanStatus, PlanStore, Provider, ProviderFactory,
+    ResolvedConfig, SecretSource, SecretStore, SecretString, Session, SessionStatus, SessionStore,
+    SqliteSessionStore, ToolRegistry, WorkspaceLock, XduduError, approval_rules_path, approve_plan,
+    config_paths, generate_plan, load_config, redact_text, redact_value, register_builtins,
+    reject_plan, resolve_secret, revise_plan, run_agent, run_plan, submit_plan_for_review,
     write_config_value,
 };
 
@@ -36,7 +38,9 @@ use crate::approval_prompt::{ApprovalMenuChoice, read_approval_menu};
 use crate::doctor::run_doctor;
 use crate::input_editor::{InputEditor, ReadResult};
 use crate::renderer::ConsoleRenderer;
-use crate::tui::{InputOutcome, SessionChoice, TuiApp, TuiContext};
+use crate::tui::{
+    InputOutcome, PlanRecoveryChoice, PlanReviewChoice, SessionChoice, TuiApp, TuiContext,
+};
 use crate::ui::TerminalTheme;
 
 #[derive(Debug, Parser)]
@@ -121,6 +125,11 @@ enum Command {
         #[command(subcommand)]
         command: SessionCommand,
     },
+    /// 创建、审阅、执行和恢复计划。
+    Plan {
+        #[command(subcommand)]
+        command: PlanCommand,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -148,6 +157,46 @@ enum SessionCommand {
     Show { id: Uuid },
     /// 恢复一个会话；省略指令时进入交互模式。
     Resume { id: Uuid, prompt: Option<String> },
+}
+
+#[derive(Debug, Subcommand)]
+enum PlanCommand {
+    Create {
+        goal: String,
+    },
+    List {
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    Show {
+        id: Uuid,
+    },
+    Revisions {
+        id: Uuid,
+    },
+    Approve {
+        id: Uuid,
+        #[arg(long, default_value = "用户通过命令行批准计划。")]
+        reason: String,
+    },
+    Reject {
+        id: Uuid,
+        #[arg(long, default_value = "用户通过命令行拒绝计划。")]
+        reason: String,
+    },
+    Revise {
+        id: Uuid,
+        request: String,
+    },
+    Run {
+        id: Uuid,
+    },
+    Retry {
+        id: Uuid,
+    },
+    Cancel {
+        id: Uuid,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -488,6 +537,11 @@ async fn tui_interactive_loop(
     if let Some(id) = session_id {
         let session = session_for_resume(&runtime, id).await?;
         app.load_session(&session).map_err(XduduError::from)?;
+        if let Some(plan) = pending_plan_for_session(&runtime, Some(id)).await? {
+            review_plan_in_tui(&runtime, &app, plan).await?;
+        } else if let Some(plan) = paused_plan_for_session(&runtime, Some(id)).await? {
+            recover_plan_in_tui(&runtime, &app, plan).await?;
+        }
     }
     if let Some(prompt) = initial_prompt {
         app.begin_prompt(&prompt).map_err(XduduError::from)?;
@@ -518,7 +572,7 @@ async fn tui_interactive_loop(
                     "/exit" | "/quit" | "/q" => break,
                     "/help" | "/h" => {
                         app.notice(
-                            "/new  新会话  ·  /resume  恢复会话  ·  /model NAME  切换模型  ·  /turns N  最大循环次数  ·  /exit  退出",
+                            "/new  新会话  ·  /resume  恢复会话  ·  /plan  生成/审阅计划  ·  /model NAME  切换模型  ·  /turns N  最大循环次数  ·  /exit  退出",
                         )
                         .map_err(XduduError::from)?;
                     }
@@ -538,7 +592,105 @@ async fn tui_interactive_loop(
                             let session = session_for_resume(&runtime, id).await?;
                             app.load_session(&session).map_err(XduduError::from)?;
                             session_id = Some(id);
+                            if let Some(plan) =
+                                pending_plan_for_session(&runtime, session_id).await?
+                            {
+                                review_plan_in_tui(&runtime, &app, plan).await?;
+                            } else if let Some(plan) =
+                                paused_plan_for_session(&runtime, session_id).await?
+                            {
+                                recover_plan_in_tui(&runtime, &app, plan).await?;
+                            }
                         }
+                    }
+                    "/plan" => {
+                        if let Some(plan) = pending_plan_for_session(&runtime, session_id).await? {
+                            review_plan_in_tui(&runtime, &app, plan).await?;
+                        } else if let Some(plan) =
+                            paused_plan_for_session(&runtime, session_id).await?
+                        {
+                            recover_plan_in_tui(&runtime, &app, plan).await?;
+                        } else if let Some(id) = session_id
+                            && let Some(plan) = runtime.store.latest_plan_for_session(id).await?
+                        {
+                            app.notice(plan_summary(&plan)).map_err(XduduError::from)?;
+                        } else {
+                            app.notice("用法：/plan <目标>").map_err(XduduError::from)?;
+                        }
+                    }
+                    "/plan status" => {
+                        if let Some(id) = session_id
+                            && let Some(plan) = runtime.store.latest_plan_for_session(id).await?
+                        {
+                            app.notice(plan_summary(&plan)).map_err(XduduError::from)?;
+                        } else {
+                            app.notice("当前会话没有计划。").map_err(XduduError::from)?;
+                        }
+                    }
+                    "/plan run" | "/plan retry" => {
+                        let Some(id) = session_id else {
+                            app.notice("当前没有活动会话。").map_err(XduduError::from)?;
+                            continue;
+                        };
+                        let Some(plan) = runtime.store.latest_plan_for_session(id).await? else {
+                            app.notice("当前会话没有计划。").map_err(XduduError::from)?;
+                            continue;
+                        };
+                        if input == "/plan run" && plan.status != PlanStatus::Approved {
+                            app.notice("/plan run 只执行已批准计划；暂停计划请使用 /plan retry。")
+                                .map_err(XduduError::from)?;
+                            continue;
+                        }
+                        if input == "/plan retry" && plan.status != PlanStatus::Paused {
+                            app.notice("/plan retry 只重试暂停计划。")
+                                .map_err(XduduError::from)?;
+                            continue;
+                        }
+                        let result = execute_plan_with_sink(&runtime, plan.id, &renderer).await?;
+                        app.notice(result.message).map_err(XduduError::from)?;
+                    }
+                    "/plan revisions" => {
+                        let Some(id) = session_id else {
+                            app.notice("当前没有活动会话。").map_err(XduduError::from)?;
+                            continue;
+                        };
+                        let Some(plan) = runtime.store.latest_plan_for_session(id).await? else {
+                            app.notice("当前会话没有计划。").map_err(XduduError::from)?;
+                            continue;
+                        };
+                        let revisions = runtime.store.list_plan_revisions(plan.id).await?;
+                        app.notice(format!(
+                            "计划修订：{}",
+                            revisions
+                                .iter()
+                                .map(|item| item.revision.to_string())
+                                .collect::<Vec<_>>()
+                                .join("、")
+                        ))
+                        .map_err(XduduError::from)?;
+                    }
+                    "/plan cancel" => {
+                        app.notice("取消不会撤销既有副作用。请输入 YES 确认。")
+                            .map_err(XduduError::from)?;
+                        let confirmed = matches!(
+                            app.read_input().map_err(XduduError::from)?,
+                            InputOutcome::Submit(value) if value.trim() == "YES"
+                        );
+                        if !confirmed {
+                            app.notice("已保留计划。").map_err(XduduError::from)?;
+                            continue;
+                        }
+                        let Some(id) = session_id else {
+                            app.notice("当前没有活动会话。").map_err(XduduError::from)?;
+                            continue;
+                        };
+                        let Some(plan) = runtime.store.latest_plan_for_session(id).await? else {
+                            app.notice("当前会话没有计划。").map_err(XduduError::from)?;
+                            continue;
+                        };
+                        cancel_plan(&runtime, plan.id).await?;
+                        app.notice("计划已取消；既有副作用未撤销。")
+                            .map_err(XduduError::from)?;
                     }
                     _ => {
                         if let Some(raw_id) = input
@@ -551,6 +703,15 @@ async fn tui_interactive_loop(
                                     Ok(session) => {
                                         app.load_session(&session).map_err(XduduError::from)?;
                                         session_id = Some(id);
+                                        if let Some(plan) =
+                                            pending_plan_for_session(&runtime, session_id).await?
+                                        {
+                                            review_plan_in_tui(&runtime, &app, plan).await?;
+                                        } else if let Some(plan) =
+                                            paused_plan_for_session(&runtime, session_id).await?
+                                        {
+                                            recover_plan_in_tui(&runtime, &app, plan).await?;
+                                        }
                                     }
                                     Err(error) => {
                                         app.notice(error.message).map_err(XduduError::from)?;
@@ -559,6 +720,25 @@ async fn tui_interactive_loop(
                                 Err(_) => {
                                     app.notice("会话 ID 必须是完整 UUID。")
                                         .map_err(XduduError::from)?;
+                                }
+                            }
+                        } else if let Some(goal) = input
+                            .strip_prefix("/plan new ")
+                            .or_else(|| input.strip_prefix("/plan "))
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                        {
+                            app.notice("正在生成结构化计划…")
+                                .map_err(XduduError::from)?;
+                            match create_plan_for_review(&runtime, goal.to_owned(), session_id)
+                                .await
+                            {
+                                Ok((session, plan)) => {
+                                    session_id = Some(session.id);
+                                    review_plan_in_tui(&runtime, &app, plan).await?;
+                                }
+                                Err(error) => {
+                                    app.notice(error.message).map_err(XduduError::from)?;
                                 }
                             }
                         } else if let Some(model) = input
@@ -616,6 +796,474 @@ fn session_choice(session: &Session) -> SessionChoice {
     }
 }
 
+fn plan_context(session: &Session) -> Option<String> {
+    const LIMIT: usize = 65_536;
+    let mut parts = Vec::new();
+    if !session.context_summary.trim().is_empty() {
+        parts.push(format!(
+            "较早会话摘要：\n{}",
+            redact_text(&session.context_summary)
+        ));
+    }
+    let recent = session
+        .messages
+        .iter()
+        .rev()
+        .filter(|message| {
+            matches!(
+                message.role,
+                xdudu_core::provider::MessageRole::User
+                    | xdudu_core::provider::MessageRole::Assistant
+            )
+        })
+        .take(24)
+        .collect::<Vec<_>>();
+    for message in recent.into_iter().rev() {
+        let role = if message.role == xdudu_core::provider::MessageRole::User {
+            "用户"
+        } else {
+            "助手"
+        };
+        parts.push(format!("{role}：{}", redact_text(&message.content)));
+    }
+    let mut output = String::new();
+    for part in parts {
+        let separator = if output.is_empty() { "" } else { "\n\n" };
+        if output.len() + separator.len() + part.len() > LIMIT {
+            break;
+        }
+        output.push_str(separator);
+        output.push_str(&part);
+    }
+    (!output.is_empty()).then_some(output)
+}
+
+fn active_plan(status: PlanStatus) -> bool {
+    matches!(
+        status,
+        PlanStatus::Draft
+            | PlanStatus::PendingApproval
+            | PlanStatus::Approved
+            | PlanStatus::Running
+            | PlanStatus::Paused
+    )
+}
+
+async fn create_plan_for_review(
+    runtime: &Runtime,
+    goal: String,
+    session_id: Option<Uuid>,
+) -> Result<(Session, Plan), XduduError> {
+    let mut session = if let Some(id) = session_id {
+        session_for_resume(runtime, id).await?
+    } else {
+        Session::new(
+            runtime.cwd.clone(),
+            runtime.provider.name(),
+            runtime.model.clone(),
+            goal.clone(),
+        )
+    };
+    if let Some(plan) = runtime.store.latest_plan_for_session(session.id).await?
+        && active_plan(plan.status)
+    {
+        return Err(XduduError::validation(format!(
+            "当前会话已有活动计划（revision {}，状态 {:?}），不能创建第二份计划。",
+            plan.revision, plan.status
+        )));
+    }
+
+    let context = plan_context(&session);
+    session.status = SessionStatus::Running;
+    session.current_state = AgentLoopState::Planning;
+    session.provider_name = runtime.provider.name().to_owned();
+    session.model.clone_from(&runtime.model);
+    session.completed_at = None;
+    if session_id.is_some() {
+        session.append_user_message(goal.clone());
+        runtime.store.update(&session).await?;
+    } else {
+        runtime.store.create(&session).await?;
+    }
+
+    let cancellation = CancellationToken::new();
+    let generation = generate_plan(PlanGenerationConfig {
+        session_id: session.id,
+        goal,
+        context,
+        model: runtime.model.clone(),
+        cwd: runtime.cwd.clone(),
+        provider: runtime.provider.as_ref(),
+        plan_store: &runtime.store,
+        cancellation: cancellation.clone(),
+    });
+    tokio::pin!(generation);
+    let generated = tokio::select! {
+        result = &mut generation => result,
+        signal = tokio::signal::ctrl_c() => {
+            if signal.is_ok() {
+                cancellation.cancel();
+            }
+            generation.await
+        }
+    };
+    let generated = match generated {
+        Ok(generated) => generated,
+        Err(error) => {
+            session.status = SessionStatus::Incomplete;
+            session.current_state = AgentLoopState::Incomplete;
+            session.touch();
+            runtime.store.update(&session).await?;
+            return Err(error);
+        }
+    };
+    session.total_input_tokens = session
+        .total_input_tokens
+        .saturating_add(generated.usage.input_tokens);
+    session.total_output_tokens = session
+        .total_output_tokens
+        .saturating_add(generated.usage.output_tokens);
+    let plan = submit_plan_for_review(&runtime.store, generated.plan.id, 1).await?;
+    session.status = SessionStatus::WaitingApproval;
+    session.current_state = AgentLoopState::WaitingApproval;
+    session.touch();
+    runtime.store.update(&session).await?;
+    Ok((session, plan))
+}
+
+async fn pending_plan_for_session(
+    runtime: &Runtime,
+    session_id: Option<Uuid>,
+) -> Result<Option<Plan>, XduduError> {
+    let Some(session_id) = session_id else {
+        return Ok(None);
+    };
+    Ok(runtime
+        .store
+        .latest_plan_for_session(session_id)
+        .await?
+        .filter(|plan| plan.status == PlanStatus::PendingApproval))
+}
+
+async fn paused_plan_for_session(
+    runtime: &Runtime,
+    session_id: Option<Uuid>,
+) -> Result<Option<Plan>, XduduError> {
+    let Some(session_id) = session_id else {
+        return Ok(None);
+    };
+    Ok(runtime
+        .store
+        .latest_plan_for_session(session_id)
+        .await?
+        .filter(|plan| plan.status == PlanStatus::Paused))
+}
+
+async fn sync_plan_session(
+    runtime: &Runtime,
+    session_id: Uuid,
+    status: SessionStatus,
+    state: AgentLoopState,
+) -> Result<(), XduduError> {
+    let mut session = session_for_resume(runtime, session_id).await?;
+    session.status = status;
+    session.current_state = state;
+    session.completed_at = None;
+    session.touch();
+    runtime.store.update(&session).await
+}
+
+async fn sync_plan_session_store(
+    store: &SqliteSessionStore,
+    session_id: Uuid,
+    status: SessionStatus,
+    state: AgentLoopState,
+) -> Result<(), XduduError> {
+    let mut session = store
+        .get(session_id)
+        .await?
+        .ok_or_else(|| XduduError::validation(format!("找不到会话：{session_id}")))?;
+    session.status = status;
+    session.current_state = state;
+    session.completed_at = None;
+    session.touch();
+    store.update(&session).await
+}
+
+async fn review_plan_in_tui(
+    runtime: &Runtime,
+    app: &TuiApp,
+    mut plan: Plan,
+) -> Result<(), XduduError> {
+    loop {
+        match app.review_plan(&plan).map_err(XduduError::from)? {
+            None => {
+                app.notice("计划仍保持等待审批，可稍后输入 /plan 重新打开。")
+                    .map_err(XduduError::from)?;
+                return Ok(());
+            }
+            Some(PlanReviewChoice::Approve) => {
+                let approved = approve_plan(
+                    &runtime.store,
+                    plan.id,
+                    plan.revision,
+                    "用户在终端审阅界面批准计划。",
+                )
+                .await?;
+                sync_plan_session(
+                    runtime,
+                    approved.session_id,
+                    SessionStatus::PlanReady,
+                    AgentLoopState::Completed,
+                )
+                .await?;
+                app.notice("计划已批准。输入 /plan run 开始执行；具体副作用仍会单独审批。")
+                    .map_err(XduduError::from)?;
+                return Ok(());
+            }
+            Some(PlanReviewChoice::Reject) => {
+                let rejected = reject_plan(
+                    &runtime.store,
+                    plan.id,
+                    plan.revision,
+                    "用户在终端审阅界面拒绝计划。",
+                )
+                .await?;
+                sync_plan_session(
+                    runtime,
+                    rejected.session_id,
+                    SessionStatus::Incomplete,
+                    AgentLoopState::Incomplete,
+                )
+                .await?;
+                app.notice("计划已拒绝，未执行任何步骤。")
+                    .map_err(XduduError::from)?;
+                return Ok(());
+            }
+            Some(PlanReviewChoice::RequestChanges) => {
+                app.notice("请输入对计划的修改要求；Ctrl+C 取消并保留当前版本。")
+                    .map_err(XduduError::from)?;
+                let change_request = match app.read_input().map_err(XduduError::from)? {
+                    InputOutcome::Submit(value) | InputOutcome::Command(value)
+                        if !value.trim().is_empty() =>
+                    {
+                        value
+                    }
+                    _ => {
+                        app.notice("已取消修改，原计划继续等待审批。")
+                            .map_err(XduduError::from)?;
+                        continue;
+                    }
+                };
+                let session = session_for_resume(runtime, plan.session_id).await?;
+                sync_plan_session(
+                    runtime,
+                    plan.session_id,
+                    SessionStatus::Running,
+                    AgentLoopState::Planning,
+                )
+                .await?;
+                let cancellation = CancellationToken::new();
+                let revision = revise_plan(PlanRevisionConfig {
+                    plan_id: plan.id,
+                    expected_revision: plan.revision,
+                    change_request,
+                    context: plan_context(&session),
+                    model: runtime.model.clone(),
+                    cwd: runtime.cwd.clone(),
+                    provider: runtime.provider.as_ref(),
+                    plan_store: &runtime.store,
+                    cancellation: cancellation.clone(),
+                });
+                tokio::pin!(revision);
+                let result = tokio::select! {
+                    result = &mut revision => result,
+                    signal = tokio::signal::ctrl_c() => {
+                        if signal.is_ok() {
+                            cancellation.cancel();
+                        }
+                        revision.await
+                    }
+                };
+                match result {
+                    Ok(result) => {
+                        plan = result.plan;
+                        let mut session = session_for_resume(runtime, plan.session_id).await?;
+                        session.total_input_tokens = session
+                            .total_input_tokens
+                            .saturating_add(result.usage.input_tokens);
+                        session.total_output_tokens = session
+                            .total_output_tokens
+                            .saturating_add(result.usage.output_tokens);
+                        session.status = SessionStatus::WaitingApproval;
+                        session.current_state = AgentLoopState::WaitingApproval;
+                        session.touch();
+                        runtime.store.update(&session).await?;
+                        app.notice(format!(
+                            "计划已修订为 revision {}，请重新审阅。",
+                            plan.revision
+                        ))
+                        .map_err(XduduError::from)?;
+                    }
+                    Err(error) => {
+                        sync_plan_session(
+                            runtime,
+                            plan.session_id,
+                            SessionStatus::WaitingApproval,
+                            AgentLoopState::WaitingApproval,
+                        )
+                        .await?;
+                        app.notice(format!("修订失败，原计划保持不变：{}", error.message))
+                            .map_err(XduduError::from)?;
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn recover_plan_in_tui(
+    runtime: &Runtime,
+    app: &TuiApp,
+    mut plan: Plan,
+) -> Result<(), XduduError> {
+    loop {
+        match app.recover_plan(&plan).map_err(XduduError::from)? {
+            None => {
+                app.notice("计划保持暂停，未重放任何工具调用。")
+                    .map_err(XduduError::from)?;
+                return Ok(());
+            }
+            Some(PlanRecoveryChoice::ViewDetails) => {
+                app.notice(plan_summary(&plan)).map_err(XduduError::from)?;
+                plan = runtime
+                    .store
+                    .get_plan(plan.id)
+                    .await?
+                    .ok_or_else(|| XduduError::validation("计划已不存在。"))?;
+            }
+            Some(PlanRecoveryChoice::Continue | PlanRecoveryChoice::Retry) => {
+                let result = execute_plan_with_sink(runtime, plan.id, &app.renderer()).await?;
+                app.notice(result.message).map_err(XduduError::from)?;
+                return Ok(());
+            }
+            Some(PlanRecoveryChoice::Cancel) => {
+                app.notice("取消不会撤销既有副作用。请输入 YES 确认。")
+                    .map_err(XduduError::from)?;
+                let confirmed = matches!(
+                    app.read_input().map_err(XduduError::from)?,
+                    InputOutcome::Submit(value) if value.trim() == "YES"
+                );
+                if confirmed {
+                    cancel_plan(runtime, plan.id).await?;
+                    app.notice("计划已取消；既有副作用未撤销。")
+                        .map_err(XduduError::from)?;
+                    return Ok(());
+                }
+                app.notice("已保留暂停计划。").map_err(XduduError::from)?;
+            }
+        }
+    }
+}
+
+async fn execute_plan_with_sink(
+    runtime: &Runtime,
+    plan_id: Uuid,
+    sink: &dyn EventSink,
+) -> Result<xdudu_core::PlanExecutionResult, XduduError> {
+    let cancellation = CancellationToken::new();
+    let execution = run_plan(PlanExecutorConfig {
+        plan_id,
+        model: runtime.model.clone(),
+        cwd: runtime.cwd.clone(),
+        max_turns_per_step: runtime.max_turns,
+        provider: runtime.provider.as_ref(),
+        tool_registry: &runtime.registry,
+        session_store: &runtime.store,
+        plan_store: &runtime.store,
+        permission_mode: runtime.permission_mode,
+        cancellation: cancellation.clone(),
+        event_sink: Some(sink),
+    });
+    tokio::pin!(execution);
+    tokio::select! {
+        result = &mut execution => result,
+        signal = tokio::signal::ctrl_c() => {
+            if signal.is_ok() {
+                cancellation.cancel();
+            }
+            execution.await
+        }
+    }
+}
+
+fn plan_summary(plan: &Plan) -> String {
+    let completed = plan
+        .steps
+        .iter()
+        .filter(|step| step.status == xdudu_core::StepStatus::Completed)
+        .count();
+    format!(
+        "Plan {} · revision {} · {:?} · {}/{} 步完成{}",
+        plan.id,
+        plan.revision,
+        plan.status,
+        completed,
+        plan.steps.len(),
+        plan.paused_reason
+            .as_ref()
+            .map(|reason| format!(" · {reason}"))
+            .unwrap_or_default()
+    )
+}
+
+async fn cancel_plan(runtime: &Runtime, plan_id: Uuid) -> Result<Plan, XduduError> {
+    cancel_plan_with_store(&runtime.store, plan_id).await
+}
+
+async fn cancel_plan_with_store(
+    store: &SqliteSessionStore,
+    plan_id: Uuid,
+) -> Result<Plan, XduduError> {
+    let mut plan = store
+        .get_plan(plan_id)
+        .await?
+        .ok_or_else(|| XduduError::validation(format!("找不到计划：{plan_id}")))?;
+    let expected_status = plan.status;
+    if matches!(
+        expected_status,
+        PlanStatus::Completed | PlanStatus::Failed | PlanStatus::Rejected | PlanStatus::Cancelled
+    ) {
+        return Err(XduduError::validation("终态计划不能取消。"));
+    }
+    let mut session = store
+        .get(plan.session_id)
+        .await?
+        .ok_or_else(|| XduduError::validation(format!("找不到计划会话：{}", plan.session_id)))?;
+    for step in &mut plan.steps {
+        if !matches!(
+            step.status,
+            xdudu_core::StepStatus::Completed | xdudu_core::StepStatus::Skipped
+        ) {
+            let _ = step.transition_to(xdudu_core::StepStatus::Cancelled);
+        }
+    }
+    plan.transition_to(PlanStatus::Cancelled)?;
+    let expected_version = plan.execution_version;
+    plan.execution_version += 1;
+    session.status = SessionStatus::Incomplete;
+    session.current_state = AgentLoopState::Incomplete;
+    if !store
+        .checkpoint_plan_execution(&plan, &session, expected_version, expected_status)
+        .await?
+    {
+        return Err(XduduError::validation(
+            "PLAN_CONFLICT：计划已被其他请求更新。",
+        ));
+    }
+    Ok(plan)
+}
+
 async fn plain_interactive_loop(
     mut runtime: Runtime,
     initial_prompt: Option<String>,
@@ -668,6 +1316,99 @@ async fn plain_interactive_loop(
                 println!("  当前终端不支持会话选择器，请使用 /resume <会话UUID>。");
                 continue;
             }
+            "/plan" => {
+                if pending_plan_for_session(&runtime, session_id)
+                    .await?
+                    .is_some()
+                {
+                    println!(
+                        "  当前终端不支持交互式计划审阅；计划继续保持等待审批，请在 TTY 中恢复会话。"
+                    );
+                } else {
+                    if let Some(plan) = paused_plan_for_session(&runtime, session_id).await? {
+                        println!("{}", plan_summary(&plan));
+                        println!(
+                            "  使用 /plan retry 重试，或 /plan cancel 取消。工具不会自动重放。"
+                        );
+                    } else {
+                        println!("  用法：/plan <目标>");
+                    }
+                }
+                continue;
+            }
+            "/plan status" => {
+                if let Some(id) = session_id
+                    && let Some(plan) = runtime.store.latest_plan_for_session(id).await?
+                {
+                    println!("{}", plan_summary(&plan));
+                } else {
+                    println!("  当前会话没有计划。");
+                }
+                continue;
+            }
+            "/plan run" | "/plan retry" => {
+                let Some(id) = session_id else {
+                    println!("  当前没有活动会话。");
+                    continue;
+                };
+                let Some(plan) = runtime.store.latest_plan_for_session(id).await? else {
+                    println!("  当前会话没有计划。");
+                    continue;
+                };
+                if input == "/plan run" && plan.status != PlanStatus::Approved {
+                    println!("  /plan run 只执行已批准计划；暂停计划请使用 /plan retry。");
+                    continue;
+                }
+                if input == "/plan retry" && plan.status != PlanStatus::Paused {
+                    println!("  /plan retry 只重试暂停计划。");
+                    continue;
+                }
+                let result = execute_plan_with_sink(&runtime, plan.id, &runtime.renderer).await?;
+                println!("  {}", result.message);
+                continue;
+            }
+            "/plan revisions" => {
+                let Some(id) = session_id else {
+                    println!("  当前没有活动会话。");
+                    continue;
+                };
+                let Some(plan) = runtime.store.latest_plan_for_session(id).await? else {
+                    println!("  当前会话没有计划。");
+                    continue;
+                };
+                let revisions = runtime.store.list_plan_revisions(plan.id).await?;
+                println!(
+                    "  计划修订：{}",
+                    revisions
+                        .iter()
+                        .map(|item| item.revision.to_string())
+                        .collect::<Vec<_>>()
+                        .join("、")
+                );
+                continue;
+            }
+            "/plan cancel" => {
+                let Some(id) = session_id else {
+                    println!("  当前没有活动会话。");
+                    continue;
+                };
+                let Some(plan) = runtime.store.latest_plan_for_session(id).await? else {
+                    println!("  当前会话没有计划。");
+                    continue;
+                };
+                println!("  取消不会撤销既有副作用。再次输入 YES 确认。");
+                let confirmed = matches!(
+                    editor.read_line("  确认：").map_err(XduduError::from)?,
+                    ReadResult::Line(value) if value.trim() == "YES"
+                );
+                if confirmed {
+                    cancel_plan(&runtime, plan.id).await?;
+                    println!("  计划已取消；既有副作用未撤销。");
+                } else {
+                    println!("  已保留计划。");
+                }
+                continue;
+            }
             _ => {}
         }
         if let Some(raw_id) = input
@@ -680,6 +1421,32 @@ async fn plain_interactive_loop(
             let session = session_for_resume(&runtime, id).await?;
             session_id = Some(id);
             println!("  已恢复会话：{}", session.title);
+            if pending_plan_for_session(&runtime, session_id)
+                .await?
+                .is_some()
+            {
+                println!("  此会话有等待审批的计划；当前终端不支持交互式审阅，计划状态保持不变。");
+            } else if paused_plan_for_session(&runtime, session_id)
+                .await?
+                .is_some()
+            {
+                println!("  此会话有暂停计划；使用 /plan status 查看，/plan retry 重试。");
+            }
+            continue;
+        }
+        if let Some(goal) = input
+            .strip_prefix("/plan new ")
+            .or_else(|| input.strip_prefix("/plan "))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let (session, plan) =
+                create_plan_for_review(&runtime, goal.to_owned(), session_id).await?;
+            session_id = Some(session.id);
+            println!(
+                "  计划 revision {} 已生成并等待审批。当前终端不支持交互式审阅，请在 TTY 中运行 XDUDU 并使用 /resume {}。",
+                plan.revision, session.id
+            );
             continue;
         }
         if let Some(model) = input
@@ -910,6 +1677,199 @@ async fn handle_session(command: SessionCommand, cwd: &std::path::Path) -> Resul
     Ok(0)
 }
 
+async fn handle_plan_command(runtime: &Runtime, command: PlanCommand) -> Result<u8, XduduError> {
+    match command {
+        PlanCommand::Create { goal } => {
+            let (session, plan) = create_plan_for_review(runtime, goal, None).await?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "sessionId": session.id,
+                    "plan": plan
+                }))?
+            );
+        }
+        PlanCommand::List { limit } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&runtime.store.list_plans(limit).await?)?
+            );
+        }
+        PlanCommand::Show { id } => {
+            let plan = runtime
+                .store
+                .get_plan(id)
+                .await?
+                .ok_or_else(|| XduduError::validation(format!("找不到计划：{id}")))?;
+            println!("{}", serde_json::to_string_pretty(&plan)?);
+        }
+        PlanCommand::Revisions { id } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&runtime.store.list_plan_revisions(id).await?)?
+            );
+        }
+        PlanCommand::Approve { id, reason } => {
+            let plan = runtime
+                .store
+                .get_plan(id)
+                .await?
+                .ok_or_else(|| XduduError::validation(format!("找不到计划：{id}")))?;
+            let approved = approve_plan(&runtime.store, id, plan.revision, reason).await?;
+            sync_plan_session(
+                runtime,
+                approved.session_id,
+                SessionStatus::PlanReady,
+                AgentLoopState::Completed,
+            )
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&approved)?);
+        }
+        PlanCommand::Reject { id, reason } => {
+            let plan = runtime
+                .store
+                .get_plan(id)
+                .await?
+                .ok_or_else(|| XduduError::validation(format!("找不到计划：{id}")))?;
+            let rejected = reject_plan(&runtime.store, id, plan.revision, reason).await?;
+            sync_plan_session(
+                runtime,
+                rejected.session_id,
+                SessionStatus::Incomplete,
+                AgentLoopState::Incomplete,
+            )
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&rejected)?);
+        }
+        PlanCommand::Revise { id, request } => {
+            let plan = runtime
+                .store
+                .get_plan(id)
+                .await?
+                .ok_or_else(|| XduduError::validation(format!("找不到计划：{id}")))?;
+            let session = session_for_resume(runtime, plan.session_id).await?;
+            let revised = revise_plan(PlanRevisionConfig {
+                plan_id: id,
+                expected_revision: plan.revision,
+                change_request: request,
+                context: plan_context(&session),
+                model: runtime.model.clone(),
+                cwd: runtime.cwd.clone(),
+                provider: runtime.provider.as_ref(),
+                plan_store: &runtime.store,
+                cancellation: CancellationToken::new(),
+            })
+            .await?;
+            sync_plan_session(
+                runtime,
+                revised.plan.session_id,
+                SessionStatus::WaitingApproval,
+                AgentLoopState::WaitingApproval,
+            )
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&revised.plan)?);
+        }
+        PlanCommand::Run { id } => {
+            let plan = runtime
+                .store
+                .get_plan(id)
+                .await?
+                .ok_or_else(|| XduduError::validation(format!("找不到计划：{id}")))?;
+            if plan.status != PlanStatus::Approved {
+                return Err(XduduError::validation(
+                    "plan run 只执行已批准计划；暂停计划请使用 plan retry。",
+                ));
+            }
+            let result = execute_plan_with_sink(runtime, id, &runtime.renderer).await?;
+            println!("{}", serde_json::to_string_pretty(&result.plan)?);
+            return Ok((!result.completed) as u8);
+        }
+        PlanCommand::Retry { id } => {
+            let plan = runtime
+                .store
+                .get_plan(id)
+                .await?
+                .ok_or_else(|| XduduError::validation(format!("找不到计划：{id}")))?;
+            if plan.status != PlanStatus::Paused {
+                return Err(XduduError::validation("plan retry 只重试暂停计划。"));
+            }
+            let result = execute_plan_with_sink(runtime, id, &runtime.renderer).await?;
+            println!("{}", serde_json::to_string_pretty(&result.plan)?);
+            return Ok((!result.completed) as u8);
+        }
+        PlanCommand::Cancel { id } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&cancel_plan(runtime, id).await?)?
+            );
+        }
+    }
+    Ok(0)
+}
+
+async fn handle_plan_local(cwd: &std::path::Path, command: PlanCommand) -> Result<u8, XduduError> {
+    let store = SqliteSessionStore::new(cwd)?;
+    match command {
+        PlanCommand::List { limit } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&store.list_plans(limit).await?)?
+            );
+        }
+        PlanCommand::Show { id } => {
+            let plan = store
+                .get_plan(id)
+                .await?
+                .ok_or_else(|| XduduError::validation(format!("找不到计划：{id}")))?;
+            println!("{}", serde_json::to_string_pretty(&plan)?);
+        }
+        PlanCommand::Revisions { id } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&store.list_plan_revisions(id).await?)?
+            );
+        }
+        PlanCommand::Approve { id, reason } => {
+            let plan = store
+                .get_plan(id)
+                .await?
+                .ok_or_else(|| XduduError::validation(format!("找不到计划：{id}")))?;
+            let approved = approve_plan(&store, id, plan.revision, reason).await?;
+            sync_plan_session_store(
+                &store,
+                approved.session_id,
+                SessionStatus::PlanReady,
+                AgentLoopState::Completed,
+            )
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&approved)?);
+        }
+        PlanCommand::Reject { id, reason } => {
+            let plan = store
+                .get_plan(id)
+                .await?
+                .ok_or_else(|| XduduError::validation(format!("找不到计划：{id}")))?;
+            let rejected = reject_plan(&store, id, plan.revision, reason).await?;
+            sync_plan_session_store(
+                &store,
+                rejected.session_id,
+                SessionStatus::Incomplete,
+                AgentLoopState::Incomplete,
+            )
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&rejected)?);
+        }
+        PlanCommand::Cancel { id } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&cancel_plan_with_store(&store, id).await?)?
+            );
+        }
+        _ => unreachable!("本地计划入口只接收无需 Provider 的命令"),
+    }
+    Ok(0)
+}
+
 async fn run() -> Result<u8, XduduError> {
     let cli = Cli::parse();
     let cwd = env::current_dir().map_err(XduduError::from)?;
@@ -956,6 +1916,17 @@ async fn run() -> Result<u8, XduduError> {
         }) => {
             return handle_session(command, &cwd).await;
         }
+        Some(Command::Plan {
+            command:
+                command @ (PlanCommand::List { .. }
+                | PlanCommand::Show { .. }
+                | PlanCommand::Revisions { .. }
+                | PlanCommand::Approve { .. }
+                | PlanCommand::Reject { .. }
+                | PlanCommand::Cancel { .. }),
+        }) => {
+            return handle_plan_local(&cwd, command).await;
+        }
         _ => {}
     }
 
@@ -973,6 +1944,10 @@ async fn run() -> Result<u8, XduduError> {
         _ => cli.session,
     };
     let resolved = load_config(&cwd, cli_overrides)?;
+    if let Some(Command::Plan { command }) = cli.command {
+        let runtime = create_runtime(cwd, &resolved, false).await?;
+        return handle_plan_command(&runtime, command).await;
+    }
     let piped = !io::stdin().is_terminal();
     let prompt = command_prompt.or(cli.prompt);
     let interactive = cli.interactive || (prompt.is_none() && !piped);

@@ -42,6 +42,7 @@ agent.approval
 output.json
 output.no_stream
 output.color
+output.debug_trace
 ```
 
 关键校验：Provider 只能是 `anthropic` 或 `deepseek`；模型非空；轮次、超时、重试和节流必须在限定范围；Base URL 要求 HTTPS，本机回环地址例外；TOML 中发现 key、token、secret 等秘密字段时拒绝加载。项目配置不能设置 Base URL，也不能提升用户或默认权限、审批级别。
@@ -126,6 +127,8 @@ Idle → Planning → Acting → Observing → Reflecting
 
 首轮模型请求处于 `Planning`，执行工具时进入 `Acting`，工具结果落入上下文后进入 `Observing`，下一次携带观察结果请求模型时进入 `Reflecting`。系统提示词只提供简短工具索引；结构化输入 Schema 只通过 Provider 的 `tools` 字段发送，避免重复占用上下文。模型不输出内部思维链，只通过工具调用、进度和最终结论表现 ReAct 循环。
 
+Provider 的专用推理字段不会转换成公开 `AssistantDelta`：DeepSeek 的 `reasoning_content` 被忽略，Anthropic 的 `thinking` 和 `redacted_thinking` 内容块被过滤，流式 thinking delta 也不会进入公开文本。`--debug-trace` 只启用 XDUDU 自己生成的结构化运行时轨迹，不会打开或重建模型思维链。
+
 Agent 将状态、文本增量、工具开始、工具进度、工具结束、用量和告警发送为 `AgentEvent`。每个工具调用拥有容量为 64 的非阻塞进度通道；通道满时丢弃中间更新，工具执行不能因 UI 变慢而阻塞。同批工具中一旦出现拒绝，后续副作用工具会被阻止，只读工具仍可执行。Renderer 只是消费者，不能改变 Agent 领域状态。达到最大轮次、模型长度截断、未执行工具调用或仍有未解决的工具失败均为 `Incomplete`。
 
 ## 8. Renderer
@@ -134,12 +137,14 @@ CLI Renderer 有四种输出策略：
 
 | 模式 | 行为 |
 | --- | --- |
-| 交互 TTY | 全屏对话时间线；文本、工具、状态和用量事件原位更新，底部 Composer 独占输入 |
+| 交互 TTY | 默认原生滚动历史与底部活动区域；可选备用屏幕全屏 TUI |
 | 非交互默认 | 文本增量立即写终端，工具事件给出已脱敏的阶段提示 |
 | `--no-stream` | 缓存助手文本，但仍实时显示工具阶段 |
 | `--json` | 每个事件一行 JSON，末尾输出运行结果 |
 
-所有模式先经过统一脱敏。交互 TTY 不允许核心层直接写终端，TUI 根据 `AgentEvent` 维护静态对话、流式回复、工具活动和底部状态；不支持 TUI 的终端自动降级为行式输入。`--no-color` 和 `NO_COLOR` 禁用颜色。JSON 字段不包含 ANSI，并适合管道消费。CLI 的打印错误也不得包含 Secret 原文。
+所有输出先经过统一脱敏。Markdown 由 `pulldown-cmark` 解析成统一终端语义行，交互终端与非 TTY 顺序输出共享标题、列表、引用、表格、链接、代码块与 Diff 基础表现。交互界面使用事件通道和单一绘制循环，完成内容只提交一次，工具和审批只在活动区更新；审批结果与工具摘要随后进入原生滚动历史。`--no-color` 和 `NO_COLOR` 禁用颜色，JSON 字段不包含 ANSI。
+
+`/model` 在交互 TTY 中打开 Provider 感知的模型选择器；只列出当前适配器经过兼容性验证的模型，上下键选择、Enter 确认、Esc 取消。确认后同时更新当前运行时和用户级 `provider.model`，后续会话继承该默认值；`/model <id>` 仍作为高级快捷入口保留。DeepSeek V4 请求显式使用非思考模式，避免在不保存原始思维链的前提下破坏多轮工具调用协议。
 
 ## 9. 工具和权限
 
@@ -166,7 +171,7 @@ ToolRegistry 的固定顺序是：
 
 权限使用显式矩阵，新增级别必须默认拒绝。项目配置、提示词和模型输出都不能提升 CLI 选择的权限。
 
-副作用分为 `none`、`workspace_write`、`process_execution` 和 `network_access`。默认 Gate 为拒绝；CLI 依据 `ask`、`never`、`always` 装配实现。`ask` 的交互选择包括 `once`、`session` 和 `always`：单次规则不缓存；会话规则以会话 UUID、工具名和副作用类型为键；永久规则以工具名和副作用类型为键，原子写入用户级 `approval-rules.json`。待审批输入先脱敏再展示，作用域随 `ApprovalRecord` 保存到会话；旧记录缺少作用域时按 `once` 读取。
+副作用分为 `none`、`workspace_write`、`process_execution` 和 `network_access`。默认 Gate 为拒绝；CLI 依据 `ask`、`never`、`always` 装配实现。`ask` 的交互选择包括 `once`、`session` 和 `always`：单次规则不缓存；会话规则以会话 UUID、工具名和副作用类型为键；永久规则以工具名和副作用类型为键，原子写入用户级 `approval-rules.json`。待审批输入先统一脱敏，再由工具专用摘要器展示关键目标；Web 搜索只展示查询词，网页抓取只展示 URL，补丁只展示规模，避免把完整 JSON 或大段补丁铺满终端。作用域随 `ApprovalRecord` 保存到会话；旧记录缺少作用域时按 `once` 读取。
 
 `xdudu approval list/revoke/clear` 用于管理永久规则。`never` 始终拒绝，显式全局 `--approval always` 仍表示调用方批准全部当前运行操作，不依赖细粒度规则。
 

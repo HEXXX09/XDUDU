@@ -94,8 +94,74 @@ pub(crate) fn model_display_name(provider: &str, model: &str) -> String {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ModelOption {
+    pub(crate) id: String,
+    pub(crate) label: String,
+    pub(crate) description: String,
+}
+
+/// 返回当前 Provider 在 XDUDU 中经过兼容性验证的模型，而不是展示任意字符串。
+pub(crate) fn model_options(provider: &str, current: &str) -> Vec<ModelOption> {
+    if provider.eq_ignore_ascii_case("deepseek") {
+        return vec![
+            ModelOption {
+                id: "deepseek-v4-flash".into(),
+                label: "DeepSeek-V4-Flash".into(),
+                description: "快速 · 日常编码与工具任务".into(),
+            },
+            ModelOption {
+                id: "deepseek-v4-pro".into(),
+                label: "DeepSeek-V4-Pro".into(),
+                description: "能力优先 · 复杂编码与分析".into(),
+            },
+        ];
+    }
+
+    vec![ModelOption {
+        id: current.to_owned(),
+        label: model_display_name(provider, current),
+        description: "当前 Provider 配置".into(),
+    }]
+}
+
+pub(crate) fn model_matches(option: &str, current: &str) -> bool {
+    option == current
+        || (option == "deepseek-v4-flash"
+            && matches!(current, "deepseek-chat" | "deepseek-reasoner"))
+}
+
 pub(crate) fn prompt(theme: TerminalTheme) -> String {
     format!("{} ", theme.accent("❯"))
+}
+
+pub(crate) fn tool_display_name(name: &str) -> &str {
+    match name {
+        "web_search" => "联网搜索",
+        "web_fetch" => "读取网页",
+        "search_text" => "搜索代码",
+        "file_read" => "读取文件",
+        "file_write" => "写入文件",
+        "apply_patch" => "应用补丁",
+        "git_status" => "Git 状态",
+        "git_diff" => "Git 差异",
+        "terminal_exec" => "运行命令",
+        _ => name,
+    }
+}
+
+pub(crate) fn tool_phase_display(phase: &str) -> &str {
+    match phase {
+        "resolving" => "解析地址",
+        "connecting" => "建立连接",
+        "downloading" | "reading" => "读取内容",
+        "searching" => "搜索中",
+        "parsing" => "整理结果",
+        "scanning" => "扫描文件",
+        "preflight" => "检查变更",
+        "applying" | "committing" => "提交变更",
+        _ => phase,
+    }
 }
 
 pub(crate) fn help(theme: TerminalTheme) -> String {
@@ -117,8 +183,8 @@ pub(crate) fn help(theme: TerminalTheme) -> String {
         "开始新会话",
         command("/resume [ID]"),
         "浏览或恢复历史会话",
-        command("/model NAME"),
-        "切换当前模型",
+        command("/model [NAME]"),
+        "选择或切换当前模型",
         command("/turns N"),
         "设置最大 Agent 循环次数",
         command("/exit"),
@@ -146,5 +212,21 @@ mod tests {
             model_display_name("deepseek", "deepseek-v4-pro"),
             "DeepSeek-V4-Pro"
         );
+    }
+
+    #[test]
+    fn 工具与阶段使用面向用户的名称() {
+        assert_eq!(tool_display_name("web_search"), "联网搜索");
+        assert_eq!(tool_phase_display("parsing"), "整理结果");
+        assert_eq!(tool_display_name("custom_tool"), "custom_tool");
+    }
+
+    #[test]
+    fn deepseek_只列出当前官方_v4_模型() {
+        let options = model_options("DeepSeek", "deepseek-chat");
+        assert_eq!(options.len(), 2);
+        assert_eq!(options[0].id, "deepseek-v4-flash");
+        assert_eq!(options[1].id, "deepseek-v4-pro");
+        assert!(model_matches(&options[0].id, "deepseek-chat"));
     }
 }

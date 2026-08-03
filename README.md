@@ -15,7 +15,7 @@ XDUDU 是一个使用 Rust 实现的终端 AI 编程助手。它把自然语言�
 - 工作区路径隔离、符号链接逃逸防御和无 shell 命令执行；
 - CLI、环境变量、项目文件、用户文件和默认值组成的分层配置；
 - 环境变量或操作系统凭据库保存 API Key，普通配置文件拒绝明文密钥；
-- Hermes 风格的全屏交互 TUI：对话时间线、实时工具活动、状态栏和无边框 Composer；
+- Claude 风格的经典滚动终端作为默认界面，并保留 Hermes 风格全屏 TUI：终端 Markdown、实时工具活动、上下文内审批和 Composer；
 - 统一 Agent 事件、终端流式渲染、JSON Lines 和无颜色输出；
 - Provider 指数退避、抖动、`Retry-After`、请求节流和取消；
 - `auth`、`config`、`doctor` 命令；
@@ -84,10 +84,10 @@ Anthropic 对应 `anthropic` 和 `ANTHROPIC_API_KEY`：
 ./target/release/xdudu run --provider deepseek "运行测试并解释失败原因"
 ```
 
-交互 TTY 默认进入全屏界面；重定向输入、`TERM=dumb` 或不支持 TUI 的环境自动使用普通行式界面。
+真实交互终端中自动启用带 XDUDU 图标、状态栏、消息时间线和固定输入区的完整界面。管道、重定向、CI 和 `TERM=dumb` 会自动降级为无光标控制的顺序文本，用户无需选择渲染模式。
 输入支持左右移动、Home/End、Ctrl+A/E、Ctrl+U/K/W、上下浏览本会话历史、
 Ctrl+C 清空当前输入和空行 Ctrl+D 退出。历史仅保存在当前进程内，不会把输入写入额外的历史文件。
-交互命令包括 `/help`、`/new`、`/resume`、`/plan <目标>`、`/model <name>`、`/turns <n>` 和 `/exit`。
+交互命令包括 `/help`、`/new`、`/resume`、`/plan <目标>`、`/model [name]`、`/transcript`、`/copy`、`/export`、`/rename`、`/turns <n>` 和 `/exit`。交互界面支持运行中输入并排队、Shift+Enter/Ctrl+J 多行输入、Ctrl+R 历史检索、`/` 命令候选和 `@` 工作区文件候选。DeepSeek 当前提供 `deepseek-v4-flash` 和 `deepseek-v4-pro`。
 
 ## 安装为全局命令
 
@@ -131,7 +131,17 @@ xdudu config set agent.max_turns 30 --project
 xdudu config set agent.approval ask --user
 ```
 
-可配置项包括 `provider.name`、`provider.model`、`provider.base_url`、`provider.timeout_seconds`、`provider.max_attempts`、`provider.retry_base_ms`、`provider.min_request_interval_ms`、`agent.max_turns`、`agent.permission`、`agent.approval`、`output.json`、`output.no_stream` 和 `output.color`。
+可配置项包括 `provider.name`、`provider.model`、`provider.base_url`、`provider.timeout_seconds`、`provider.max_attempts`、`provider.retry_base_ms`、`provider.min_request_interval_ms`、`agent.max_turns`、`agent.permission`、`agent.approval`、`output.json`、`output.no_stream`、`output.color` 和 `output.debug_trace`。
+
+XDUDU 不展示 Provider 的原始思维链或隐藏推理字段。默认界面只展示必要的计划、工具调用、进度、实际结果和完成证据。需要排查运行时状态时可以临时启用高级轨迹：
+
+```bash
+xdudu --debug-trace
+xdudu --json --debug-trace "检查当前项目"
+xdudu config set --user output.debug_trace true
+```
+
+调试轨迹是运行时生成的结构化元数据，只包含状态、轮次、工具名称、成功状态、耗时、错误码、Token 数和证据索引等；不包含模型思维链、助手正文、工具输入、工具输出或证据正文，并继续经过统一敏感信息脱敏。
 
 API Key 不属于普通配置。项目或用户 TOML 中出现 key、token、secret 等秘密字段时，加载器会拒绝该配置。
 
@@ -229,7 +239,9 @@ Provider 发生连接失败、超时、HTTP 408、409、429 或 5xx 时，可以
 
 `full-access` 仍不会启用 shell 字符串拼接，但允许模型调用 PATH 中的任意程序，只应在任务和仓库可信时使用。
 
-默认审批模式为 `ask`。交互终端会在文件写入、命令执行或网络访问前展示已脱敏参数，并提供 `Allow once`、`Allow this session`、`Allow always` 和拒绝四种选择。菜单使用 `↑/↓` 移动、`Enter` 确认，默认选中拒绝，`Esc` 或 `Ctrl-C` 也会安全拒绝。作用域按“工具名 + 副作用类型”匹配，批准 `web_fetch` 不会放行 `terminal_exec`。
+默认审批模式为 `ask`。交互终端会在文件写入、命令执行或网络访问前用一行展示已脱敏的关键操作摘要，并提供仅本次、本会话、永久允许和拒绝四种选择。菜单使用 `↑/↓` 移动、`Enter` 确认，默认选中拒绝，`Esc` 或 `Ctrl-C` 也会安全拒绝。作用域按“工具名 + 副作用类型”匹配，批准 `web_fetch` 不会放行 `terminal_exec`。
+
+交互界面不会截断可见历史，也不会捕获鼠标；可直接使用终端滚轮、搜索和复制。Web Search 等已完成工具会压缩成一行摘要写入历史。
 
 `Allow always` 保存到用户配置目录的 `approval-rules.json`，不会写入项目仓库。管道输入、一次性命令和 JSON 模式无法安全询问：没有匹配永久规则时默认拒绝；有匹配规则时可以执行。永久规则可随时查看或撤销：
 

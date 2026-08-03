@@ -1,14 +1,17 @@
 //! XDUDU Rust 命令行入口。
 
 mod approval_prompt;
+mod classic_tui;
 mod doctor;
 mod input_editor;
+mod markdown;
 mod renderer;
 mod tui;
 mod ui;
 
+use std::io::Write as _;
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, VecDeque},
     env,
     io::{self, IsTerminal},
     path::PathBuf,
@@ -29,12 +32,12 @@ use xdudu_core::{
     PlanGenerationConfig, PlanRevisionConfig, PlanStatus, PlanStore, Provider, ProviderFactory,
     ResolvedConfig, SecretSource, SecretStore, SecretString, Session, SessionStatus, SessionStore,
     SqliteSessionStore, ToolRegistry, WorkspaceLock, XduduError, approval_rules_path, approve_plan,
-    config_paths, generate_plan, load_config, redact_text, redact_value, register_builtins,
-    reject_plan, resolve_secret, revise_plan, run_agent, run_plan, submit_plan_for_review,
-    write_config_value,
+    config_paths, generate_plan, load_config, redact_text, register_builtins, reject_plan,
+    resolve_secret, revise_plan, run_agent, run_plan, submit_plan_for_review, write_config_value,
 };
 
-use crate::approval_prompt::{ApprovalMenuChoice, read_approval_menu};
+use crate::approval_prompt::{ApprovalMenuChoice, format_approval_prompt, read_approval_menu};
+use crate::classic_tui::{ApprovalBroker, ChannelEventSink, drive_turn};
 use crate::doctor::run_doctor;
 use crate::input_editor::{InputEditor, ReadResult};
 use crate::renderer::ConsoleRenderer;
@@ -95,6 +98,10 @@ struct Cli {
     /// 禁用颜色。
     #[arg(long, global = true)]
     no_color: bool,
+
+    /// 输出不含模型思维链、且经过脱敏的结构化运行时调试轨迹。
+    #[arg(long, global = true)]
+    debug_trace: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -253,6 +260,8 @@ struct Runtime {
     renderer: ConsoleRenderer,
     stream: bool,
     color: bool,
+    debug_trace: bool,
+    approval_broker: Option<Arc<ApprovalBroker>>,
 }
 
 fn overrides(cli: &Cli) -> ConfigOverrides {
@@ -266,6 +275,8 @@ fn overrides(cli: &Cli) -> ConfigOverrides {
         json: cli.json.then_some(true),
         no_stream: cli.no_stream.then_some(true),
         color: cli.no_color.then_some(false),
+        debug_trace: cli.debug_trace.then_some(true),
+        render_mode: None,
     }
 }
 
@@ -285,6 +296,7 @@ struct ConsoleApprovalGate {
     theme: TerminalTheme,
     session_rules: tokio::sync::Mutex<BTreeSet<(Uuid, ApprovalRule)>>,
     persistent_rules: JsonApprovalRuleStore,
+    broker: Option<Arc<ApprovalBroker>>,
 }
 
 impl ConsoleApprovalGate {
@@ -293,6 +305,7 @@ impl ConsoleApprovalGate {
         persistent_rules: JsonApprovalRuleStore,
         theme: TerminalTheme,
         fullscreen: bool,
+        broker: Option<Arc<ApprovalBroker>>,
     ) -> Self {
         Self {
             can_prompt,
@@ -300,6 +313,7 @@ impl ConsoleApprovalGate {
             theme,
             session_rules: tokio::sync::Mutex::new(BTreeSet::new()),
             persistent_rules,
+            broker,
         }
     }
 }
@@ -328,37 +342,29 @@ impl ApprovalGate for ConsoleApprovalGate {
         if !self.can_prompt {
             return ApprovalDecision::deny("当前运行方式无法交互审批，且没有匹配的永久审批规则。");
         }
-        let input = serde_json::to_string_pretty(&redact_value(&request.input))
-            .unwrap_or_else(|_| "<无法显示输入>".into());
-        let theme = self.theme;
-        let fullscreen = self.fullscreen;
-        let input = input
-            .lines()
-            .map(|line| format!("  {} {line}", theme.muted("│")))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let prompt = format!(
-            "\n  {} {}\n\
-             \x20 {} 工具  {}\n\
-             \x20 {} 风险  {}\n\
-             {input}\n\
-             \x20 {} {}\n",
-            theme.warning("◆"),
-            theme.strong("需要你的批准"),
-            theme.muted("│"),
-            request.tool_name,
-            theme.muted("│"),
-            request.side_effect.as_str(),
-            theme.muted("╰"),
-            theme.muted("↑/↓ 或 j/k 选择 · Enter 确认 · Esc 拒绝"),
-        );
-        match tokio::task::spawn_blocking(move || read_approval_menu(theme, &prompt, fullscreen))
+        let mut choice = if let Some(broker) = &self.broker {
+            broker.request(request.clone()).await
+        } else {
+            None
+        };
+        if choice.is_none() {
+            let theme = self.theme;
+            let fullscreen = self.fullscreen;
+            let prompt = format_approval_prompt(theme, request);
+            choice = match tokio::task::spawn_blocking(move || {
+                read_approval_menu(theme, &prompt, fullscreen)
+            })
             .await
-        {
-            Ok(Ok(ApprovalMenuChoice::Once)) => {
+            {
+                Ok(Ok(choice)) => Some(choice),
+                _ => None,
+            };
+        }
+        match choice {
+            Some(ApprovalMenuChoice::Once) => {
                 ApprovalDecision::approve_with_scope("用户批准当前工具调用。", ApprovalScope::Once)
             }
-            Ok(Ok(ApprovalMenuChoice::Session)) => {
+            Some(ApprovalMenuChoice::Session) => {
                 self.session_rules
                     .lock()
                     .await
@@ -368,7 +374,7 @@ impl ApprovalGate for ConsoleApprovalGate {
                     ApprovalScope::Session,
                 )
             }
-            Ok(Ok(ApprovalMenuChoice::Always)) => match self.persistent_rules.allow(rule).await {
+            Some(ApprovalMenuChoice::Always) => match self.persistent_rules.allow(rule).await {
                 Ok(()) => ApprovalDecision::approve_with_scope(
                     "用户永久批准同类工具调用。",
                     ApprovalScope::Always,
@@ -378,9 +384,8 @@ impl ApprovalGate for ConsoleApprovalGate {
                     error.message
                 )),
             },
-            Ok(Ok(ApprovalMenuChoice::Deny)) => ApprovalDecision::deny("用户拒绝或未明确批准。"),
-            Ok(Err(error)) => ApprovalDecision::deny(format!("读取审批输入失败：{error}")),
-            Err(error) => ApprovalDecision::deny(format!("审批任务失败：{error}")),
+            Some(ApprovalMenuChoice::Deny) => ApprovalDecision::deny("用户拒绝或未明确批准。"),
+            None => ApprovalDecision::deny("审批界面已关闭或无法读取审批输入。"),
         }
     }
 }
@@ -398,10 +403,11 @@ async fn create_runtime(
     let approval_mode = resolved.config.agent.approval_mode()?;
     let color = resolved.config.output.color && io::stdout().is_terminal();
     let theme = TerminalTheme::new(color);
-    let fullscreen = interactive
+    let rich_terminal = interactive
         && io::stdin().is_terminal()
         && io::stdout().is_terminal()
         && env::var("TERM").is_ok_and(|term| term != "dumb");
+    let approval_broker = None;
     let approval_gate: Arc<dyn ApprovalGate> = match approval_mode {
         ApprovalMode::Always => Arc::new(AllowAllApprovalGate),
         ApprovalMode::Never => Arc::new(DenyAllApprovalGate),
@@ -409,7 +415,8 @@ async fn create_runtime(
             interactive && !resolved.config.output.json,
             JsonApprovalRuleStore::open(approval_rules_path()?).await?,
             theme,
-            fullscreen,
+            rich_terminal,
+            approval_broker.clone(),
         )),
     };
     let mut registry = ToolRegistry::with_runtime(approval_gate, change_ledger);
@@ -428,9 +435,12 @@ async fn create_runtime(
             resolved.config.output.json,
             !resolved.config.output.no_stream,
             color,
+            resolved.config.output.debug_trace,
         ),
         stream: !resolved.config.output.no_stream,
         color,
+        debug_trace: resolved.config.output.debug_trace,
+        approval_broker,
     })
 }
 
@@ -451,20 +461,13 @@ async fn execute_prompt_with_sink(
     print_interrupt: bool,
 ) -> Result<AgentRunResult, XduduError> {
     let cancellation = CancellationToken::new();
-    let run = run_agent(AgentRunConfig {
+    let run = execute_prompt_with_cancellation(
+        runtime,
         prompt,
-        model: runtime.model.clone(),
-        max_turns: runtime.max_turns,
-        cwd: runtime.cwd.clone(),
-        provider: runtime.provider.as_ref(),
-        tool_registry: &runtime.registry,
-        session_store: &runtime.store,
-        permission_mode: runtime.permission_mode,
-        cancellation: cancellation.clone(),
         session_id,
-        event_sink: Some(event_sink),
-        stream: runtime.stream,
-    });
+        event_sink,
+        cancellation.clone(),
+    );
     tokio::pin!(run);
     tokio::select! {
         result = &mut run => result,
@@ -478,6 +481,47 @@ async fn execute_prompt_with_sink(
             run.await
         }
     }
+}
+
+async fn execute_prompt_with_cancellation(
+    runtime: &Runtime,
+    prompt: String,
+    session_id: Option<Uuid>,
+    event_sink: &dyn EventSink,
+    cancellation: CancellationToken,
+) -> Result<AgentRunResult, XduduError> {
+    run_agent(AgentRunConfig {
+        prompt,
+        model: runtime.model.clone(),
+        max_turns: runtime.max_turns,
+        cwd: runtime.cwd.clone(),
+        provider: runtime.provider.as_ref(),
+        tool_registry: &runtime.registry,
+        session_store: &runtime.store,
+        permission_mode: runtime.permission_mode,
+        cancellation,
+        session_id,
+        event_sink: Some(event_sink),
+        stream: runtime.stream,
+    })
+    .await
+}
+
+async fn execute_classic_prompt(
+    runtime: &Runtime,
+    prompt: String,
+    session_id: Option<Uuid>,
+) -> Result<classic_tui::ClassicTurnOutcome, XduduError> {
+    let cancellation = CancellationToken::new();
+    let (sink, events) = ChannelEventSink::channel();
+    let approvals = if let Some(broker) = &runtime.approval_broker {
+        broker.attach()
+    } else {
+        ApprovalBroker::default().attach()
+    };
+    let run =
+        execute_prompt_with_cancellation(runtime, prompt, session_id, &sink, cancellation.clone());
+    drive_turn(run, events, approvals, cancellation, runtime.color).await
 }
 
 fn print_banner(runtime: &Runtime, interactive: bool) {
@@ -499,14 +543,17 @@ async fn interactive_loop(
     initial_prompt: Option<String>,
     initial_session: Option<Uuid>,
 ) -> Result<u8, XduduError> {
-    let tui_supported = io::stdin().is_terminal()
-        && io::stdout().is_terminal()
-        && env::var("TERM").is_ok_and(|term| term != "dumb");
-    if tui_supported {
+    if interactive_terminal() {
         tui_interactive_loop(runtime, initial_prompt, initial_session).await
     } else {
         plain_interactive_loop(runtime, initial_prompt, initial_session).await
     }
+}
+
+fn interactive_terminal() -> bool {
+    io::stdin().is_terminal()
+        && io::stdout().is_terminal()
+        && env::var("TERM").is_ok_and(|term| term != "dumb")
 }
 
 async fn tui_interactive_loop(
@@ -529,6 +576,7 @@ async fn tui_interactive_loop(
         available_tools,
         skills: Vec::new(),
         color: runtime.color,
+        debug_trace: runtime.debug_trace,
     };
     let (app, _screen) = TuiApp::enter(context).map_err(XduduError::from)?;
     let renderer = app.renderer();
@@ -572,13 +620,35 @@ async fn tui_interactive_loop(
                     "/exit" | "/quit" | "/q" => break,
                     "/help" | "/h" => {
                         app.notice(
-                            "/new  新会话  ·  /resume  恢复会话  ·  /plan  生成/审阅计划  ·  /model NAME  切换模型  ·  /turns N  最大循环次数  ·  /exit  退出",
+                            "/new  新会话  ·  /resume  恢复会话  ·  /plan  生成/审阅计划  ·  /model  选择模型  ·  /turns N  最大循环次数  ·  /exit  退出",
                         )
                         .map_err(XduduError::from)?;
                     }
                     "/new" => {
                         session_id = None;
                         app.notice("已开始新会话。").map_err(XduduError::from)?;
+                    }
+                    "/model" => {
+                        if let Some(model) = app.select_model().map_err(XduduError::from)? {
+                            runtime.model = model;
+                            let saved = write_config_value(
+                                &runtime.cwd,
+                                true,
+                                "provider.model",
+                                &runtime.model,
+                            );
+                            app.set_model(&runtime.model).map_err(XduduError::from)?;
+                            app.notice(format!(
+                                "已切换到 {}{}",
+                                ui::model_display_name(&runtime.provider_display, &runtime.model),
+                                if saved.is_ok() {
+                                    "，并保存为默认模型。"
+                                } else {
+                                    "（仅当前会话，默认配置保存失败）。"
+                                }
+                            ))
+                            .map_err(XduduError::from)?;
+                        }
                     }
                     "/resume" => {
                         let sessions = runtime.store.list(20).await?;
@@ -747,7 +817,19 @@ async fn tui_interactive_loop(
                             .filter(|value| !value.is_empty())
                         {
                             runtime.model = model.to_owned();
+                            let saved = write_config_value(
+                                &runtime.cwd,
+                                true,
+                                "provider.model",
+                                &runtime.model,
+                            );
                             app.set_model(&runtime.model).map_err(XduduError::from)?;
+                            app.notice(if saved.is_ok() {
+                                format!("已切换到 {}，并保存为默认模型。", runtime.model)
+                            } else {
+                                format!("已切换到 {}，但默认配置保存失败。", runtime.model)
+                            })
+                            .map_err(XduduError::from)?;
                         } else if let Some(turns) = input.strip_prefix("/turns ") {
                             match turns.trim().parse::<u32>() {
                                 Ok(value) if (1..=100).contains(&value) => {
@@ -1122,6 +1204,118 @@ async fn review_plan_in_tui(
     }
 }
 
+async fn review_plan_classic(
+    runtime: &Runtime,
+    editor: &mut InputEditor,
+    mut plan: Plan,
+) -> Result<(), XduduError> {
+    loop {
+        println!("\n{}", plan_summary(&plan));
+        for (index, step) in plan.steps.iter().enumerate() {
+            println!("  {}. {}", index + 1, step.title);
+            if !step.dependencies.is_empty() {
+                println!("     依赖 {} 个步骤", step.dependencies.len());
+            }
+            for criterion in &step.completion_criteria {
+                println!("     ✓ {criterion}");
+            }
+        }
+        println!("\n  1 批准计划  ·  2 请求修改  ·  0 拒绝（默认）");
+        let choice = match editor.read_line("  选择：").map_err(XduduError::from)? {
+            ReadResult::Line(value) => value,
+            _ => return Ok(()),
+        };
+        match choice.trim() {
+            "1" => {
+                let approved = approve_plan(
+                    &runtime.store,
+                    plan.id,
+                    plan.revision,
+                    "用户在经典终端审阅界面批准计划。",
+                )
+                .await?;
+                sync_plan_session(
+                    runtime,
+                    approved.session_id,
+                    SessionStatus::PlanReady,
+                    AgentLoopState::Completed,
+                )
+                .await?;
+                println!("  计划已批准。输入 /plan run 开始执行；工具副作用仍会单独审批。");
+                return Ok(());
+            }
+            "2" => {
+                let request = match editor.read_line("  修改要求：").map_err(XduduError::from)?
+                {
+                    ReadResult::Line(value) if !value.trim().is_empty() => value,
+                    _ => continue,
+                };
+                let session = session_for_resume(runtime, plan.session_id).await?;
+                sync_plan_session(
+                    runtime,
+                    plan.session_id,
+                    SessionStatus::Running,
+                    AgentLoopState::Planning,
+                )
+                .await?;
+                let result = revise_plan(PlanRevisionConfig {
+                    plan_id: plan.id,
+                    expected_revision: plan.revision,
+                    change_request: request,
+                    context: plan_context(&session),
+                    model: runtime.model.clone(),
+                    cwd: runtime.cwd.clone(),
+                    provider: runtime.provider.as_ref(),
+                    plan_store: &runtime.store,
+                    cancellation: CancellationToken::new(),
+                })
+                .await;
+                match result {
+                    Ok(result) => {
+                        plan = result.plan;
+                        sync_plan_session(
+                            runtime,
+                            plan.session_id,
+                            SessionStatus::WaitingApproval,
+                            AgentLoopState::WaitingApproval,
+                        )
+                        .await?;
+                        println!("  计划已修订为 revision {}。", plan.revision);
+                    }
+                    Err(error) => {
+                        sync_plan_session(
+                            runtime,
+                            plan.session_id,
+                            SessionStatus::WaitingApproval,
+                            AgentLoopState::WaitingApproval,
+                        )
+                        .await?;
+                        println!("  修订失败，原计划保持不变：{}", error.message);
+                    }
+                }
+            }
+            _ => {
+                let rejected = reject_plan(
+                    &runtime.store,
+                    plan.id,
+                    plan.revision,
+                    "用户在经典终端审阅界面拒绝计划。",
+                )
+                .await?;
+                sync_plan_session(
+                    runtime,
+                    rejected.session_id,
+                    SessionStatus::Incomplete,
+                    AgentLoopState::Incomplete,
+                )
+                .await?;
+                println!("  计划已拒绝，未执行任何步骤。");
+                return Ok(());
+            }
+        }
+    }
+}
+
 async fn recover_plan_in_tui(
     runtime: &Runtime,
     app: &TuiApp,
@@ -1270,11 +1464,34 @@ async fn plain_interactive_loop(
     initial_session: Option<Uuid>,
 ) -> Result<u8, XduduError> {
     let mut session_id = initial_session;
-    let mut editor = InputEditor::default();
+    let mut editor = InputEditor::with_workspace(&runtime.cwd);
+    println!(
+        "{}",
+        ui::compact_banner(
+            TerminalTheme::new(runtime.color),
+            env!("CARGO_PKG_VERSION"),
+            &runtime.provider_display,
+            &runtime.model,
+        )
+    );
+    println!(
+        "  {} · {} · 输入 /help 查看命令",
+        runtime.permission_mode.as_str(),
+        runtime.cwd.display()
+    );
     if let Some(prompt) = initial_prompt {
-        let result = execute_prompt(&runtime, prompt, session_id).await?;
-        runtime.renderer.finish_run(&result)?;
-        session_id = Some(result.session_id);
+        let mut pending = VecDeque::from([prompt]);
+        while let Some(prompt) = pending.pop_front() {
+            if interactive_terminal() {
+                let outcome = execute_classic_prompt(&runtime, prompt, session_id).await?;
+                session_id = Some(outcome.result.session_id);
+                pending.extend(outcome.queued);
+            } else {
+                let result = execute_prompt(&runtime, prompt, session_id).await?;
+                runtime.renderer.finish_run(&result)?;
+                session_id = Some(result.session_id);
+            }
+        }
     }
 
     loop {
@@ -1307,23 +1524,168 @@ async fn plain_interactive_loop(
                 print!("{}", ui::help(TerminalTheme::new(runtime.color)));
                 continue;
             }
-            "/new" => {
+            "/new" | "/clear" => {
                 session_id = None;
                 println!("  已开始新会话。");
                 continue;
             }
+            "/transcript" => {
+                if let Some(id) = session_id {
+                    let session = session_for_resume(&runtime, id).await?;
+                    println!("\n  会话：{} · {}", session.title, session.id);
+                    for message in &session.messages {
+                        if message.content.trim().is_empty() {
+                            continue;
+                        }
+                        let role = match message.role {
+                            xdudu_core::provider::MessageRole::User => "❯",
+                            xdudu_core::provider::MessageRole::Assistant => "┊",
+                            xdudu_core::provider::MessageRole::Tool => "⏺",
+                            xdudu_core::provider::MessageRole::System => "·",
+                        };
+                        println!("\n  {role} {}", redact_text(&message.content));
+                    }
+                } else {
+                    println!("  当前没有活动会话。");
+                }
+                continue;
+            }
+            "/copy" => {
+                if let Some(id) = session_id {
+                    let session = session_for_resume(&runtime, id).await?;
+                    if let Some(message) = session.messages.iter().rev().find(|message| {
+                        message.role == xdudu_core::provider::MessageRole::Assistant
+                            && !message.content.trim().is_empty()
+                    }) {
+                        match copy_text(&redact_text(&message.content)) {
+                            Ok(()) => println!("  已复制最后一条助手回答。"),
+                            Err(error) => println!("  无法访问系统剪贴板：{error}"),
+                        }
+                    }
+                }
+                continue;
+            }
+            "/export" => {
+                if let Some(id) = session_id {
+                    let session = session_for_resume(&runtime, id).await?;
+                    let path = export_session_markdown(&runtime.cwd, &session)?;
+                    println!("  会话已导出：{}", path.display());
+                } else {
+                    println!("  当前没有活动会话。");
+                }
+                continue;
+            }
+            "/compact" => {
+                println!("  XDUDU 会在上下文接近上限时自动压缩；手动压缩协议尚未开放。");
+                continue;
+            }
+            "/model" => {
+                let options = ui::model_options(&runtime.provider_display, &runtime.model);
+                println!("  当前 Provider 可用模型：");
+                for (index, option) in options.iter().enumerate() {
+                    let current = if ui::model_matches(&option.id, &runtime.model) {
+                        "（当前）"
+                    } else {
+                        ""
+                    };
+                    println!(
+                        "    {}. {} {}  {}",
+                        index + 1,
+                        option.label,
+                        current,
+                        option.description
+                    );
+                }
+                let selection = match editor
+                    .read_line("  选择（Enter 保持当前）：")
+                    .map_err(XduduError::from)?
+                {
+                    ReadResult::Line(value) => value,
+                    _ => continue,
+                };
+                if let Some(option) = selection
+                    .trim()
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|index| options.get(index.saturating_sub(1)))
+                {
+                    runtime.model.clone_from(&option.id);
+                    let saved =
+                        write_config_value(&runtime.cwd, true, "provider.model", &runtime.model);
+                    println!(
+                        "  已切换到 {}{}",
+                        option.label,
+                        if saved.is_ok() {
+                            "，并保存为默认模型。"
+                        } else {
+                            "（仅当前会话）。"
+                        }
+                    );
+                }
+                continue;
+            }
             "/resume" => {
-                println!("  当前终端不支持会话选择器，请使用 /resume <会话UUID>。");
+                let sessions = runtime.store.list(30).await?;
+                if sessions.is_empty() {
+                    println!("  当前工作区还没有历史会话。");
+                    continue;
+                }
+                println!("  最近会话（输入编号、标题关键词或完整 UUID）：");
+                for (index, session) in sessions.iter().enumerate() {
+                    println!(
+                        "  {:>2}. {} · {} · {:?} · {} 条消息",
+                        index + 1,
+                        session.updated_at.format("%m-%d %H:%M"),
+                        session.title,
+                        session.status,
+                        session.messages.len()
+                    );
+                }
+                let selection = match editor.read_line("  选择：").map_err(XduduError::from)? {
+                    ReadResult::Line(value) => value,
+                    _ => continue,
+                };
+                let selected = selection
+                    .trim()
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|index| sessions.get(index.saturating_sub(1)))
+                    .or_else(|| {
+                        Uuid::parse_str(selection.trim())
+                            .ok()
+                            .and_then(|id| sessions.iter().find(|session| session.id == id))
+                    })
+                    .or_else(|| {
+                        let query = selection.trim().to_ascii_lowercase();
+                        sessions
+                            .iter()
+                            .find(|session| session.title.to_ascii_lowercase().contains(&query))
+                    });
+                if let Some(selected) = selected {
+                    let session = session_for_resume(&runtime, selected.id).await?;
+                    session_id = Some(session.id);
+                    println!("  已恢复会话：{}", session.title);
+                    for message in session.messages.iter().rev().take(6).rev() {
+                        if !message.content.trim().is_empty() {
+                            let role = match message.role {
+                                xdudu_core::provider::MessageRole::User => "❯",
+                                xdudu_core::provider::MessageRole::Assistant => "┊",
+                                _ => "·",
+                            };
+                            println!("  {role} {}", redact_text(&message.content));
+                        }
+                    }
+                    if let Some(plan) = pending_plan_for_session(&runtime, session_id).await? {
+                        review_plan_classic(&runtime, &mut editor, plan).await?;
+                    }
+                } else {
+                    println!("  没有找到匹配会话。");
+                }
                 continue;
             }
             "/plan" => {
-                if pending_plan_for_session(&runtime, session_id)
-                    .await?
-                    .is_some()
-                {
-                    println!(
-                        "  当前终端不支持交互式计划审阅；计划继续保持等待审批，请在 TTY 中恢复会话。"
-                    );
+                if let Some(plan) = pending_plan_for_session(&runtime, session_id).await? {
+                    review_plan_classic(&runtime, &mut editor, plan).await?;
                 } else {
                     if let Some(plan) = paused_plan_for_session(&runtime, session_id).await? {
                         println!("{}", plan_summary(&plan));
@@ -1411,6 +1773,22 @@ async fn plain_interactive_loop(
             }
             _ => {}
         }
+        if let Some(title) = input
+            .strip_prefix("/rename ")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let Some(id) = session_id else {
+                println!("  当前没有活动会话。");
+                continue;
+            };
+            let mut session = session_for_resume(&runtime, id).await?;
+            session.title = redact_text(&title.chars().take(120).collect::<String>());
+            session.touch();
+            runtime.store.update(&session).await?;
+            println!("  会话已重命名：{}", session.title);
+            continue;
+        }
         if let Some(raw_id) = input
             .strip_prefix("/resume ")
             .map(str::trim)
@@ -1421,11 +1799,8 @@ async fn plain_interactive_loop(
             let session = session_for_resume(&runtime, id).await?;
             session_id = Some(id);
             println!("  已恢复会话：{}", session.title);
-            if pending_plan_for_session(&runtime, session_id)
-                .await?
-                .is_some()
-            {
-                println!("  此会话有等待审批的计划；当前终端不支持交互式审阅，计划状态保持不变。");
+            if let Some(plan) = pending_plan_for_session(&runtime, session_id).await? {
+                review_plan_classic(&runtime, &mut editor, plan).await?;
             } else if paused_plan_for_session(&runtime, session_id)
                 .await?
                 .is_some()
@@ -1443,10 +1818,14 @@ async fn plain_interactive_loop(
             let (session, plan) =
                 create_plan_for_review(&runtime, goal.to_owned(), session_id).await?;
             session_id = Some(session.id);
-            println!(
-                "  计划 revision {} 已生成并等待审批。当前终端不支持交互式审阅，请在 TTY 中运行 XDUDU 并使用 /resume {}。",
-                plan.revision, session.id
-            );
+            if io::stdin().is_terminal() {
+                review_plan_classic(&runtime, &mut editor, plan).await?;
+            } else {
+                println!(
+                    "  计划 revision {} 已生成并等待审批。会话：{}",
+                    plan.revision, session.id
+                );
+            }
             continue;
         }
         if let Some(model) = input
@@ -1455,7 +1834,16 @@ async fn plain_interactive_loop(
             .filter(|value| !value.is_empty())
         {
             runtime.model = model.to_owned();
-            println!("  模型已切换：{}", runtime.model);
+            let saved = write_config_value(&runtime.cwd, true, "provider.model", &runtime.model);
+            println!(
+                "  模型已切换：{}{}",
+                runtime.model,
+                if saved.is_ok() {
+                    "（已保存为默认模型）"
+                } else {
+                    "（默认配置保存失败）"
+                }
+            );
             continue;
         }
         if let Some(turns) = input.strip_prefix("/turns ") {
@@ -1468,11 +1856,77 @@ async fn plain_interactive_loop(
             }
             continue;
         }
-        let result = execute_prompt(&runtime, input.to_owned(), session_id).await?;
-        runtime.renderer.finish_run(&result)?;
-        session_id = Some(result.session_id);
+        let mut pending = VecDeque::from([input.to_owned()]);
+        while let Some(prompt) = pending.pop_front() {
+            if interactive_terminal() {
+                let outcome = execute_classic_prompt(&runtime, prompt, session_id).await?;
+                session_id = Some(outcome.result.session_id);
+                pending.extend(outcome.queued);
+            } else {
+                let result = execute_prompt(&runtime, prompt, session_id).await?;
+                runtime.renderer.finish_run(&result)?;
+                session_id = Some(result.session_id);
+            }
+        }
     }
     Ok(0)
+}
+
+fn copy_text(text: &str) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    let mut child = std::process::Command::new("pbcopy")
+        .stdin(std::process::Stdio::piped())
+        .spawn()?;
+    #[cfg(target_os = "windows")]
+    let mut child = std::process::Command::new("clip")
+        .stdin(std::process::Stdio::piped())
+        .spawn()?;
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut child = std::process::Command::new("xclip")
+        .args(["-selection", "clipboard"])
+        .stdin(std::process::Stdio::piped())
+        .spawn()?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin.write_all(text.as_bytes())?;
+    }
+    let status = child.wait()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other("剪贴板命令执行失败"))
+    }
+}
+
+fn export_session_markdown(
+    cwd: &std::path::Path,
+    session: &Session,
+) -> Result<PathBuf, XduduError> {
+    let directory = cwd.join(".xdudu/exports");
+    std::fs::create_dir_all(&directory).map_err(XduduError::from)?;
+    let path = directory.join(format!("{}.md", session.id));
+    let mut output = format!(
+        "# {}\n\n- 会话：{}\n- 更新时间：{}\n\n",
+        redact_text(&session.title),
+        session.id,
+        session.updated_at
+    );
+    for message in &session.messages {
+        if message.content.trim().is_empty() {
+            continue;
+        }
+        let heading = match message.role {
+            xdudu_core::provider::MessageRole::User => "用户",
+            xdudu_core::provider::MessageRole::Assistant => "XDUDU",
+            xdudu_core::provider::MessageRole::Tool => "工具",
+            xdudu_core::provider::MessageRole::System => "系统",
+        };
+        output.push_str(&format!(
+            "## {heading}\n\n{}\n\n",
+            redact_text(&message.content)
+        ));
+    }
+    std::fs::write(&path, output).map_err(XduduError::from)?;
+    Ok(path)
 }
 
 fn print_config(resolved: &ResolvedConfig) -> Result<(), XduduError> {
@@ -1513,6 +1967,7 @@ fn config_value(resolved: &ResolvedConfig, key: &str) -> Option<String> {
         "output.json" => Some(resolved.config.output.json.to_string()),
         "output.no_stream" => Some(resolved.config.output.no_stream.to_string()),
         "output.color" => Some(resolved.config.output.color.to_string()),
+        "output.debug_trace" => Some(resolved.config.output.debug_trace.to_string()),
         _ => None,
     }
 }

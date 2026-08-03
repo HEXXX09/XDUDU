@@ -13,7 +13,10 @@ use std::{
 use async_trait::async_trait;
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
-    event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, read},
+    event::{
+        DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers, MouseEventKind, read,
+    },
     execute, queue,
     style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor},
     terminal::{
@@ -24,13 +27,18 @@ use crossterm::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use xdudu_core::{
     AgentEvent, AgentLoopState, AgentRunResult, EventSink, Plan, Session, provider::MessageRole,
-    redact_text,
+    redact_text, redact_value,
 };
 
-use crate::ui::{model_display_name, supports_true_color};
+use crate::{
+    markdown::{MarkdownLineKind, terminal_markdown},
+    ui::{
+        ModelOption, model_display_name, model_matches, model_options, supports_true_color,
+        tool_display_name, tool_phase_display,
+    },
+};
 
 const CHROME_ROWS: u16 = 5;
-const MAX_TRANSCRIPT_BLOCKS: usize = 200;
 const MAX_COMMAND_SUGGESTIONS: usize = 5;
 const PRIMARY: Color = Color::Rgb {
     r: 252,
@@ -62,6 +70,11 @@ const WARNING: Color = Color::Rgb {
 enum Role {
     User,
     Assistant,
+    AssistantHeading,
+    AssistantCode,
+    AssistantDiffAdd,
+    AssistantDiffRemove,
+    Tool,
     System,
     Warning,
 }
@@ -152,9 +165,9 @@ const SLASH_COMMANDS: [SlashCommand; 13] = [
     },
     SlashCommand {
         name: "/model",
-        usage: "/model <name>",
-        description: "切换当前模型",
-        requires_argument: true,
+        usage: "/model [name]",
+        description: "选择或切换当前模型",
+        requires_argument: false,
     },
     SlashCommand {
         name: "/turns",
@@ -192,11 +205,14 @@ struct TuiState {
     input_active: bool,
     input_interrupted: bool,
     usage: Option<(u64, u64)>,
+    transcript_scroll: usize,
     available_tools: Vec<String>,
     skills: Vec<String>,
     show_intro: bool,
     session_picker: Option<SessionPicker>,
     plan_review: Option<PlanReviewView>,
+    model_picker: Option<ModelPicker>,
+    debug_trace: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -210,6 +226,12 @@ pub(crate) struct SessionChoice {
 #[derive(Debug)]
 struct SessionPicker {
     choices: Vec<SessionChoice>,
+    selected: usize,
+}
+
+#[derive(Debug)]
+struct ModelPicker {
+    choices: Vec<ModelOption>,
     selected: usize,
 }
 
@@ -261,6 +283,7 @@ pub(crate) struct TuiContext {
     pub(crate) available_tools: Vec<String>,
     pub(crate) skills: Vec<String>,
     pub(crate) color: bool,
+    pub(crate) debug_trace: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -280,6 +303,7 @@ impl ScreenGuard {
             ResetColor,
             SetAttribute(Attribute::Reset),
             EnterAlternateScreen,
+            EnableMouseCapture,
             ResetColor,
             SetAttribute(Attribute::Reset),
             Hide
@@ -296,6 +320,7 @@ impl Drop for ScreenGuard {
             ResetColor,
             SetAttribute(Attribute::Reset),
             Show,
+            DisableMouseCapture,
             LeaveAlternateScreen
         );
     }
@@ -336,15 +361,18 @@ impl TuiApp {
             history_index: None,
             draft: Vec::new(),
             command_selection: 0,
-            input_hint: "Enter 发送 · / 命令 · ↑↓ 历史 · Ctrl+C 清空 · Ctrl+D 退出".into(),
+            input_hint: "Enter 发送 · / 命令 · ↑↓ 历史 · 滚轮/PgUp 对话 · Ctrl+D 退出".into(),
             input_active: true,
             input_interrupted: false,
             usage: None,
+            transcript_scroll: 0,
             available_tools: context.available_tools,
             skills: context.skills,
             show_intro: true,
             session_picker: None,
             plan_review: None,
+            model_picker: None,
+            debug_trace: context.debug_trace,
         };
         let app = Self {
             renderer: TuiRenderer {
@@ -371,6 +399,7 @@ impl TuiApp {
     pub(crate) fn notice(&self, message: impl Into<String>) -> io::Result<()> {
         let mut state = self.renderer.state.lock().unwrap();
         state.show_intro = false;
+        state.transcript_scroll = 0;
         push_block(&mut state, Role::System, message.into());
         drop(state);
         self.renderer.draw()
@@ -435,6 +464,59 @@ impl TuiApp {
         {
             let mut state = self.renderer.state.lock().unwrap();
             state.session_picker = None;
+            state.input_active = true;
+        }
+        self.renderer.draw()?;
+        Ok(selected)
+    }
+
+    pub(crate) fn select_model(&self) -> io::Result<Option<String>> {
+        let _raw = RawGuard::enter()?;
+        {
+            let mut state = self.renderer.state.lock().unwrap();
+            let choices = model_options(&state.provider, &state.model);
+            let selected = choices
+                .iter()
+                .position(|choice| model_matches(&choice.id, &state.model))
+                .unwrap_or(0);
+            state.input_active = false;
+            state.model_picker = Some(ModelPicker { choices, selected });
+        }
+        self.renderer.draw()?;
+
+        let selected = loop {
+            let Event::Key(key) = read()? else {
+                continue;
+            };
+            if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+                continue;
+            }
+            let mut state = self.renderer.state.lock().unwrap();
+            let Some(picker) = state.model_picker.as_mut() else {
+                break None;
+            };
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    picker.selected = picker
+                        .selected
+                        .checked_sub(1)
+                        .unwrap_or(picker.choices.len() - 1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    picker.selected = (picker.selected + 1) % picker.choices.len();
+                }
+                KeyCode::Enter => break Some(picker.choices[picker.selected].id.clone()),
+                KeyCode::Esc => break None,
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break None,
+                _ => {}
+            }
+            drop(state);
+            self.renderer.draw()?;
+        };
+
+        {
+            let mut state = self.renderer.state.lock().unwrap();
+            state.model_picker = None;
             state.input_active = true;
         }
         self.renderer.draw()?;
@@ -577,6 +659,7 @@ impl TuiApp {
         state.input.clear();
         state.cursor = 0;
         state.history_index = None;
+        state.transcript_scroll = 0;
         drop(state);
         self.renderer.draw()
     }
@@ -596,6 +679,7 @@ impl TuiApp {
             "未完成".into()
         };
         state.tools.clear();
+        state.transcript_scroll = 0;
         state.input_active = true;
         drop(state);
         self.renderer.draw()
@@ -611,7 +695,27 @@ impl TuiApp {
         self.renderer.draw()?;
 
         loop {
-            let Event::Key(key) = read()? else {
+            let event = read()?;
+            if matches!(event, Event::Resize(_, _)) {
+                self.renderer.draw()?;
+                continue;
+            }
+            if let Event::Mouse(mouse) = event {
+                let mut state = self.renderer.state.lock().unwrap();
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => {
+                        state.transcript_scroll = state.transcript_scroll.saturating_add(3)
+                    }
+                    MouseEventKind::ScrollDown => {
+                        state.transcript_scroll = state.transcript_scroll.saturating_sub(3)
+                    }
+                    _ => continue,
+                }
+                drop(state);
+                self.renderer.draw()?;
+                continue;
+            }
+            let Event::Key(key) = event else {
                 continue;
             };
             let outcome = {
@@ -647,6 +751,9 @@ impl TuiRenderer {
         if state.plan_review.is_some() {
             draw_plan_review(&mut stdout, &state, columns, rows, self.color)?;
         }
+        if state.model_picker.is_some() {
+            draw_model_picker(&mut stdout, &state, columns, rows, self.color)?;
+        }
         stdout.flush()
     }
 }
@@ -656,6 +763,12 @@ impl EventSink for TuiRenderer {
     async fn emit(&self, event: AgentEvent) {
         {
             let mut state = self.state.lock().unwrap();
+            if state.debug_trace
+                && let Some(trace) = event.structured_trace()
+                && let Ok(line) = serde_json::to_string(&redact_value(&trace))
+            {
+                push_block(&mut state, Role::System, format!("trace {line}"));
+            }
             match event {
                 AgentEvent::StateChanged { state: agent_state } => {
                     state.status = state_label(agent_state).into();
@@ -690,28 +803,29 @@ impl EventSink for TuiRenderer {
                             (Some(done), None, Some(unit)) => format!(" · {done} {unit}"),
                             _ => String::new(),
                         };
-                        let message = message
-                            .map(|value| format!(" · {}", redact_text(&value)))
-                            .unwrap_or_default();
-                        tool.detail = format!("{phase}{count}{message}");
+                        let detail = message
+                            .map(|value| redact_text(&value))
+                            .filter(|value| !value.trim().is_empty())
+                            .unwrap_or_else(|| tool_phase_display(&phase).into());
+                        tool.detail = format!("{detail}{count}");
                     }
                 }
                 AgentEvent::ToolFinished {
                     call_id, result, ..
                 } => {
-                    if let Some(tool) = state.tools.iter_mut().find(|tool| tool.call_id == call_id)
+                    if let Some(index) = state.tools.iter().position(|tool| tool.call_id == call_id)
                     {
-                        tool.finished = Some(result.success);
-                        tool.duration_ms = Some(result.duration_ms);
-                        tool.detail = if result.success {
-                            "完成".into()
-                        } else {
-                            result
-                                .error
-                                .as_ref()
-                                .map(|error| redact_text(&error.message))
-                                .unwrap_or_else(|| "失败".into())
-                        };
+                        let tool = state.tools.remove(index);
+                        let line = completed_tool_line(&tool, &result);
+                        push_block(
+                            &mut state,
+                            if result.success {
+                                Role::Tool
+                            } else {
+                                Role::Warning
+                            },
+                            line,
+                        );
                     }
                 }
                 AgentEvent::UsageUpdated { usage } => {
@@ -720,16 +834,30 @@ impl EventSink for TuiRenderer {
                 AgentEvent::Warning { message, .. } => {
                     push_block(&mut state, Role::Warning, redact_text(&message));
                 }
+                AgentEvent::DebugTrace { .. } => {}
                 AgentEvent::PlanStarted { .. } => state.status = "执行计划".into(),
                 AgentEvent::PlanStepStarted { title, attempt, .. } => {
                     state.status = format!("步骤 {title} · 第 {attempt} 次");
                 }
-                AgentEvent::PlanStepCompleted { summary, .. } => {
+                AgentEvent::PlanStepCompleted {
+                    summary, evidence, ..
+                } => {
                     push_block(
                         &mut state,
                         Role::System,
                         format!("步骤完成：{}", redact_text(&summary)),
                     );
+                    for item in evidence {
+                        push_block(
+                            &mut state,
+                            Role::System,
+                            format!(
+                                "证据 {}：{}",
+                                item.criterion_index,
+                                redact_text(&item.evidence)
+                            ),
+                        );
+                    }
                 }
                 AgentEvent::PlanStepFailed { error, .. } => {
                     push_block(
@@ -837,6 +965,14 @@ fn handle_input_key(state: &mut TuiState, key: KeyEvent) -> Option<InputOutcome>
             }
             None
         }
+        KeyCode::PageUp => {
+            state.transcript_scroll = state.transcript_scroll.saturating_add(8);
+            None
+        }
+        KeyCode::PageDown => {
+            state.transcript_scroll = state.transcript_scroll.saturating_sub(8);
+            None
+        }
         KeyCode::Left if state.cursor > 0 => {
             state.cursor -= 1;
             None
@@ -930,6 +1066,7 @@ fn load_session_state(state: &mut TuiState, session: &Session) {
     state.history_index = None;
     state.show_intro = false;
     state.status = "已恢复会话".into();
+    state.transcript_scroll = 0;
     state.usage = Some((session.total_input_tokens, session.total_output_tokens));
     for message in &session.messages {
         let role = match message.role {
@@ -968,9 +1105,6 @@ fn matching_commands(input: &[char]) -> Vec<&'static SlashCommand> {
 
 fn push_block(state: &mut TuiState, role: Role, text: String) {
     state.transcript.push_back(TranscriptBlock { role, text });
-    while state.transcript.len() > MAX_TRANSCRIPT_BLOCKS {
-        state.transcript.pop_front();
-    }
 }
 
 #[allow(dead_code)]
@@ -1074,16 +1208,10 @@ fn draw_intro(
         )),
         MoveTo(x, 4),
         Print(format!(
-            "{} tools · Skills {}",
+            "{} tools · {}",
             state.available_tools.len(),
-            if state.skills.is_empty() {
-                "尚未启用"
-            } else {
-                "已启用"
-            }
-        )),
-        MoveTo(x, 5),
-        Print(format!("{} · 审批 {}", state.permission, state.approval))
+            state.permission
+        ))
     )?;
     reset_color(writer, color)
 }
@@ -1314,14 +1442,18 @@ fn draw_transcript(
     let mut lines: Vec<(Role, String)> = Vec::new();
 
     for block in &state.transcript {
-        append_wrapped(&mut lines, block.role, &block.text, body_width);
+        if block.role == Role::Assistant {
+            append_markdown_wrapped(&mut lines, &block.text, body_width);
+        } else {
+            append_wrapped(&mut lines, block.role, &block.text, body_width);
+        }
         lines.push((Role::System, String::new()));
     }
     for tool in &state.tools {
         let marker = match tool.finished {
             Some(true) => "✓",
             Some(false) => "✗",
-            None => "◆",
+            None => "●",
         };
         let duration = tool
             .duration_ms
@@ -1334,39 +1466,110 @@ fn draw_transcript(
             } else {
                 Role::System
             },
-            &format!("{marker} {} · {}{duration}", tool.name, tool.detail),
+            &format!(
+                "{marker} {}  {}{duration}",
+                tool_display_name(&tool.name),
+                tool.detail
+            ),
             body_width,
         );
     }
     if !state.streaming.is_empty() {
-        append_wrapped(&mut lines, Role::Assistant, &state.streaming, body_width);
+        append_markdown_wrapped(&mut lines, &state.streaming, body_width);
     }
 
-    let start = lines.len().saturating_sub(available);
-    for (offset, (role, line)) in lines[start..].iter().enumerate() {
+    let start = transcript_window_start(lines.len(), available, state.transcript_scroll);
+    for (offset, (role, line)) in lines.iter().skip(start).take(available).enumerate() {
         let row = transcript_top + offset as u16;
         queue!(writer, MoveTo(1, row))?;
         let glyph = match role {
             Role::User => "❯",
-            Role::Assistant => "┊",
+            Role::Assistant
+            | Role::AssistantHeading
+            | Role::AssistantCode
+            | Role::AssistantDiffAdd
+            | Role::AssistantDiffRemove => "┊",
+            Role::Tool => "●",
             Role::System => "·",
             Role::Warning => "!",
         };
         let tone = match role {
             Role::User => PRIMARY,
             Role::Assistant => TEXT,
+            Role::AssistantHeading => PRIMARY,
+            Role::AssistantCode => MUTED,
+            Role::AssistantDiffAdd => Color::Rgb {
+                r: 132,
+                g: 169,
+                b: 140,
+            },
+            Role::AssistantDiffRemove => Color::Rgb {
+                r: 190,
+                g: 110,
+                b: 110,
+            },
+            Role::Tool => PRIMARY,
             Role::System => MUTED,
             Role::Warning => WARNING,
         };
         set_color(writer, color, tone)?;
         queue!(writer, Print(glyph), Print(" "))?;
-        if *role == Role::User {
+        if matches!(role, Role::User | Role::AssistantHeading) {
             queue!(writer, SetAttribute(Attribute::Bold))?;
         }
         queue!(writer, Print(line), SetAttribute(Attribute::Reset))?;
         reset_color(writer, color)?;
     }
     Ok(())
+}
+
+fn transcript_window_start(total: usize, visible: usize, scroll_from_bottom: usize) -> usize {
+    let latest_start = total.saturating_sub(visible);
+    latest_start.saturating_sub(scroll_from_bottom.min(latest_start))
+}
+
+fn completed_tool_line(tool: &ToolActivity, result: &xdudu_core::tools::ToolResult) -> String {
+    let duration = if result.duration_ms >= 1_000 {
+        format!("{:.1} s", result.duration_ms as f64 / 1_000.0)
+    } else {
+        format!("{} ms", result.duration_ms)
+    };
+    let name = tool_display_name(&tool.name);
+    if tool.name == "web_search" {
+        let query = result
+            .output
+            .as_ref()
+            .and_then(|output| output.get("query"))
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                result
+                    .error
+                    .as_ref()
+                    .and_then(|error| error.details.get("query"))
+                    .and_then(serde_json::Value::as_str)
+            })
+            .map(redact_text)
+            .map(|value| value.replace(['\r', '\n'], " "))
+            .unwrap_or_else(|| "未提供查询词".into());
+        let count = result
+            .output
+            .as_ref()
+            .and_then(|output| output.get("resultCount"))
+            .and_then(serde_json::Value::as_u64);
+        return if result.success {
+            format!(
+                "{name}（“{query}”）  {} 条结果 · {duration}",
+                count.unwrap_or(0)
+            )
+        } else {
+            format!("{name}（“{query}”）  失败 · {duration}")
+        };
+    }
+    if result.success {
+        format!("{name}  完成 · {duration}")
+    } else {
+        format!("{name}  失败 · {duration}")
+    }
 }
 
 fn draw_chrome(
@@ -1376,26 +1579,23 @@ fn draw_chrome(
     rows: u16,
     color: bool,
 ) -> io::Result<()> {
-    let status_row = if state.show_intro && rows >= 14 && columns >= 42 {
-        6
+    let (status_row, _, _, _) = chrome_positions(rows);
+    // 状态、模型和权限已在其他区域展示，输入框上方只保留边界。
+    // 运行和上翻时仅用边框色彩给出低干扰状态反馈。
+    let border_color = if state.status.contains("失败") || state.status.contains("暂停") {
+        WARNING
+    } else if state.status != "就绪" || state.transcript_scroll > 0 {
+        PRIMARY
     } else {
-        rows.saturating_sub(4)
+        BORDER
     };
-    let usage = state
-        .usage
-        .map(|(input, output)| format!(" │ {input}+{output} tok"))
-        .unwrap_or_default();
-    let visible_model = model_display_name(&state.provider, &state.model);
-    let left = format!(
-        "─ {} │ {} │ {}{}",
-        state.status, visible_model, state.permission, usage
-    );
-    set_color(writer, color, BORDER)?;
+    let _token_usage = state.usage;
+    set_color(writer, color, border_color)?;
     queue!(
         writer,
         MoveTo(0, status_row),
         Clear(ClearType::CurrentLine),
-        Print(truncate_to_width(&left, usize::from(columns)))
+        Print("─".repeat(usize::from(columns)))
     )?;
     reset_color(writer, color)?;
 
@@ -1409,18 +1609,8 @@ fn draw_input_area(
     rows: u16,
     color: bool,
 ) -> io::Result<()> {
-    let compact_intro = state.show_intro && rows >= 14 && columns >= 42;
-    let input_row = if compact_intro {
-        8
-    } else {
-        rows.saturating_sub(2)
-    };
-    let help_row = if compact_intro {
-        9
-    } else {
-        rows.saturating_sub(1)
-    };
-    draw_command_suggestions(writer, state, columns, rows, compact_intro, color)?;
+    let (_, input_row, separator_row, help_row) = chrome_positions(rows);
+    draw_command_suggestions(writer, state, columns, rows, color)?;
     set_color(writer, color, PRIMARY)?;
     queue!(
         writer,
@@ -1434,6 +1624,15 @@ fn draw_input_area(
     reset_color(writer, color)?;
     let input: String = state.input.iter().collect();
     queue!(writer, Print(&input))?;
+
+    set_color(writer, color, BORDER)?;
+    queue!(
+        writer,
+        MoveTo(0, separator_row),
+        Clear(ClearType::CurrentLine),
+        Print("─".repeat(usize::from(columns)))
+    )?;
+    reset_color(writer, color)?;
 
     set_color(writer, color, MUTED)?;
     let hint_text = if matching_commands(&state.input).is_empty() {
@@ -1472,7 +1671,6 @@ fn draw_command_suggestions(
     state: &TuiState,
     columns: u16,
     rows: u16,
-    compact_intro: bool,
     color: bool,
 ) -> io::Result<()> {
     let suggestions = matching_commands(&state.input);
@@ -1480,11 +1678,7 @@ fn draw_command_suggestions(
         return Ok(());
     }
     let count = suggestions.len().min(MAX_COMMAND_SUGGESTIONS);
-    let start_row = if compact_intro {
-        11
-    } else {
-        rows.saturating_sub(4 + count as u16)
-    };
+    let start_row = rows.saturating_sub(4 + count as u16);
     for (index, command) in suggestions.into_iter().take(count).enumerate() {
         let row = start_row + index as u16;
         if row >= rows {
@@ -1513,6 +1707,15 @@ fn draw_command_suggestions(
         reset_color(writer, color)?;
     }
     Ok(())
+}
+
+fn chrome_positions(rows: u16) -> (u16, u16, u16, u16) {
+    (
+        rows.saturating_sub(4),
+        rows.saturating_sub(3),
+        rows.saturating_sub(2),
+        rows.saturating_sub(1),
+    )
 }
 
 fn draw_session_picker(
@@ -1576,6 +1779,77 @@ fn draw_session_picker(
                 usize::from(columns.saturating_sub(4))
             )),
             SetAttribute(Attribute::Reset)
+        )?;
+    }
+    reset_color(writer, color)
+}
+
+fn draw_model_picker(
+    writer: &mut impl Write,
+    state: &TuiState,
+    columns: u16,
+    rows: u16,
+    color: bool,
+) -> io::Result<()> {
+    let Some(picker) = &state.model_picker else {
+        return Ok(());
+    };
+    let top = 1_u16;
+    let bottom = rows.saturating_sub(2);
+    for row in top..=bottom {
+        queue!(writer, MoveTo(0, row), Clear(ClearType::CurrentLine))?;
+    }
+
+    set_color(writer, color, PRIMARY)?;
+    queue!(
+        writer,
+        MoveTo(2, top),
+        SetAttribute(Attribute::Bold),
+        Print("选择模型"),
+        SetAttribute(Attribute::Reset)
+    )?;
+    set_color(writer, color, MUTED)?;
+    queue!(
+        writer,
+        MoveTo(2, top + 1),
+        Print("↑↓/j/k 选择 · Enter 确认 · Esc 取消")
+    )?;
+
+    for (index, choice) in picker.choices.iter().enumerate() {
+        let row = top + 3 + (index as u16 * 2);
+        if row + 1 >= bottom {
+            break;
+        }
+        let selected = index == picker.selected;
+        set_color(writer, color, if selected { PRIMARY } else { TEXT })?;
+        if selected {
+            queue!(writer, SetAttribute(Attribute::Bold))?;
+        }
+        let current = model_matches(&choice.id, &state.model);
+        let title = format!(
+            "{} {}{}",
+            if selected { "›" } else { " " },
+            choice.label,
+            if current { "  当前" } else { "" }
+        );
+        queue!(
+            writer,
+            MoveTo(2, row),
+            Print(truncate_to_width(
+                &title,
+                usize::from(columns.saturating_sub(4))
+            )),
+            SetAttribute(Attribute::Reset)
+        )?;
+        set_color(writer, color, MUTED)?;
+        let detail = format!("  {} · {}", choice.description, choice.id);
+        queue!(
+            writer,
+            MoveTo(4, row + 1),
+            Print(truncate_to_width(
+                &detail,
+                usize::from(columns.saturating_sub(6))
+            ))
         )?;
     }
     reset_color(writer, color)
@@ -1802,6 +2076,20 @@ fn append_wrapped(lines: &mut Vec<(Role, String)>, role: Role, text: &str, width
     }
 }
 
+fn append_markdown_wrapped(lines: &mut Vec<(Role, String)>, text: &str, width: usize) {
+    for line in terminal_markdown(text) {
+        let role = match line.kind {
+            MarkdownLineKind::Body => Role::Assistant,
+            MarkdownLineKind::Heading => Role::AssistantHeading,
+            MarkdownLineKind::Code => Role::AssistantCode,
+            MarkdownLineKind::DiffAdd => Role::AssistantDiffAdd,
+            MarkdownLineKind::DiffRemove => Role::AssistantDiffRemove,
+            MarkdownLineKind::DiffContext => Role::AssistantCode,
+        };
+        append_wrapped(lines, role, &line.text, width);
+    }
+}
+
 fn set_color(writer: &mut impl Write, enabled: bool, color: Color) -> io::Result<()> {
     if enabled {
         queue!(writer, SetForegroundColor(terminal_color(color)))?;
@@ -1870,11 +2158,14 @@ mod tests {
             input_active: true,
             input_interrupted: false,
             usage: None,
+            transcript_scroll: 0,
             available_tools: vec!["file_read".into(), "git_status".into()],
             skills: Vec::new(),
             show_intro: true,
             session_picker: None,
             plan_review: None,
+            model_picker: None,
+            debug_trace: false,
         }
     }
 
@@ -1915,13 +2206,57 @@ mod tests {
     }
 
     #[test]
-    fn 需要参数的斜杠命令先补全而不立即执行() {
+    fn model_命令无需完整参数即可执行() {
         let mut state = state();
         for character in "/mod".chars() {
             handle_input_key(&mut state, key(KeyCode::Char(character)));
         }
-        assert_eq!(handle_input_key(&mut state, key(KeyCode::Enter)), None);
-        assert_eq!(state.input.iter().collect::<String>(), "/model ");
+        assert_eq!(
+            handle_input_key(&mut state, key(KeyCode::Enter)),
+            Some(InputOutcome::Command("/model".into()))
+        );
+    }
+
+    #[test]
+    fn page_up_和_page_down_控制对话滚动() {
+        let mut state = state();
+        assert_eq!(handle_input_key(&mut state, key(KeyCode::PageUp)), None);
+        assert_eq!(state.transcript_scroll, 8);
+        assert_eq!(handle_input_key(&mut state, key(KeyCode::PageDown)), None);
+        assert_eq!(state.transcript_scroll, 0);
+        assert_eq!(transcript_window_start(40, 8, 0), 32);
+        assert_eq!(transcript_window_start(40, 8, 8), 24);
+        assert_eq!(transcript_window_start(40, 8, usize::MAX), 0);
+    }
+
+    #[test]
+    fn 输入区始终固定在终端底部() {
+        assert_eq!(chrome_positions(24), (20, 21, 22, 23));
+        assert_eq!(chrome_positions(12), (8, 9, 10, 11));
+    }
+
+    #[test]
+    fn web_search_完成记录包含查询结果数和耗时() {
+        let tool = ToolActivity {
+            call_id: "call-1".into(),
+            name: "web_search".into(),
+            detail: "搜索：爪子刀".into(),
+            finished: None,
+            duration_ms: None,
+        };
+        let result = xdudu_core::tools::ToolResult::success(
+            serde_json::json!({
+                "query": "爪子刀",
+                "resultCount": 5,
+                "results": [],
+            }),
+            chrono::Utc::now(),
+            serde_json::json!({}),
+        );
+        let line = completed_tool_line(&tool, &result);
+        assert!(line.contains("联网搜索（“爪子刀”）"));
+        assert!(line.contains("5 条结果"));
+        assert!(line.contains("ms"));
     }
 
     #[test]

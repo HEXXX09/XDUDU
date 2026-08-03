@@ -41,7 +41,7 @@ Cargo workspace
     └── error.rs         错误类别和退出码
 ```
 
-`xdudu-core` 不读取终端输入，也不直接打印输出。CLI 只负责组合、输入和渲染，因此后续桌面端、服务端或测试程序可以复用同一 Agent 运行时。
+`xdudu-core` 不读取终端输入，也不直接打印输出。CLI 只负责组合、输入和渲染，因此后续桌面端、服务端或测试程序可以复用同一 Agent 运行时。CLI 根据 TTY 能力自动决定渲染策略，领域事件及权限协议不依赖具体界面。
 
 ## 3. 启动数据流
 
@@ -143,10 +143,11 @@ Agent 发出以下领域事件：
 - `StateChanged`：运行状态变化；
 - `AssistantDelta`：助手文本增量；
 - `ToolStarted`、`ToolProgress`、`ToolFinished`：工具生命周期和实时阶段；
+- `DebugTrace`：高级模式下的安全运行时元数据，不包含模型思维链或工具正文；
 - `UsageUpdated`：Token 用量；
 - `Warning`：可恢复告警。
 
-CLI Renderer 决定具体表现：交互 TTY 使用 alternate screen 全屏界面，固定展示对话时间线、实时工具活动、状态规则和 Composer；非交互任务继续使用终端流式输出，`--no-stream` 聚合文本，`--json` 输出 JSON Lines。`--no-color` 或 `NO_COLOR` 禁用颜色，领域层不感知 TTY 样式。
+CLI Renderer 自动决定具体表现：交互 TTY 启用完整界面，保留图标、状态栏、消息时间线和固定输入区；非 TTY、管道和自动化环境顺序输出纯文本。`--no-stream` 聚合文本，`--json` 输出 JSON Lines，`--no-color` 或 `NO_COLOR` 禁用颜色。
 
 ## 9. 权限、审批与安全边界
 

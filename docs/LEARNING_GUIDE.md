@@ -1622,6 +1622,8 @@ SQLite Schema v4 使用 `revision + executionVersion + status` 作为执行期�
 
 核心事件：
 
+默认 Renderer 展示计划、工具生命周期、进度、结果状态与 Plan 完成证据，不展示模型原始思维链。开启 `--debug-trace` 后，Renderer 会额外把事件映射成经过统一脱敏的 `debug_trace` JSON：其中只保留运行状态、工具名称、耗时、错误码、Token 数、Plan/Step ID 和证据索引，不复制助手正文、工具参数/输出或证据正文。该轨迹用于观察状态机，不是思维链的替代名称。
+
 - `StateChanged`；
 - `AssistantDelta`；
 - `ToolStarted`；

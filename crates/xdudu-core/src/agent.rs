@@ -347,6 +347,21 @@ pub async fn run_agent(config: AgentRunConfig<'_>) -> XduduResult<AgentRunResult
             max_output_tokens: 4096,
             cancellation: config.cancellation.child_token(),
         };
+        emit(
+            config.event_sink,
+            AgentEvent::DebugTrace {
+                phase: "provider_request".into(),
+                summary: "向 Provider 请求下一步动作".into(),
+                details: serde_json::json!({
+                    "turn": turns,
+                    "state": state,
+                    "messageCount": request.messages.len(),
+                    "toolDefinitionCount": request.tools.len(),
+                    "model": request.model,
+                }),
+            },
+        )
+        .await;
         let response_result = if config.stream {
             config
                 .provider
@@ -386,6 +401,23 @@ pub async fn run_agent(config: AgentRunConfig<'_>) -> XduduResult<AgentRunResult
                 break;
             }
         };
+        emit(
+            config.event_sink,
+            AgentEvent::DebugTrace {
+                phase: "provider_response".into(),
+                summary: "Provider 返回结构化动作".into(),
+                details: serde_json::json!({
+                    "turn": turns,
+                    "finishReason": format!("{:?}", response.finish_reason),
+                    "assistantTextBytes": response.message.text_content().len(),
+                    "toolCallCount": response.tool_calls.len(),
+                    "toolNames": response.tool_calls.iter().map(|call| call.name.as_str()).collect::<Vec<_>>(),
+                    "inputTokens": response.usage.input_tokens,
+                    "outputTokens": response.usage.output_tokens,
+                }),
+            },
+        )
+        .await;
         session.total_input_tokens += response.usage.input_tokens;
         session.total_output_tokens += response.usage.output_tokens;
         emit(

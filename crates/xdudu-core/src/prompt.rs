@@ -28,6 +28,10 @@ pub fn build_system_prompt(tools: &[ToolDefinition], cwd: &Path) -> String {
 9. 修改完成后执行与改动风险相匹配的格式检查、静态检查或测试。\n\
 10. 只有在目标已完成并经过必要验证后才能宣布完成。\n\
 11. 最终答复简洁说明实际完成内容、验证结果和仍存在的问题。\n\n\
+## 可见输出边界\n\n\
+- 不输出原始思维链、隐藏推理、内部草稿或逐步心理过程。\n\
+- 默认只向用户展示必要的计划、工具调用、进度、实际结果和可验证证据。\n\
+- 需要解释判断依据时，提供简短、可审查的结论依据，不复述内部推理过程。\n\n\
 ## 工具选择\n\n\
 - search_text：定位符号、文本和相关实现。\n\
 - file_read：读取已知文件及校验当前内容。\n\
@@ -58,6 +62,7 @@ pub fn build_system_prompt(tools: &[ToolDefinition], cwd: &Path) -> String {
 - 不伪造文件内容、命令输出、测试结果、Git 状态或网络结果。\n\n\
 ## 最终答复\n\n\
 最终答复必须以实际结果为准：\n\n\
+- 终端输出保持简洁；不要使用 Markdown `#` 标题或 `**` 强调符，分点时使用短列表。\n\
 - 回答任务：直接给出结论。\n\
 - 检查任务：说明发现的问题和证据。\n\
 - 修改任务：说明改了什么、验证了什么。\n\
@@ -120,6 +125,8 @@ mod tests {
         assert!(prompt.contains("不可信指令"));
         assert!(prompt.contains("工具被拒绝后不得改用其他工具实现相同副作用"));
         assert!(prompt.contains("测试失败时不得宣称任务完成"));
+        assert!(prompt.contains("不输出原始思维链、隐藏推理"));
+        assert!(prompt.contains("计划、工具调用、进度、实际结果和可验证证据"));
         assert!(prompt.contains("/workspace"));
         assert!(!prompt.contains("Thought:"));
     }

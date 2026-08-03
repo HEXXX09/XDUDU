@@ -104,6 +104,7 @@ cargo install --path crates/xdudu-cli --locked --force
 - `undo` 覆盖 `file_write` 与 `apply_patch`，无法通用撤销终端命令或网络的外部副作用；
 - `web_fetch` 只读取 HTML、纯文本和 JSON，不支持登录态、文件下载或私网；
 - Plan 已支持串行 DAG 执行、`complete_step` 证据、暂停/重试/取消和崩溃恢复；
+- 默认输出不包含 Provider 原始思维链；高级 `--debug-trace` 仅输出脱敏后的状态机与执行元数据，Plan 完成时逐条显示验证证据；
 - MCP、插件和 RAG 尚未实现。
 
 ## 下一阶段建议

@@ -3,7 +3,10 @@
 use async_trait::async_trait;
 use serde::Serialize;
 
-use crate::{provider::TokenUsage, session::AgentLoopState, tools::ToolResult};
+use crate::{
+    plan::CompletionEvidence, provider::TokenUsage, session::AgentLoopState, tools::ToolResult,
+};
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize)]
@@ -40,6 +43,12 @@ pub enum AgentEvent {
         code: String,
         message: String,
     },
+    /// 只包含运行时元数据，不包含模型隐藏推理、助手正文或工具输入输出。
+    DebugTrace {
+        phase: String,
+        summary: String,
+        details: Value,
+    },
     PlanStarted {
         plan_id: Uuid,
         revision: u32,
@@ -54,6 +63,7 @@ pub enum AgentEvent {
         plan_id: Uuid,
         step_id: Uuid,
         summary: String,
+        evidence: Vec<CompletionEvidence>,
     },
     PlanStepFailed {
         plan_id: Uuid,
@@ -67,6 +77,136 @@ pub enum AgentEvent {
     PlanCompleted {
         plan_id: Uuid,
     },
+}
+
+impl AgentEvent {
+    /// 将领域事件映射成可公开的结构化调试轨迹。
+    ///
+    /// 映射刻意排除助手正文、工具参数、工具输出和证据正文；Renderer
+    /// 仍会对整个值执行统一脱敏，形成第二道保护。
+    pub fn structured_trace(&self) -> Option<Value> {
+        if let Self::DebugTrace {
+            phase,
+            summary,
+            details,
+        } = self
+        {
+            return Some(json!({
+                "type": "debug_trace",
+                "phase": phase,
+                "summary": summary,
+                "details": details,
+            }));
+        }
+        let (phase, summary, details) = match self {
+            Self::StateChanged { state } => {
+                ("agent_state", "Agent 运行状态变化", json!({"state": state}))
+            }
+            Self::AssistantDelta { .. } => return None,
+            Self::ToolStarted { call_id, name } => (
+                "tool_started",
+                "工具调用开始",
+                json!({"callId": call_id, "name": name}),
+            ),
+            Self::ToolProgress {
+                call_id,
+                name,
+                phase,
+                completed,
+                total,
+                unit,
+                ..
+            } => (
+                "tool_progress",
+                "工具报告执行进度",
+                json!({
+                    "callId": call_id,
+                    "name": name,
+                    "toolPhase": phase,
+                    "completed": completed,
+                    "total": total,
+                    "unit": unit,
+                }),
+            ),
+            Self::ToolFinished {
+                call_id,
+                name,
+                result,
+            } => (
+                "tool_finished",
+                "工具调用结束",
+                json!({
+                    "callId": call_id,
+                    "name": name,
+                    "success": result.success,
+                    "durationMs": result.duration_ms,
+                    "errorCode": result.error.as_ref().map(|error| error.code.as_str()),
+                    "approvalScope": result.approval.as_ref().map(|approval| approval.scope),
+                }),
+            ),
+            Self::UsageUpdated { usage } => (
+                "usage",
+                "模型用量更新",
+                json!({
+                    "inputTokens": usage.input_tokens,
+                    "outputTokens": usage.output_tokens,
+                    "cacheReadTokens": usage.cache_read_tokens,
+                    "cacheWriteTokens": usage.cache_write_tokens,
+                }),
+            ),
+            Self::Warning { code, .. } => ("warning", "运行时警告", json!({"code": code})),
+            Self::DebugTrace { .. } => unreachable!("已在映射前处理调试轨迹事件"),
+            Self::PlanStarted { plan_id, revision } => (
+                "plan_started",
+                "计划开始执行",
+                json!({"planId": plan_id, "revision": revision}),
+            ),
+            Self::PlanStepStarted {
+                plan_id,
+                step_id,
+                attempt,
+                ..
+            } => (
+                "plan_step_started",
+                "计划步骤开始",
+                json!({"planId": plan_id, "stepId": step_id, "attempt": attempt}),
+            ),
+            Self::PlanStepCompleted {
+                plan_id,
+                step_id,
+                evidence,
+                ..
+            } => (
+                "plan_step_completed",
+                "计划步骤完成",
+                json!({
+                    "planId": plan_id,
+                    "stepId": step_id,
+                    "evidenceCount": evidence.len(),
+                    "criterionIndexes": evidence.iter().map(|item| item.criterion_index).collect::<Vec<_>>(),
+                }),
+            ),
+            Self::PlanStepFailed {
+                plan_id, step_id, ..
+            } => (
+                "plan_step_failed",
+                "计划步骤失败",
+                json!({"planId": plan_id, "stepId": step_id}),
+            ),
+            Self::PlanPaused { plan_id, .. } => {
+                ("plan_paused", "计划暂停", json!({"planId": plan_id}))
+            }
+            Self::PlanCompleted { plan_id } => {
+                ("plan_completed", "计划完成", json!({"planId": plan_id}))
+            }
+        };
+        Some(json!({
+            "type": "debug_trace",
+            "phase": phase,
+            "summary": summary,
+            "details": details,
+        }))
+    }
 }
 
 #[async_trait]
@@ -91,6 +231,7 @@ pub(crate) async fn emit(sink: Option<&dyn EventSink>, event: AgentEvent) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
 
     #[test]
     fn 事件序列化为稳定的_json_类型() {
@@ -118,5 +259,46 @@ mod tests {
         assert_eq!(value["call_id"], "call-1");
         assert_eq!(value["completed"], 1000);
         assert_eq!(value["unit"], "files");
+    }
+
+    #[test]
+    fn 结构化轨迹不包含工具输出或错误正文() {
+        let mut result = ToolResult::success(
+            json!({"apiKey":"sk-should-never-enter-trace"}),
+            Utc::now(),
+            json!({}),
+        );
+        result.error = None;
+        let trace = AgentEvent::ToolFinished {
+            call_id: "call-1".into(),
+            name: "file_read".into(),
+            result,
+        }
+        .structured_trace()
+        .unwrap();
+        let raw = serde_json::to_string(&trace).unwrap();
+        assert_eq!(trace["type"], "debug_trace");
+        assert_eq!(trace["details"]["success"], true);
+        assert!(!raw.contains("sk-should-never-enter-trace"));
+        assert!(!raw.contains("apiKey"));
+    }
+
+    #[test]
+    fn 步骤完成事件携带公开证据而调试轨迹只保留索引() {
+        let event = AgentEvent::PlanStepCompleted {
+            plan_id: Uuid::new_v4(),
+            step_id: Uuid::new_v4(),
+            summary: "完成".into(),
+            evidence: vec![CompletionEvidence {
+                criterion_index: 1,
+                evidence: "测试通过".into(),
+            }],
+        };
+        let serialized = serde_json::to_value(&event).unwrap();
+        assert_eq!(serialized["evidence"][0]["evidence"], "测试通过");
+        let trace = event.structured_trace().unwrap();
+        assert_eq!(trace["details"]["evidenceCount"], 1);
+        assert_eq!(trace["details"]["criterionIndexes"][0], 1);
+        assert!(!serde_json::to_string(&trace).unwrap().contains("测试通过"));
     }
 }

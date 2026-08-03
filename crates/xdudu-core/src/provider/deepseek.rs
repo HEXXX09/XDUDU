@@ -111,13 +111,22 @@ impl DeepSeekProvider {
                 })
             })
             .collect::<Vec<_>>();
-        Ok(json!({
+        let mut body = json!({
             "model": request.model,
             "messages": Self::openai_messages(request)?,
             "tools": tools,
             "temperature": request.temperature,
             "max_tokens": request.max_output_tokens,
-        }))
+        });
+        if matches!(
+            request.model.as_str(),
+            "deepseek-v4-flash" | "deepseek-v4-pro"
+        ) {
+            // V4 默认启用思考模式。XDUDU 当前公开边界不保存原始思维链，
+            // 因此明确关闭思考，避免工具调用后因无法回传 reasoning_content 而失败。
+            body["thinking"] = json!({ "type": "disabled" });
+        }
+        Ok(body)
     }
 
     fn parse_response(value: Value) -> XduduResult<ProviderResponse> {
@@ -408,6 +417,23 @@ mod tests {
     }
 
     #[test]
+    fn 推理字段不会进入公开助手文本() {
+        let response = DeepSeekProvider::parse_response(json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "reasoning_content": "这里是不能公开的原始推理",
+                    "content": "这是最终结论"
+                },
+                "finish_reason": "stop"
+            }]
+        }))
+        .unwrap();
+        assert_eq!(response.message.text_content(), "这是最终结论");
+        assert!(!response.message.text_content().contains("原始推理"));
+    }
+
+    #[test]
     fn 消息会展开工具结果() {
         let request = ProviderRequest {
             session_id: "s".into(),
@@ -429,5 +455,21 @@ mod tests {
         let messages = DeepSeekProvider::openai_messages(&request).unwrap();
         assert_eq!(messages[1]["role"], "tool");
         assert_eq!(messages[1]["tool_call_id"], "call-1");
+    }
+
+    #[test]
+    fn v4_请求显式关闭思考以兼容工具循环() {
+        let request = ProviderRequest {
+            session_id: "s".into(),
+            model: "deepseek-v4-pro".into(),
+            messages: vec![],
+            tools: vec![],
+            system: "system".into(),
+            temperature: 0.2,
+            max_output_tokens: 100,
+            cancellation: CancellationToken::new(),
+        };
+        let body = DeepSeekProvider::request_body(&request).unwrap();
+        assert_eq!(body["thinking"]["type"], "disabled");
     }
 }

@@ -292,6 +292,7 @@ fn help_可以在没有_api_key_时运行() {
     assert!(stdout.contains("终端原生 AI 编程助手"));
     assert!(stdout.contains("--permission"));
     assert!(stdout.contains("--approval"));
+    assert!(!stdout.contains("--tui"));
     assert!(stdout.contains("undo"));
     assert!(stdout.contains("approval"));
 }
@@ -596,6 +597,9 @@ fn plan_cli_完成创建批准和执行闭环() {
     assert_eq!(plan["status"], "completed");
     assert_eq!(plan["steps"][0]["status"], "completed");
     assert_eq!(plan["steps"][0]["attempts"][0]["attempt"], 1);
+    assert!(
+        String::from_utf8_lossy(&completed.stderr).contains("证据 1： 模拟验收确认检查全部通过")
+    );
 }
 
 #[test]
@@ -618,6 +622,42 @@ fn json_模式只输出可解析事件且没有横幅() {
         .collect::<Vec<_>>();
     assert!(events.iter().any(|event| event["type"] == "tool_started"));
     assert!(events.iter().any(|event| event["type"] == "run_completed"));
+    assert!(!events.iter().any(|event| event["type"] == "debug_trace"));
+}
+
+#[test]
+fn 高级模式输出脱敏结构化轨迹且不包含工具正文() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("fixture.txt"), "fixture secret body").unwrap();
+    let output = xdudu()
+        .current_dir(dir.path())
+        .env("ANTHROPIC_API_KEY", "test-key")
+        .env("ANTHROPIC_BASE_URL", two_turn_anthropic_server())
+        .args(["--json", "--debug-trace", "--no-stream", "读取 fixture.txt"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let traces = output
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
+        .filter(|event| event["type"] == "debug_trace")
+        .collect::<Vec<_>>();
+    assert!(!traces.is_empty());
+    assert!(
+        traces
+            .iter()
+            .any(|event| event["phase"] == "provider_response")
+    );
+    let raw = serde_json::to_string(&traces).unwrap();
+    assert!(!raw.contains("fixture secret body"));
+    assert!(!raw.contains("toolOutput"));
+    assert!(!raw.contains("reasoning_content"));
 }
 
 #[test]

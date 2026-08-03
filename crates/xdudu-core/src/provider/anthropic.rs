@@ -68,9 +68,22 @@ impl AnthropicProvider {
             .get("content")
             .cloned()
             .ok_or_else(|| XduduError::provider("Anthropic 响应缺少 content。", false))?;
-        let content: Vec<ContentBlock> = serde_json::from_value(blocks).map_err(|error| {
-            XduduError::provider(format!("Anthropic content 格式无效：{error}"), false)
-        })?;
+        let public_blocks = blocks
+            .as_array()
+            .ok_or_else(|| XduduError::provider("Anthropic content 必须是数组。", false))?
+            .iter()
+            .filter(|block| {
+                !matches!(
+                    block.get("type").and_then(Value::as_str),
+                    Some("thinking" | "redacted_thinking")
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let content: Vec<ContentBlock> = serde_json::from_value(Value::Array(public_blocks))
+            .map_err(|error| {
+                XduduError::provider(format!("Anthropic content 格式无效：{error}"), false)
+            })?;
         let tool_calls = content
             .iter()
             .filter_map(|block| match block {
@@ -383,5 +396,21 @@ mod tests {
         assert_eq!(response.finish_reason, FinishReason::ToolCalls);
         assert_eq!(response.tool_calls[0].name, "file_read");
         assert_eq!(response.usage.input_tokens, 10);
+    }
+
+    #[test]
+    fn thinking_内容块不会进入公开助手文本() {
+        let response = AnthropicProvider::parse_response(json!({
+            "content": [
+                {"type":"thinking","thinking":"这里是不能公开的原始推理","signature":"sig"},
+                {"type":"redacted_thinking","data":"opaque"},
+                {"type":"text","text":"这是最终结论"}
+            ],
+            "stop_reason":"end_turn",
+            "usage":{"input_tokens":1,"output_tokens":2}
+        }))
+        .unwrap();
+        assert_eq!(response.message.text_content(), "这是最终结论");
+        assert!(!response.message.text_content().contains("原始推理"));
     }
 }

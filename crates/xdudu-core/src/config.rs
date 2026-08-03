@@ -17,7 +17,7 @@ use crate::{
 };
 
 const DEFAULT_ANTHROPIC_MODEL: &str = "claude-sonnet-4-5-20250929";
-const DEFAULT_DEEPSEEK_MODEL: &str = "deepseek-chat";
+const DEFAULT_DEEPSEEK_MODEL: &str = "deepseek-v4-flash";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -77,6 +77,13 @@ pub struct OutputConfig {
     pub json: bool,
     pub no_stream: bool,
     pub color: bool,
+    pub debug_trace: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UiConfig {
+    pub render_mode: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -85,6 +92,7 @@ pub struct AppConfig {
     pub provider: ProviderConfig,
     pub agent: AgentConfig,
     pub output: OutputConfig,
+    pub ui: UiConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -112,6 +120,8 @@ pub struct ConfigOverrides {
     pub json: Option<bool>,
     pub no_stream: Option<bool>,
     pub color: Option<bool>,
+    pub debug_trace: Option<bool>,
+    pub render_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -122,6 +132,8 @@ struct FileConfig {
     agent: FileAgent,
     #[serde(default)]
     output: FileOutput,
+    #[serde(default)]
+    ui: FileUi,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -147,6 +159,13 @@ struct FileOutput {
     json: Option<bool>,
     no_stream: Option<bool>,
     color: Option<bool>,
+    debug_trace: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+struct FileUi {
+    #[serde(alias = "renderMode")]
+    render_mode: Option<String>,
 }
 
 fn config_error(message: impl Into<String>) -> XduduError {
@@ -347,6 +366,20 @@ fn apply_file(
         source,
         sources,
     );
+    set(
+        &mut config.output.debug_trace,
+        &file.output.debug_trace,
+        "output.debug_trace",
+        source,
+        sources,
+    );
+    set(
+        &mut config.ui.render_mode,
+        &file.ui.render_mode,
+        "ui.render_mode",
+        source,
+        sources,
+    );
 }
 
 fn validate_project_trust(
@@ -435,6 +468,11 @@ fn env_file(provider: &str) -> FileConfig {
             no_stream: value("XDUDU_NO_STREAM", "XYCLI_NO_STREAM")
                 .and_then(|value| value.parse().ok()),
             color: env::var("NO_COLOR").ok().map(|_| false),
+            debug_trace: value("XDUDU_DEBUG_TRACE", "XYCLI_DEBUG_TRACE")
+                .and_then(|value| value.parse().ok()),
+        },
+        ui: FileUi {
+            render_mode: value("XDUDU_UI_RENDER_MODE", "XYCLI_UI_RENDER_MODE"),
         },
     }
 }
@@ -476,6 +514,14 @@ fn validate(config: &mut AppConfig, model_was_explicit: bool) -> XduduResult<()>
     }
     config.agent.permission.parse::<PermissionMode>()?;
     config.agent.approval.parse::<ApprovalMode>()?;
+    if !matches!(
+        config.ui.render_mode.as_str(),
+        "classic" | "fullscreen" | "plain"
+    ) {
+        return Err(config_error(
+            "ui.render_mode 只能是 classic、fullscreen 或 plain。",
+        ));
+    }
     if let Some(base_url) = &config.provider.base_url
         && !(base_url.starts_with("https://")
             || base_url.starts_with("http://127.0.0.1")
@@ -535,6 +581,10 @@ fn load_config_from_paths(
             json: false,
             no_stream: false,
             color: env::var_os("NO_COLOR").is_none(),
+            debug_trace: false,
+        },
+        ui: UiConfig {
+            render_mode: "classic".into(),
         },
     };
     let mut sources = [
@@ -551,6 +601,8 @@ fn load_config_from_paths(
         ("output.json", ConfigSource::Default),
         ("output.no_stream", ConfigSource::Default),
         ("output.color", ConfigSource::Default),
+        ("output.debug_trace", ConfigSource::Default),
+        ("ui.render_mode", ConfigSource::Default),
     ]
     .into_iter()
     .map(|(key, source)| (key.to_owned(), source))
@@ -592,6 +644,10 @@ fn load_config_from_paths(
             json: overrides.json,
             no_stream: overrides.no_stream,
             color: overrides.color,
+            debug_trace: overrides.debug_trace,
+        },
+        ui: FileUi {
+            render_mode: overrides.render_mode,
         },
     };
     apply_file(&mut config, &cli, ConfigSource::Cli, &mut sources);
@@ -663,6 +719,8 @@ pub fn write_config_value(
                 | "output.json"
                 | "output.no_stream"
                 | "output.color"
+                | "output.debug_trace"
+                | "ui.render_mode"
         )
     {
         return Err(config_error(format!("不支持的配置项：{key}")));
@@ -688,6 +746,11 @@ pub fn write_config_value(
         }
         "agent.approval" => {
             raw_value.parse::<ApprovalMode>()?;
+        }
+        "ui.render_mode" if !matches!(raw_value, "classic" | "fullscreen" | "plain") => {
+            return Err(config_error(
+                "ui.render_mode 只能是 classic、fullscreen 或 plain。",
+            ));
         }
         _ => {}
     }
@@ -770,6 +833,24 @@ mod tests {
         .unwrap();
         assert_eq!(resolved.config.provider.name, "deepseek");
         assert_eq!(resolved.config.provider.model, DEFAULT_DEEPSEEK_MODEL);
+        assert!(!resolved.config.output.debug_trace);
+        assert_eq!(resolved.config.ui.render_mode, "classic");
+    }
+
+    #[test]
+    fn 终端渲染模式可配置且拒绝未知值() {
+        let root = tempdir().unwrap();
+        write_config_value(root.path(), false, "ui.render_mode", "fullscreen").unwrap();
+        let resolved = load_config_from_paths(
+            root.path(),
+            root.path().join("missing-user.toml"),
+            root.path().join(".xdudu/config.toml"),
+            ConfigOverrides::default(),
+            Some(FileConfig::default()),
+        )
+        .unwrap();
+        assert_eq!(resolved.config.ui.render_mode, "fullscreen");
+        assert!(write_config_value(root.path(), false, "ui.render_mode", "unknown").is_err());
     }
 
     #[test]
@@ -828,6 +909,9 @@ mod tests {
         write_config_value(root.path(), false, "agent.max_turns", "30").unwrap();
         let resolved = load_config(root.path(), ConfigOverrides::default()).unwrap();
         assert_eq!(resolved.config.agent.max_turns, 30);
+        write_config_value(root.path(), false, "output.debug_trace", "true").unwrap();
+        let resolved = load_config(root.path(), ConfigOverrides::default()).unwrap();
+        assert!(resolved.config.output.debug_trace);
         assert!(write_config_value(root.path(), false, "api_key", "secret").is_err());
     }
 

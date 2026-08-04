@@ -1,12 +1,12 @@
 # XDUDU 系统架构
 
-> 当前基线：Rust-only v0.7.0。旧 TypeScript 实现已退役，可通过 Git 历史审计。
+> 当前基线：Rust-only v0.8.0 开发分支。旧 TypeScript 实现已退役，可通过 Git 历史审计。
 
 ## 1. 系统定位
 
 XDUDU 是运行在开发者本机终端中的 AI 编程 Agent。它接收自然语言任务，通过模型推理、受控工具调用和本地会话持久化完成编码工作，不是常驻 Web 服务。
 
-当前外部边界包括模型 API、受限公网 HTTPS、系统凭据库、当前工作区文件系统和本地可执行程序。MCP 和插件属于后续里程碑。
+当前外部边界包括模型 API、受限公网 HTTPS、系统凭据库、当前工作区文件系统、本地可执行程序、stdio MCP 和 Streamable HTTP MCP。声明式插件只能组合 MCP Server，不能把动态代码加载进 XDUDU 进程。
 
 ## 2. Rust 工作区
 
@@ -34,6 +34,8 @@ Cargo workspace
     │   ├── stream.rs    流事件、Sink 和 SSE 解码
     │   └── retry.rs     安全重试、退避和请求节流
     ├── permission.rs    显式权限矩阵
+    ├── mcp.rs           stdio/Streamable HTTP MCP、生命周期与工具适配
+    ├── plugin.rs        声明式插件清单、加载与校验
     ├── tools/           注册中心、九个内置工具及路径策略
     ├── session.rs       会话领域模型与兼容 JSON 读取
     ├── sqlite_session.rs SQLite、迁移、恢复与工作区锁

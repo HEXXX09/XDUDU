@@ -4,7 +4,7 @@ XDUDU 是一个使用 Rust 实现的终端 AI 编程助手。它把自然语言�
 
 ## 当前状态
 
-当前版本为 Rust-only 的 `v0.7.0`：
+当前代码为 Rust-only 的 `v0.8.0` 开发版本：
 
 - DeepSeek Chat Completions API 为当前主用 Provider，保留已验证的 Anthropic 适配；
 - 支持文本和工具调用的 SSE 流式响应；
@@ -15,7 +15,7 @@ XDUDU 是一个使用 Rust 实现的终端 AI 编程助手。它把自然语言�
 - 工作区路径隔离、符号链接逃逸防御和无 shell 命令执行；
 - CLI、环境变量、项目文件、用户文件和默认值组成的分层配置；
 - 环境变量或操作系统凭据库保存 API Key，普通配置文件拒绝明文密钥；
-- Claude 风格的经典滚动终端作为默认界面，并保留 Hermes 风格全屏 TUI：终端 Markdown、实时工具活动、上下文内审批和 Composer；
+- 真实交互终端自动使用 Claude 风格的完整界面：XDUDU 启动标识、消息时间线、实时工具活动、上下文内审批、固定 Composer 和终端 Markdown；非 TTY 自动使用顺序文本；
 - 统一 Agent 事件、终端流式渲染、JSON Lines 和无颜色输出；
 - Provider 指数退避、抖动、`Retry-After`、请求节流和取消；
 - `auth`、`config`、`doctor` 命令；
@@ -28,6 +28,8 @@ XDUDU 是一个使用 Rust 实现的终端 AI 编程助手。它把自然语言�
 - `session list/show/resume` 会话查询与恢复命令；
 - 长会话 Token 预算、上下文压缩和关键计划保留；
 - 结构化 Plan 生成、整份审批、自然语言修订、串行 DAG 执行、暂停恢复与并发保护；
+- stdio 与 Streamable HTTP MCP，外部工具统一进入权限、审批、超时、取消、脱敏和审计链；
+- 只声明 MCP Server 的隔离插件清单，以及 `mcp`、`plugin` 管理和诊断命令；
 - 密钥、Bearer Token、私钥和敏感结构字段的统一输出及会话脱敏；
 - macOS、Linux、Windows CI 与多平台 Release 归档工作流。
 
@@ -87,7 +89,35 @@ Anthropic 对应 `anthropic` 和 `ANTHROPIC_API_KEY`：
 真实交互终端中自动启用带 XDUDU 图标、状态栏、消息时间线和固定输入区的完整界面。管道、重定向、CI 和 `TERM=dumb` 会自动降级为无光标控制的顺序文本，用户无需选择渲染模式。
 输入支持左右移动、Home/End、Ctrl+A/E、Ctrl+U/K/W、上下浏览本会话历史、
 Ctrl+C 清空当前输入和空行 Ctrl+D 退出。历史仅保存在当前进程内，不会把输入写入额外的历史文件。
-交互命令包括 `/help`、`/new`、`/resume`、`/plan <目标>`、`/model [name]`、`/transcript`、`/copy`、`/export`、`/rename`、`/turns <n>` 和 `/exit`。交互界面支持运行中输入并排队、Shift+Enter/Ctrl+J 多行输入、Ctrl+R 历史检索、`/` 命令候选和 `@` 工作区文件候选。DeepSeek 当前提供 `deepseek-v4-flash` 和 `deepseek-v4-pro`。
+交互命令包括 `/help`、`/new`、`/resume`、`/plan <目标>`、`/model [name]`、`/mcp`、`/plugins`、`/transcript`、`/copy`、`/export`、`/rename`、`/turns <n>` 和 `/exit`。交互界面支持 Shift+Enter/Ctrl+J 多行输入、Ctrl+R 历史检索、`/` 命令候选和 `@` 工作区文件候选。DeepSeek 当前提供 `deepseek-v4-flash` 和 `deepseek-v4-pro`。
+
+## MCP 与插件
+
+XDUDU 支持本地 stdio 和远程 Streamable HTTP MCP。远程地址默认必须使用 HTTPS；`localhost` 和回环地址允许使用 HTTP 进行开发测试。外部工具不会绕过 XDUDU，仍需满足当前权限模式并经过审批。
+
+```bash
+# 本地 stdio Server（command 和 args 直接执行，不经过 shell）
+xdudu mcp add-stdio filesystem npx -y @modelcontextprotocol/server-filesystem /你的工作区
+
+# 远程 Streamable HTTP Server；Token 存入系统凭据，不进入配置文件
+xdudu mcp add-http team https://mcp.example.com/mcp --auth
+xdudu mcp login team
+
+xdudu mcp list
+xdudu mcp doctor team
+xdudu mcp disable team
+```
+
+声明式插件位于 `~/.config/xdudu/plugins/*.toml`，只能声明 MCP Server，不能加载动态库或进程内 Python/Rust 代码：
+
+```bash
+xdudu plugin list
+xdudu plugin show team-tools
+xdudu plugin enable team-tools
+xdudu plugin doctor team-tools
+```
+
+Python 扩展可以实现为独立 stdio/HTTP MCP Server，由 XDUDU 隔离启动或连接。完整协议与安全边界见 `docs/M8_MCP_PLUGIN_DESIGN.md`。
 
 ## 安装为全局命令
 

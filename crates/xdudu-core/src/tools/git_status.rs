@@ -109,8 +109,10 @@ fn parse_entries(bytes: &[u8]) -> (Vec<Value>, bool) {
 impl Tool for GitStatusTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
-            name: "git_status",
-            description: "返回工作区 Git 分支、ahead/behind 以及暂存、修改、删除和未跟踪文件的结构化状态。",
+            name: "git_status".into(),
+            description:
+                "返回工作区 Git 分支、ahead/behind 以及暂存、修改、删除和未跟踪文件的结构化状态。"
+                    .into(),
             input_schema: json!({
                 "type":"object",
                 "properties":{},

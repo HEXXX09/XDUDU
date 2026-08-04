@@ -84,8 +84,8 @@ mod tests {
 
     fn definition(name: &'static str, description: &'static str) -> ToolDefinition {
         ToolDefinition {
-            name,
-            description,
+            name: name.into(),
+            description: description.into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {

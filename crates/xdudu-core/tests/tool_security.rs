@@ -55,7 +55,10 @@ fn 内置工具定义完整() {
     let definitions = registry().definitions();
     assert_eq!(definitions.len(), 9);
     assert_eq!(
-        definitions.iter().map(|item| item.name).collect::<Vec<_>>(),
+        definitions
+            .iter()
+            .map(|item| item.name.as_str())
+            .collect::<Vec<_>>(),
         [
             "apply_patch",
             "file_read",

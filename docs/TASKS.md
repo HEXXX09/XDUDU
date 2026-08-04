@@ -1,7 +1,7 @@
 # XDUDU 任务路线图
 
-> 当前技术基线：Rust-only v0.7.0。
-> 状态更新时间：2026-07-31。
+> 当前技术基线：Rust-only v0.8.0 开发分支。
+> 状态更新时间：2026-08-04。
 
 ## 规划调整
 
@@ -24,7 +24,7 @@
 | M5 | SQLite、恢复与上下文管理 | 已完成 |
 | M6 | 搜索、补丁、Git 与受限 Web | 功能完成，Windows CI 修复待推送复验 |
 | M7 | Plan 模式与任务执行 | 已完成 |
-| M8 | MCP 与插件 | 待开始 |
+| M8 | MCP 与插件 | 功能完成，待最终跨平台验收 |
 | M9 | 自定义指令、记忆与可选 RAG | 待评审 |
 | M10 | 1.0 发布、诊断与兼容性 | 待开始 |
 
@@ -122,19 +122,19 @@ M2 已由 `main` 的 macOS、Linux 和 Windows CI 矩阵确认。
 - [x] M7-T03：实现整份 Plan 审批、拒绝、自然语言修订、revision 快照、乐观并发保护与最小 TUI 审阅；
 - [x] M7-T04：实现串行 DAG 执行、`complete_step` 证据协议、原子检查点、暂停/重试/取消和崩溃恢复；
 - [x] M7-T05：实现 `/plan` TUI 恢复流程和 `xdudu plan` 非交互 CLI；
-- [x] M7-T06：交互终端自动使用原生滚动历史，增加异步输入队列、上下文内审批、统一 Markdown、多行 Composer 与会话体验收口；
+- [x] M7-T06：交互终端自动使用完整 TUI，增加上下文内审批、统一 Markdown、多行 Composer 与会话体验收口；
 - [x] M7-T06：完成生成、修改、拒绝、执行、暂停和恢复测试，并发布 v0.7.0。
 - [x] M7-T07：建立“无原始思维链”的公开输出边界，默认展示计划/工具/进度/结果/证据，并提供脱敏结构化 `--debug-trace`。
 
 ## M8：MCP 与插件
 
-- [ ] M8-T01：实现 MCP stdio 客户端；
-- [ ] M8-T02：实现 MCP Server 配置和生命周期；
-- [ ] M8-T03：实现插件清单 Schema、签名信息和校验；
-- [ ] M8-T04：通过统一 ToolRegistry 加载外部工具；
-- [ ] M8-T05：把 MCP/插件权限映射到 Policy Engine；
-- [ ] M8-T06：实现 plugin list/enable/disable；
-- [ ] M8-T07：完成恶意清单、越权、超时和取消 E2E。
+- [x] M8-T01：实现 MCP stdio 与 Streamable HTTP 客户端；
+- [x] M8-T02：实现 MCP Server 配置、初始化、工具发现、调用、超时和取消；
+- [x] M8-T03：实现仅声明 MCP Server 的插件清单 Schema、签名元数据和严格校验；
+- [x] M8-T04：通过统一 ToolRegistry 动态加载并命名空间化外部工具；
+- [x] M8-T05：把 MCP/插件映射到现有权限、审批、脱敏和审计链；
+- [x] M8-T06：实现 mcp/plugin list、show、enable、disable、凭据和 doctor 命令；
+- [ ] M8-T07：完成 stdio/HTTP 恶意输入、越权、超时、取消 E2E 和三平台 CI。
 
 ## M9：自定义指令、记忆与可选 RAG
 

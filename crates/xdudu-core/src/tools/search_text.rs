@@ -264,8 +264,10 @@ fn run_search(
 impl Tool for SearchTextTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
-            name: "search_text",
-            description: "在工作区内搜索文本或正则表达式，遵守忽略规则并返回有界的行号、列号和上下文。",
+            name: "search_text".into(),
+            description:
+                "在工作区内搜索文本或正则表达式，遵守忽略规则并返回有界的行号、列号和上下文。"
+                    .into(),
             input_schema: json!({
                 "type":"object",
                 "properties":{

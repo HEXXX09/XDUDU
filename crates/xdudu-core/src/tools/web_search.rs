@@ -103,8 +103,8 @@ fn parse_results(html: &[u8], max_results: usize) -> Vec<SearchResult> {
 impl Tool for WebSearchTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
-            name: "web_search",
-            description: "搜索公开互联网并返回标题、HTTPS 链接和摘要；适用于通用知识、查询、研究和时效性问题。",
+            name: "web_search".into(),
+            description: "搜索公开互联网并返回标题、HTTPS 链接和摘要；适用于通用知识、查询、研究和时效性问题。".into(),
             input_schema: json!({
                 "type":"object",
                 "properties":{

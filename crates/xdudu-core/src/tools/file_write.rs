@@ -127,8 +127,8 @@ async fn write_image(path: &Path, image: Option<&[u8]>, _mode: Option<u32>) -> s
 impl Tool for FileWriteTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
-            name: "file_write",
-            description: "创建或覆盖工作区内文件，返回前后哈希和 unified diff。建议先读取文件并提供 expectedSha256。",
+            name: "file_write".into(),
+            description: "创建或覆盖工作区内文件，返回前后哈希和 unified diff。建议先读取文件并提供 expectedSha256。".into(),
             input_schema: json!({
                 "type":"object",
                 "properties":{

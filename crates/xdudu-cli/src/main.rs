@@ -1,7 +1,6 @@
 //! XDUDU Rust 命令行入口。
 
 mod approval_prompt;
-mod classic_tui;
 mod doctor;
 mod input_editor;
 mod markdown;
@@ -11,7 +10,7 @@ mod ui;
 
 use std::io::Write as _;
 use std::{
-    collections::{BTreeSet, VecDeque},
+    collections::BTreeSet,
     env,
     io::{self, IsTerminal},
     path::PathBuf,
@@ -28,16 +27,18 @@ use xdudu_core::{
     AgentLoopState, AgentRunConfig, AgentRunResult, AllowAllApprovalGate, ApprovalDecision,
     ApprovalGate, ApprovalMode, ApprovalRequest, ApprovalRule, ApprovalScope, ConfigOverrides,
     DefaultProviderFactory, DenyAllApprovalGate, EventSink, JsonApprovalRuleStore,
-    JsonChangeLedger, KeyringSecretStore, PermissionMode, Plan, PlanExecutorConfig,
-    PlanGenerationConfig, PlanRevisionConfig, PlanStatus, PlanStore, Provider, ProviderFactory,
+    JsonChangeLedger, KeyringSecretStore, McpConfigFile, McpServerConfig, McpServerRuntime,
+    McpTransportKind, PermissionMode, Plan, PlanExecutorConfig, PlanGenerationConfig,
+    PlanRevisionConfig, PlanStatus, PlanStore, PluginManifest, Provider, ProviderFactory,
     ResolvedConfig, SecretSource, SecretStore, SecretString, Session, SessionStatus, SessionStore,
     SqliteSessionStore, ToolRegistry, WorkspaceLock, XduduError, approval_rules_path, approve_plan,
-    config_paths, generate_plan, load_config, redact_text, register_builtins, reject_plan,
-    resolve_secret, revise_plan, run_agent, run_plan, submit_plan_for_review, write_config_value,
+    config_paths, generate_plan, load_config, load_mcp_config, load_plugin_manifests,
+    mcp_config_path, plugin_directory, redact_text, register_builtins,
+    register_configured_mcp_tools, reject_plan, resolve_secret, revise_plan, run_agent, run_plan,
+    save_mcp_config, save_plugin_manifest, submit_plan_for_review, write_config_value,
 };
 
 use crate::approval_prompt::{ApprovalMenuChoice, format_approval_prompt, read_approval_menu};
-use crate::classic_tui::{ApprovalBroker, ChannelEventSink, drive_turn};
 use crate::doctor::run_doctor;
 use crate::input_editor::{InputEditor, ReadResult};
 use crate::renderer::ConsoleRenderer;
@@ -137,6 +138,65 @@ enum Command {
         #[command(subcommand)]
         command: PlanCommand,
     },
+    /// 管理 Model Context Protocol 服务器。
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommand,
+    },
+    /// 管理只声明 MCP Server 的隔离插件。
+    Plugin {
+        #[command(subcommand)]
+        command: PluginCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum PluginCommand {
+    /// 列出本地插件清单。
+    List,
+    /// 显示插件的脱敏清单。
+    Show { id: String },
+    /// 启用插件。
+    Enable { id: String },
+    /// 禁用插件。
+    Disable { id: String },
+    /// 校验插件并连接其中的 MCP Server。
+    Doctor { id: Option<String> },
+}
+
+#[derive(Debug, Subcommand)]
+enum McpCommand {
+    /// 列出已配置的 MCP Server。
+    List,
+    /// 显示一个 MCP Server 的脱敏配置。
+    Show { name: String },
+    /// 添加本地 stdio MCP Server；额外参数直接放在命令之后。
+    AddStdio {
+        name: String,
+        command: String,
+        #[arg(trailing_var_arg = true)]
+        args: Vec<String>,
+    },
+    /// 添加 Streamable HTTP MCP Server。
+    AddHttp {
+        name: String,
+        url: String,
+        /// 使用系统凭据 mcp:<name> 作为 Bearer Token。
+        #[arg(long)]
+        auth: bool,
+    },
+    /// 启用 MCP Server。
+    Enable { name: String },
+    /// 禁用 MCP Server。
+    Disable { name: String },
+    /// 删除 MCP Server 配置（不会删除系统凭据）。
+    Remove { name: String },
+    /// 把远程 MCP Bearer Token 保存到系统凭据。
+    Login { name: String },
+    /// 删除远程 MCP Bearer Token。
+    Logout { name: String },
+    /// 启动并检查 Server、协议和工具列表。
+    Doctor { name: Option<String> },
 }
 
 #[derive(Debug, Args)]
@@ -261,7 +321,7 @@ struct Runtime {
     stream: bool,
     color: bool,
     debug_trace: bool,
-    approval_broker: Option<Arc<ApprovalBroker>>,
+    startup_notices: Vec<String>,
 }
 
 fn overrides(cli: &Cli) -> ConfigOverrides {
@@ -276,7 +336,6 @@ fn overrides(cli: &Cli) -> ConfigOverrides {
         no_stream: cli.no_stream.then_some(true),
         color: cli.no_color.then_some(false),
         debug_trace: cli.debug_trace.then_some(true),
-        render_mode: None,
     }
 }
 
@@ -296,7 +355,6 @@ struct ConsoleApprovalGate {
     theme: TerminalTheme,
     session_rules: tokio::sync::Mutex<BTreeSet<(Uuid, ApprovalRule)>>,
     persistent_rules: JsonApprovalRuleStore,
-    broker: Option<Arc<ApprovalBroker>>,
 }
 
 impl ConsoleApprovalGate {
@@ -305,7 +363,6 @@ impl ConsoleApprovalGate {
         persistent_rules: JsonApprovalRuleStore,
         theme: TerminalTheme,
         fullscreen: bool,
-        broker: Option<Arc<ApprovalBroker>>,
     ) -> Self {
         Self {
             can_prompt,
@@ -313,7 +370,6 @@ impl ConsoleApprovalGate {
             theme,
             session_rules: tokio::sync::Mutex::new(BTreeSet::new()),
             persistent_rules,
-            broker,
         }
     }
 }
@@ -342,24 +398,17 @@ impl ApprovalGate for ConsoleApprovalGate {
         if !self.can_prompt {
             return ApprovalDecision::deny("当前运行方式无法交互审批，且没有匹配的永久审批规则。");
         }
-        let mut choice = if let Some(broker) = &self.broker {
-            broker.request(request.clone()).await
-        } else {
-            None
+        let theme = self.theme;
+        let fullscreen = self.fullscreen;
+        let prompt = format_approval_prompt(theme, request);
+        let choice = match tokio::task::spawn_blocking(move || {
+            read_approval_menu(theme, &prompt, fullscreen)
+        })
+        .await
+        {
+            Ok(Ok(choice)) => Some(choice),
+            _ => None,
         };
-        if choice.is_none() {
-            let theme = self.theme;
-            let fullscreen = self.fullscreen;
-            let prompt = format_approval_prompt(theme, request);
-            choice = match tokio::task::spawn_blocking(move || {
-                read_approval_menu(theme, &prompt, fullscreen)
-            })
-            .await
-            {
-                Ok(Ok(choice)) => Some(choice),
-                _ => None,
-            };
-        }
         match choice {
             Some(ApprovalMenuChoice::Once) => {
                 ApprovalDecision::approve_with_scope("用户批准当前工具调用。", ApprovalScope::Once)
@@ -407,7 +456,6 @@ async fn create_runtime(
         && io::stdin().is_terminal()
         && io::stdout().is_terminal()
         && env::var("TERM").is_ok_and(|term| term != "dumb");
-    let approval_broker = None;
     let approval_gate: Arc<dyn ApprovalGate> = match approval_mode {
         ApprovalMode::Always => Arc::new(AllowAllApprovalGate),
         ApprovalMode::Never => Arc::new(DenyAllApprovalGate),
@@ -416,11 +464,11 @@ async fn create_runtime(
             JsonApprovalRuleStore::open(approval_rules_path()?).await?,
             theme,
             rich_terminal,
-            approval_broker.clone(),
         )),
     };
     let mut registry = ToolRegistry::with_runtime(approval_gate, change_ledger);
     register_builtins(&mut registry)?;
+    let mcp = register_configured_mcp_tools(&mut registry).await?;
     Ok(Runtime {
         provider,
         provider_display: provider_label(&resolved.config.provider.name),
@@ -440,7 +488,7 @@ async fn create_runtime(
         stream: !resolved.config.output.no_stream,
         color,
         debug_trace: resolved.config.output.debug_trace,
-        approval_broker,
+        startup_notices: mcp.failures,
     })
 }
 
@@ -507,23 +555,6 @@ async fn execute_prompt_with_cancellation(
     .await
 }
 
-async fn execute_classic_prompt(
-    runtime: &Runtime,
-    prompt: String,
-    session_id: Option<Uuid>,
-) -> Result<classic_tui::ClassicTurnOutcome, XduduError> {
-    let cancellation = CancellationToken::new();
-    let (sink, events) = ChannelEventSink::channel();
-    let approvals = if let Some(broker) = &runtime.approval_broker {
-        broker.attach()
-    } else {
-        ApprovalBroker::default().attach()
-    };
-    let run =
-        execute_prompt_with_cancellation(runtime, prompt, session_id, &sink, cancellation.clone());
-    drive_turn(run, events, approvals, cancellation, runtime.color).await
-}
-
 fn print_banner(runtime: &Runtime, interactive: bool) {
     if !interactive {
         println!(
@@ -582,6 +613,10 @@ async fn tui_interactive_loop(
     let renderer = app.renderer();
     let mut session_id = initial_session;
 
+    for notice in &runtime.startup_notices {
+        app.notice(notice).map_err(XduduError::from)?;
+    }
+
     if let Some(id) = session_id {
         let session = session_for_resume(&runtime, id).await?;
         app.load_session(&session).map_err(XduduError::from)?;
@@ -620,7 +655,7 @@ async fn tui_interactive_loop(
                     "/exit" | "/quit" | "/q" => break,
                     "/help" | "/h" => {
                         app.notice(
-                            "/new  新会话  ·  /resume  恢复会话  ·  /plan  生成/审阅计划  ·  /model  选择模型  ·  /turns N  最大循环次数  ·  /exit  退出",
+                            "/new  新会话  ·  /resume  恢复会话  ·  /plan  生成/审阅计划  ·  /model  选择模型  ·  /mcp  外部工具  ·  /plugins  插件  ·  /turns N  最大循环次数  ·  /exit  退出",
                         )
                         .map_err(XduduError::from)?;
                     }
@@ -649,6 +684,64 @@ async fn tui_interactive_loop(
                             ))
                             .map_err(XduduError::from)?;
                         }
+                    }
+                    "/mcp" => {
+                        let config = load_mcp_config()?;
+                        let external_tools = runtime
+                            .registry
+                            .definitions()
+                            .into_iter()
+                            .filter(|definition| definition.name.starts_with("mcp__"))
+                            .count();
+                        let servers = if config.servers.is_empty() {
+                            "尚未配置 Server".to_owned()
+                        } else {
+                            config
+                                .servers
+                                .iter()
+                                .map(|server| {
+                                    format!(
+                                        "{} [{}]",
+                                        server.name,
+                                        if server.enabled {
+                                            "enabled"
+                                        } else {
+                                            "disabled"
+                                        }
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join("、")
+                        };
+                        app.notice(format!(
+                            "MCP：{servers}\n已加载外部工具：{external_tools}\n管理命令：xdudu mcp --help"
+                        ))
+                        .map_err(XduduError::from)?;
+                    }
+                    "/plugins" => {
+                        let plugins = load_plugin_manifests()?;
+                        let summary = if plugins.is_empty() {
+                            "尚未安装插件".to_owned()
+                        } else {
+                            plugins
+                                .iter()
+                                .map(|plugin| {
+                                    format!(
+                                        "{} [{}] · {} MCP servers",
+                                        plugin.id,
+                                        if plugin.enabled {
+                                            "enabled"
+                                        } else {
+                                            "disabled"
+                                        },
+                                        plugin.mcp_servers.len()
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        };
+                        app.notice(format!("插件：\n{summary}\n管理命令：xdudu plugin --help"))
+                            .map_err(XduduError::from)?;
                     }
                     "/resume" => {
                         let sessions = runtime.store.list(20).await?;
@@ -1479,19 +1572,13 @@ async fn plain_interactive_loop(
         runtime.permission_mode.as_str(),
         runtime.cwd.display()
     );
+    for notice in &runtime.startup_notices {
+        eprintln!("  警告：{notice}");
+    }
     if let Some(prompt) = initial_prompt {
-        let mut pending = VecDeque::from([prompt]);
-        while let Some(prompt) = pending.pop_front() {
-            if interactive_terminal() {
-                let outcome = execute_classic_prompt(&runtime, prompt, session_id).await?;
-                session_id = Some(outcome.result.session_id);
-                pending.extend(outcome.queued);
-            } else {
-                let result = execute_prompt(&runtime, prompt, session_id).await?;
-                runtime.renderer.finish_run(&result)?;
-                session_id = Some(result.session_id);
-            }
-        }
+        let result = execute_prompt(&runtime, prompt, session_id).await?;
+        runtime.renderer.finish_run(&result)?;
+        session_id = Some(result.session_id);
     }
 
     loop {
@@ -1577,6 +1664,46 @@ async fn plain_interactive_loop(
             }
             "/compact" => {
                 println!("  XDUDU 会在上下文接近上限时自动压缩；手动压缩协议尚未开放。");
+                continue;
+            }
+            "/mcp" => {
+                let config = load_mcp_config()?;
+                if config.servers.is_empty() {
+                    println!("  尚未配置 MCP Server。使用 xdudu mcp --help 查看管理命令。");
+                } else {
+                    for server in config.servers {
+                        println!(
+                            "  {} · {} · {:?}",
+                            server.name,
+                            if server.enabled {
+                                "enabled"
+                            } else {
+                                "disabled"
+                            },
+                            server.transport
+                        );
+                    }
+                }
+                continue;
+            }
+            "/plugins" => {
+                let plugins = load_plugin_manifests()?;
+                if plugins.is_empty() {
+                    println!("  尚未安装插件。使用 xdudu plugin --help 查看管理命令。");
+                } else {
+                    for plugin in plugins {
+                        println!(
+                            "  {} · {} · {} MCP servers",
+                            plugin.id,
+                            if plugin.enabled {
+                                "enabled"
+                            } else {
+                                "disabled"
+                            },
+                            plugin.mcp_servers.len()
+                        );
+                    }
+                }
                 continue;
             }
             "/model" => {
@@ -1856,18 +1983,9 @@ async fn plain_interactive_loop(
             }
             continue;
         }
-        let mut pending = VecDeque::from([input.to_owned()]);
-        while let Some(prompt) = pending.pop_front() {
-            if interactive_terminal() {
-                let outcome = execute_classic_prompt(&runtime, prompt, session_id).await?;
-                session_id = Some(outcome.result.session_id);
-                pending.extend(outcome.queued);
-            } else {
-                let result = execute_prompt(&runtime, prompt, session_id).await?;
-                runtime.renderer.finish_run(&result)?;
-                session_id = Some(result.session_id);
-            }
-        }
+        let result = execute_prompt(&runtime, input.to_owned(), session_id).await?;
+        runtime.renderer.finish_run(&result)?;
+        session_id = Some(result.session_id);
     }
     Ok(0)
 }
@@ -2088,6 +2206,317 @@ async fn handle_approval(command: ApprovalCommand) -> Result<u8, XduduError> {
         }
     }
     Ok(0)
+}
+
+async fn handle_mcp(command: McpCommand) -> Result<u8, XduduError> {
+    let mut config = load_mcp_config()?;
+    match command {
+        McpCommand::List => {
+            if config.servers.is_empty() {
+                println!(
+                    "尚未配置 MCP Server。配置文件：{}",
+                    mcp_config_path()?.display()
+                );
+            } else {
+                for server in &config.servers {
+                    let endpoint = match server.transport {
+                        McpTransportKind::Stdio => server.command.as_deref().unwrap_or_default(),
+                        McpTransportKind::StreamableHttp => {
+                            server.url.as_deref().unwrap_or_default()
+                        }
+                    };
+                    println!(
+                        "{}\t{}\t{}\t{}",
+                        server.name,
+                        if server.enabled {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        },
+                        match server.transport {
+                            McpTransportKind::Stdio => "stdio",
+                            McpTransportKind::StreamableHttp => "streamable-http",
+                        },
+                        endpoint
+                    );
+                }
+            }
+        }
+        McpCommand::Show { name } => {
+            let server = find_mcp_server(&config, &name)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "name":server.name,
+                    "enabled":server.enabled,
+                    "transport":server.transport,
+                    "command":server.command,
+                    "args":server.args,
+                    "environmentKeys":server.env.keys().collect::<Vec<_>>(),
+                    "url":server.url,
+                    "credential":server.credential.as_ref().map(|_| "[系统凭据]"),
+                    "timeoutSeconds":server.timeout_seconds,
+                }))?
+            );
+        }
+        McpCommand::AddStdio {
+            name,
+            command,
+            args,
+        } => {
+            ensure_new_mcp_name(&config, &name)?;
+            config.servers.push(McpServerConfig {
+                name: name.clone(),
+                enabled: true,
+                transport: McpTransportKind::Stdio,
+                command: Some(command),
+                args,
+                env: Default::default(),
+                url: None,
+                credential: None,
+                timeout_seconds: 30,
+            });
+            let path = save_mcp_config(&config)?;
+            println!(
+                "已添加并启用 stdio MCP Server：{name}\n配置：{}",
+                path.display()
+            );
+        }
+        McpCommand::AddHttp { name, url, auth } => {
+            ensure_new_mcp_name(&config, &name)?;
+            config.servers.push(McpServerConfig {
+                name: name.clone(),
+                enabled: true,
+                transport: McpTransportKind::StreamableHttp,
+                command: None,
+                args: Vec::new(),
+                env: Default::default(),
+                url: Some(url),
+                credential: auth.then(|| name.clone()),
+                timeout_seconds: 30,
+            });
+            let path = save_mcp_config(&config)?;
+            println!("已添加并启用 Streamable HTTP MCP Server：{name}");
+            if auth {
+                println!("请继续运行：xdudu mcp login {name}");
+            }
+            println!("配置：{}", path.display());
+        }
+        McpCommand::Enable { name } => {
+            let server = find_mcp_server_mut(&mut config, &name)?;
+            server.enabled = true;
+            save_mcp_config(&config)?;
+            println!("MCP Server {name} 已启用。");
+        }
+        McpCommand::Disable { name } => {
+            let server = find_mcp_server_mut(&mut config, &name)?;
+            server.enabled = false;
+            save_mcp_config(&config)?;
+            println!("MCP Server {name} 已禁用。");
+        }
+        McpCommand::Remove { name } => {
+            let before = config.servers.len();
+            config.servers.retain(|server| server.name != name);
+            if config.servers.len() == before {
+                return Err(XduduError::validation(format!("找不到 MCP Server：{name}")));
+            }
+            save_mcp_config(&config)?;
+            println!("已删除 MCP Server 配置：{name}");
+        }
+        McpCommand::Login { name } => {
+            let server = find_mcp_server(&config, &name)?;
+            if server.transport != McpTransportKind::StreamableHttp {
+                return Err(XduduError::validation("只有 HTTP MCP 使用 Bearer Token。"));
+            }
+            let account = server
+                .credential_account()
+                .ok_or_else(|| XduduError::validation("该 Server 未启用认证引用。"))?;
+            let token = rpassword::prompt_password(format!("请输入 {name} 的 Bearer Token："))?;
+            KeyringSecretStore
+                .set(&account, SecretString::new(token)?)
+                .await?;
+            println!("已保存到系统凭据：{account}");
+        }
+        McpCommand::Logout { name } => {
+            let account = format!("mcp:{name}");
+            let removed = KeyringSecretStore.delete(&account).await?;
+            println!(
+                "{}",
+                if removed {
+                    format!("已删除系统凭据：{account}")
+                } else {
+                    format!("系统凭据不存在：{account}")
+                }
+            );
+        }
+        McpCommand::Doctor { name } => {
+            let selected = config
+                .servers
+                .iter()
+                .filter(|server| name.as_ref().is_none_or(|value| &server.name == value))
+                .cloned()
+                .collect::<Vec<_>>();
+            if selected.is_empty() {
+                return Err(XduduError::validation("没有匹配的 MCP Server。"));
+            }
+            let store = KeyringSecretStore;
+            for server in selected {
+                if !server.enabled {
+                    println!("{}\tdisabled", server.name);
+                    continue;
+                }
+                let runtime = McpServerRuntime::new(server.clone(), &store).await?;
+                let tools = runtime.list_tools(CancellationToken::new()).await?;
+                println!("{}\tok\t{} tools", server.name, tools.len());
+            }
+        }
+    }
+    Ok(0)
+}
+
+async fn handle_plugin(command: PluginCommand) -> Result<u8, XduduError> {
+    let mut manifests = load_plugin_manifests()?;
+    match command {
+        PluginCommand::List => {
+            if manifests.is_empty() {
+                println!("尚未安装插件。目录：{}", plugin_directory()?.display());
+            } else {
+                for plugin in manifests {
+                    println!(
+                        "{}\t{}\t{}\t{} MCP servers",
+                        plugin.id,
+                        if plugin.enabled {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        },
+                        plugin.version,
+                        plugin.mcp_servers.len()
+                    );
+                }
+            }
+        }
+        PluginCommand::Show { id } => {
+            let plugin = find_plugin(&manifests, &id)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "schemaVersion": plugin.schema_version,
+                    "id": plugin.id,
+                    "name": plugin.name,
+                    "version": plugin.version,
+                    "description": plugin.description,
+                    "enabled": plugin.enabled,
+                    "homepage": plugin.homepage,
+                    "sha256": plugin.sha256,
+                    "signature": plugin.signature.as_ref().map(|signature| serde_json::json!({
+                        "algorithm": signature.algorithm,
+                        "keyId": signature.key_id,
+                        "value": "[已隐藏]",
+                    })),
+                    "mcpServers": plugin.mcp_servers.iter().map(|server| serde_json::json!({
+                        "name": server.name,
+                        "enabled": server.enabled,
+                        "transport": server.transport,
+                        "command": server.command,
+                        "args": server.args,
+                        "environmentKeys": server.env.keys().collect::<Vec<_>>(),
+                        "url": server.url,
+                        "credential": server.credential.as_ref().map(|_| "[系统凭据]"),
+                    })).collect::<Vec<_>>(),
+                }))?
+            );
+        }
+        PluginCommand::Enable { id } => {
+            let plugin = find_plugin_mut(&mut manifests, &id)?;
+            plugin.enabled = true;
+            save_plugin_manifest(plugin)?;
+            println!("插件 {id} 已启用。");
+        }
+        PluginCommand::Disable { id } => {
+            let plugin = find_plugin_mut(&mut manifests, &id)?;
+            plugin.enabled = false;
+            save_plugin_manifest(plugin)?;
+            println!("插件 {id} 已禁用。");
+        }
+        PluginCommand::Doctor { id } => {
+            let selected = manifests
+                .into_iter()
+                .filter(|plugin| id.as_ref().is_none_or(|value| &plugin.id == value))
+                .collect::<Vec<_>>();
+            if selected.is_empty() {
+                return Err(XduduError::validation("没有匹配的插件。"));
+            }
+            let store = KeyringSecretStore;
+            for plugin in selected {
+                plugin.validate()?;
+                if !plugin.enabled {
+                    println!("{}\tdisabled", plugin.id);
+                    continue;
+                }
+                let mut tool_count = 0usize;
+                for server in plugin.mcp_servers {
+                    if !server.enabled {
+                        continue;
+                    }
+                    let runtime = McpServerRuntime::new(server, &store).await?;
+                    tool_count += runtime.list_tools(CancellationToken::new()).await?.len();
+                }
+                println!("{}\tok\t{} tools", plugin.id, tool_count);
+            }
+        }
+    }
+    Ok(0)
+}
+
+fn find_plugin<'a>(
+    manifests: &'a [PluginManifest],
+    id: &str,
+) -> Result<&'a PluginManifest, XduduError> {
+    manifests
+        .iter()
+        .find(|plugin| plugin.id == id)
+        .ok_or_else(|| XduduError::validation(format!("找不到插件：{id}")))
+}
+
+fn find_plugin_mut<'a>(
+    manifests: &'a mut [PluginManifest],
+    id: &str,
+) -> Result<&'a mut PluginManifest, XduduError> {
+    manifests
+        .iter_mut()
+        .find(|plugin| plugin.id == id)
+        .ok_or_else(|| XduduError::validation(format!("找不到插件：{id}")))
+}
+
+fn find_mcp_server<'a>(
+    config: &'a McpConfigFile,
+    name: &str,
+) -> Result<&'a McpServerConfig, XduduError> {
+    config
+        .servers
+        .iter()
+        .find(|server| server.name == name)
+        .ok_or_else(|| XduduError::validation(format!("找不到 MCP Server：{name}")))
+}
+
+fn find_mcp_server_mut<'a>(
+    config: &'a mut McpConfigFile,
+    name: &str,
+) -> Result<&'a mut McpServerConfig, XduduError> {
+    config
+        .servers
+        .iter_mut()
+        .find(|server| server.name == name)
+        .ok_or_else(|| XduduError::validation(format!("找不到 MCP Server：{name}")))
+}
+
+fn ensure_new_mcp_name(config: &McpConfigFile, name: &str) -> Result<(), XduduError> {
+    if config.servers.iter().any(|server| server.name == name) {
+        Err(XduduError::validation(format!("MCP Server 已存在：{name}")))
+    } else {
+        Ok(())
+    }
 }
 
 async fn handle_session(command: SessionCommand, cwd: &std::path::Path) -> Result<u8, XduduError> {
@@ -2340,6 +2769,12 @@ async fn run() -> Result<u8, XduduError> {
         }
         Some(Command::Approval { command }) => {
             return handle_approval(command).await;
+        }
+        Some(Command::Mcp { command }) => {
+            return handle_mcp(command).await;
+        }
+        Some(Command::Plugin { command }) => {
+            return handle_plugin(command).await;
         }
         Some(Command::Doctor) => {
             return run_doctor(&cwd, cli_overrides, cli.json).await;

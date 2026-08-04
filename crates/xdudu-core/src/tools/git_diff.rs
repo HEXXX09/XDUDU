@@ -94,8 +94,8 @@ fn base_args(input: &Value) -> Vec<String> {
 impl Tool for GitDiffTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
-            name: "git_diff",
-            description: "返回工作区或暂存区的 Git unified diff 和结构化文件状态，不执行外部 diff 或 textconv。",
+            name: "git_diff".into(),
+            description: "返回工作区或暂存区的 Git unified diff 和结构化文件状态，不执行外部 diff 或 textconv。".into(),
             input_schema: json!({
                 "type":"object",
                 "properties":{

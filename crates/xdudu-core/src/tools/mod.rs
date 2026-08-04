@@ -45,12 +45,13 @@ pub use git_status::GitStatusTool;
 pub use search_text::SearchTextTool;
 pub use terminal_exec::TerminalExecTool;
 pub use web_fetch::WebFetchTool;
+pub(crate) use web_fetch::pinned_client;
 pub use web_search::WebSearchTool;
 
 #[derive(Debug, Clone)]
 pub struct ToolDefinition {
-    pub name: &'static str,
-    pub description: &'static str,
+    pub name: String,
+    pub description: String,
     pub input_schema: Value,
     pub permission_level: PermissionLevel,
     pub side_effect: SideEffectKind,
@@ -60,8 +61,8 @@ pub struct ToolDefinition {
 impl ToolDefinition {
     pub fn provider_definition(&self) -> ProviderToolDefinition {
         ProviderToolDefinition {
-            name: self.name.to_owned(),
-            description: self.description.to_owned(),
+            name: self.name.clone(),
+            description: self.description.clone(),
             input_schema: self.input_schema.clone(),
         }
     }
@@ -260,7 +261,7 @@ impl ToolRegistry {
             .values()
             .map(|tool| tool.definition())
             .collect::<Vec<_>>();
-        definitions.sort_by_key(|definition| definition.name);
+        definitions.sort_by(|left, right| left.name.cmp(&right.name));
         definitions
     }
 

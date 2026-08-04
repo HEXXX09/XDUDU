@@ -10,11 +10,13 @@ pub mod config;
 pub mod credentials;
 pub mod error;
 pub mod events;
+pub mod mcp;
 pub mod permission;
 pub mod plan;
 pub mod plan_executor;
 pub mod plan_generation;
 pub mod plan_review;
+pub mod plugin;
 pub mod prompt;
 pub mod provider;
 pub mod redaction;
@@ -42,6 +44,11 @@ pub use credentials::{
 };
 pub use error::{ErrorKind, XduduError, XduduResult};
 pub use events::{AgentEvent, EventSink, NoopEventSink};
+pub use mcp::{
+    McpConfigFile, McpRegistrationReport, McpServerConfig, McpServerRuntime, McpToolInfo,
+    McpTransportKind, load_mcp_config, mcp_config_path, register_configured_mcp_tools,
+    save_mcp_config,
+};
 pub use permission::{PermissionLevel, PermissionMode};
 pub use plan::{
     CompletionEvidence, PLAN_SCHEMA_VERSION, Plan, PlanReviewDecision, PlanReviewRecord,
@@ -55,6 +62,10 @@ pub use plan_generation::{
 pub use plan_review::{
     PlanRevisionConfig, PlanRevisionResult, approve_plan, build_revision_prompt, reject_plan,
     revise_plan, submit_plan_for_review,
+};
+pub use plugin::{
+    PluginManifest, PluginSignatureInfo, load_plugin_manifests, plugin_directory,
+    save_plugin_manifest,
 };
 pub use provider::{
     AnthropicProvider, DeepSeekProvider, DefaultProviderFactory, Provider, ProviderFactory,

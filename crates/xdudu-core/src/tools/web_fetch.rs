@@ -197,7 +197,7 @@ async fn doh_addresses(
     Ok(addresses.into_iter().collect())
 }
 
-pub(super) async fn pinned_client(url: &Url, timeout: Duration) -> Result<Client, String> {
+pub(crate) async fn pinned_client(url: &Url, timeout: Duration) -> Result<Client, String> {
     let started = Instant::now();
     validate_url(url)?;
     let host = url
@@ -302,8 +302,8 @@ fn html_text(bytes: &[u8]) -> (Option<String>, String) {
 impl Tool for WebFetchTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
-            name: "web_fetch",
-            description: "抓取公网 HTTPS 网页、纯文本或 JSON；逐跳校验 DNS 和重定向，不携带 Cookie、认证或代理。",
+            name: "web_fetch".into(),
+            description: "抓取公网 HTTPS 网页、纯文本或 JSON；逐跳校验 DNS 和重定向，不携带 Cookie、认证或代理。".into(),
             input_schema: json!({
                 "type":"object",
                 "properties":{

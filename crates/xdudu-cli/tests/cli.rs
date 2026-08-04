@@ -836,3 +836,74 @@ fn undo_发现后续人工修改时拒绝覆盖() {
         "user edit"
     );
 }
+
+#[test]
+fn mcp_cli_管理_http_配置且拒绝远程明文_http() {
+    let config_home = tempdir().unwrap();
+    let add = xdudu()
+        .env("XDUDU_CONFIG_HOME", config_home.path())
+        .args([
+            "mcp",
+            "add-http",
+            "team",
+            "https://mcp.example.com/mcp",
+            "--auth",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        add.status.success(),
+        "{}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+    let list = xdudu()
+        .env("XDUDU_CONFIG_HOME", config_home.path())
+        .args(["mcp", "list"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&list.stdout);
+    assert!(stdout.contains("team\tenabled\tstreamable-http"));
+    let config = fs::read_to_string(config_home.path().join("mcp.toml")).unwrap();
+    assert!(!config.contains("Bearer"));
+
+    let insecure = xdudu()
+        .env("XDUDU_CONFIG_HOME", config_home.path())
+        .args(["mcp", "add-http", "bad", "http://example.com/mcp"])
+        .output()
+        .unwrap();
+    assert!(!insecure.status.success());
+    assert!(String::from_utf8_lossy(&insecure.stderr).contains("只允许 HTTPS"));
+}
+
+#[test]
+fn plugin_cli_拒绝可执行入口并列出声明式插件() {
+    let config_home = tempdir().unwrap();
+    let plugins = config_home.path().join("plugins");
+    fs::create_dir_all(&plugins).unwrap();
+    fs::write(
+        plugins.join("team.toml"),
+        "schemaVersion=1\nid='team'\nname='Team'\nversion='1.0.0'\nenabled=false\n",
+    )
+    .unwrap();
+    let list = xdudu()
+        .env("XDUDU_CONFIG_HOME", config_home.path())
+        .args(["plugin", "list"])
+        .output()
+        .unwrap();
+    assert!(list.status.success());
+    assert!(String::from_utf8_lossy(&list.stdout).contains("team\tdisabled"));
+
+    fs::write(
+        plugins.join("bad.toml"),
+        "schemaVersion=1\nid='bad'\nname='Bad'\nversion='1'\nentry='payload.so'\n",
+    )
+    .unwrap();
+    let rejected = xdudu()
+        .env("XDUDU_CONFIG_HOME", config_home.path())
+        .args(["plugin", "list"])
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    let error = String::from_utf8_lossy(&rejected.stderr);
+    assert!(error.contains("插件清单") && error.contains("entry"));
+}

@@ -443,8 +443,8 @@ fn rollback_suffix(errors: &[String]) -> String {
 impl Tool for ApplyPatchTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
-            name: "apply_patch",
-            description: "以事务方式应用标准 unified diff，可一次创建、修改或删除多个 UTF-8 文本文件；任一失败时整体回滚。",
+            name: "apply_patch".into(),
+            description: "以事务方式应用标准 unified diff，可一次创建、修改或删除多个 UTF-8 文本文件；任一失败时整体回滚。".into(),
             input_schema: json!({
                 "type":"object",
                 "properties":{"patch":{"type":"string","minLength":1,"maxLength":MAX_PATCH_BYTES}},

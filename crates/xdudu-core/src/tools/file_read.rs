@@ -22,8 +22,9 @@ pub struct FileReadTool;
 impl Tool for FileReadTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
-            name: "file_read",
-            description: "读取工作区内文件，可指定行范围。超过 2 MiB 的文件会被截断，并返回 SHA-256。",
+            name: "file_read".into(),
+            description:
+                "读取工作区内文件，可指定行范围。超过 2 MiB 的文件会被截断，并返回 SHA-256。".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {

@@ -102,7 +102,7 @@ struct SlashCommand {
     requires_argument: bool,
 }
 
-const SLASH_COMMANDS: [SlashCommand; 13] = [
+const SLASH_COMMANDS: [SlashCommand; 15] = [
     SlashCommand {
         name: "/help",
         usage: "/help",
@@ -167,6 +167,18 @@ const SLASH_COMMANDS: [SlashCommand; 13] = [
         name: "/model",
         usage: "/model [name]",
         description: "选择或切换当前模型",
+        requires_argument: false,
+    },
+    SlashCommand {
+        name: "/mcp",
+        usage: "/mcp",
+        description: "查看 MCP Server 与外部工具",
+        requires_argument: false,
+    },
+    SlashCommand {
+        name: "/plugins",
+        usage: "/plugins",
+        description: "查看声明式插件",
         requires_argument: false,
     },
     SlashCommand {

@@ -153,8 +153,8 @@ async fn read_limited(mut reader: impl AsyncRead + Unpin) -> (String, bool) {
 impl Tool for TerminalExecTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
-            name: "terminal_exec",
-            description: "运行单个可执行文件并返回 stdout、stderr 和退出码。所有参数必须放入 args；auto-safe 仅允许 pwd、echo、ls 和只读 git 子命令。",
+            name: "terminal_exec".into(),
+            description: "运行单个可执行文件并返回 stdout、stderr 和退出码。所有参数必须放入 args；auto-safe 仅允许 pwd、echo、ls 和只读 git 子命令。".into(),
             input_schema: json!({
                 "type":"object",
                 "properties":{

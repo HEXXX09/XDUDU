@@ -36,6 +36,9 @@ Cargo workspace
     ├── permission.rs    显式权限矩阵
     ├── mcp.rs           stdio/Streamable HTTP MCP、生命周期与工具适配
     ├── plugin.rs        声明式插件清单、加载与校验
+    ├── instructions.rs   用户/项目级指令加载与提示词注入
+    ├── memories.rs       可审查记忆存储与 FTS5 检索
+    ├── memory_suggestion.rs 会话结束记忆建议协议
     ├── tools/           注册中心、九个内置工具及路径策略
     ├── session.rs       会话领域模型与兼容 JSON 读取
     ├── sqlite_session.rs SQLite、迁移、恢复与工作区锁
@@ -203,4 +206,4 @@ Cargo 是唯一构建入口。CI 在 Linux、macOS 和 Windows 执行格式、Cl
 
 ## 12. 后续演进
 
-Provider 扩展按当前决定暂缓，DeepSeek 保持主路径。M6 功能与 macOS、Linux、Windows CI 验收已完成。M7 已完成会话恢复、Plan Schema v3、SQLite Schema v4、结构化生成、整份审批/修订、串行 DAG 执行和恢复。M8 已完成 stdio 与 Streamable HTTP MCP 客户端、声明式插件清单、动态工具注册与统一权限/审批/脱敏链，并通过 stdio/HTTP 恶意输入、越权、超时、取消与审批链 E2E 及三平台 CI 验收。`submit_plan` 创建 Draft，`revise_plan` 生成完整新 revision，`complete_step` 以逐项证据确认当前步骤；执行期通过 `revision + execution_version + status` 原子检查点避免并发覆盖。Plan 不保存隐藏推理，也不替代单次请求内部的 ReAct；批准 Plan 不放行任何工具副作用，崩溃后也不会自动重放结果未知的工具。
+Provider 扩展按当前决定暂缓，DeepSeek 保持主路径。M6 功能与 macOS、Linux、Windows CI 验收已完成。M7 已完成会话恢复、Plan Schema v3、SQLite Schema v4、结构化生成、整份审批/修订、串行 DAG 执行和恢复。M8 已完成 stdio 与 Streamable HTTP MCP 客户端、声明式插件清单、动态工具注册与统一权限/审批/脱敏链，并通过 stdio/HTTP 恶意输入、越权、超时、取消与审批链 E2E 及三平台 CI 验收。M9 已完成用户级/项目级指令注入、可审查记忆（任务完成建议→TUI 逐条确认→SQLite FTS5 存储与检索→上下文注入），默认不自动写入，未引入向量 RAG。`submit_plan` 创建 Draft，`revise_plan` 生成完整新 revision，`complete_step` 以逐项证据确认当前步骤；执行期通过 `revision + execution_version + status` 原子检查点避免并发覆盖。Plan 不保存隐藏推理，也不替代单次请求内部的 ReAct；批准 Plan 不放行任何工具副作用，崩溃后也不会自动重放结果未知的工具。

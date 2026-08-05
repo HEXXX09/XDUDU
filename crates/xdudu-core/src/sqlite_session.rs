@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 use crate::{
     XduduError, XduduResult,
+    memories::{MAX_MEMORY_BYTES, MemoryRecord, MemoryStore, sanitize_memory_content},
     plan::{
         Plan, PlanRevision, PlanStatus, PlanStore, deserialize_plan_compatible, sanitized_plan,
         sanitized_plan_revision,
@@ -23,6 +24,7 @@ use crate::{
         sanitized_session,
     },
 };
+use chrono::DateTime;
 
 const DATABASE_PATH: &str = ".xdudu/xdudu.db";
 const LOCK_PATH: &str = ".xdudu/workspace.lock";
@@ -159,6 +161,7 @@ impl SqliteSessionStore {
             .map_err(|error| XduduError::tool(format!("初始化会话数据库失败：{error}")))?;
         migrate_plan_schema_v3(&mut connection)?;
         migrate_plan_schema_v4(&mut connection)?;
+        migrate_memory_schema_v5(&mut connection)?;
         self.import_json_sessions(&mut connection, cwd)?;
         self.recover_interrupted_sessions(&mut connection)?;
         Ok(())
@@ -470,6 +473,43 @@ fn migrate_plan_schema_v4(connection: &mut Connection) -> XduduResult<()> {
     transaction
         .commit()
         .map_err(|error| XduduError::tool(format!("提交计划 Schema v4 迁移失败：{error}")))
+}
+
+/// Schema v5：记忆表与 FTS5 全文索引。
+fn migrate_memory_schema_v5(connection: &mut Connection) -> XduduResult<()> {
+    let applied = connection
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version = 5",
+            [],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|error| XduduError::tool(format!("检查记忆迁移状态失败：{error}")))?
+        .is_some();
+    if applied {
+        return Ok(());
+    }
+    connection
+        .execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS memories (
+                id TEXT PRIMARY KEY,
+                content TEXT NOT NULL,
+                source_session_id TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS memories_created_idx
+                ON memories(created_at DESC);
+            DROP TABLE IF EXISTS memories_fts;
+            CREATE VIRTUAL TABLE memories_fts
+                USING fts5(content, tokenize='trigram');
+            INSERT INTO schema_migrations(version, applied_at)
+                VALUES (5, CURRENT_TIMESTAMP);
+            ",
+        )
+        .map_err(|error| XduduError::tool(format!("初始化记忆表失败：{error}")))?;
+    Ok(())
 }
 
 fn migrate_plan_schema_v3(connection: &mut Connection) -> XduduResult<()> {
@@ -1127,6 +1167,201 @@ impl PlanStore for SqliteSessionStore {
     }
 }
 
+#[async_trait]
+impl MemoryStore for SqliteSessionStore {
+    async fn add_memory(
+        &self,
+        content: &str,
+        source_session_id: Option<Uuid>,
+    ) -> XduduResult<MemoryRecord> {
+        let content = sanitize_memory_content(content).ok_or_else(|| {
+            XduduError::validation(format!(
+                "记忆内容不能为空且不超过 {MAX_MEMORY_BYTES} 字节。"
+            ))
+        })?;
+        let now = Utc::now();
+        let id = Uuid::new_v4();
+        let record = MemoryRecord {
+            id,
+            content: content.clone(),
+            source_session_id,
+            created_at: now,
+            updated_at: now,
+        };
+        let content = record.content.clone();
+        let source = record.source_session_id.map(|id| id.to_string());
+        let id_text = record.id.to_string();
+        let created = record.created_at.to_rfc3339();
+        let updated = record.updated_at.to_rfc3339();
+        self.run_blocking(move |mut connection| {
+            let transaction = connection
+                .transaction()
+                .map_err(|error| XduduError::tool(format!("开始写入记忆事务失败：{error}")))?;
+            transaction
+                .execute(
+                    "INSERT INTO memories(id, content, source_session_id, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![id_text, content, source, created, updated],
+                )
+                .map_err(|error| XduduError::tool(format!("写入记忆失败：{error}")))?;
+            let rowid = transaction.last_insert_rowid();
+            transaction
+                .execute(
+                    "INSERT INTO memories_fts(rowid, content) VALUES (?1, ?2)",
+                    rusqlite::params![rowid, content],
+                )
+                .map_err(|error| XduduError::tool(format!("建立记忆全文索引失败：{error}")))?;
+            transaction
+                .commit()
+                .map_err(|error| XduduError::tool(format!("提交记忆事务失败：{error}")))?;
+            Ok(record)
+        })
+        .await
+    }
+
+    async fn list_memories(&self, limit: usize) -> XduduResult<Vec<MemoryRecord>> {
+        self.run_blocking(move |connection| {
+            let mut statement = connection
+                .prepare(
+                    "SELECT id, content, source_session_id, created_at, updated_at
+                     FROM memories ORDER BY created_at DESC LIMIT ?1",
+                )
+                .map_err(|error| XduduError::tool(format!("准备记忆列表失败：{error}")))?;
+            let rows = statement
+                .query_map(rusqlite::params![limit as i64], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                })
+                .map_err(|error| XduduError::tool(format!("读取记忆列表失败：{error}")))?;
+            rows.map(|row| {
+                let (id, content, source, created, updated) =
+                    row.map_err(|error| XduduError::tool(format!("解析记忆失败：{error}")))?;
+                Ok(MemoryRecord {
+                    id: Uuid::parse_str(&id)
+                        .map_err(|error| XduduError::tool(format!("记忆 ID 无效：{error}")))?,
+                    content,
+                    source_session_id: source
+                        .map(|value| {
+                            Uuid::parse_str(&value).map_err(|error| {
+                                XduduError::tool(format!("记忆来源会话 ID 无效：{error}"))
+                            })
+                        })
+                        .transpose()?,
+                    created_at: DateTime::parse_from_rfc3339(&created)
+                        .map_err(|error| XduduError::tool(format!("记忆时间无效：{error}")))?
+                        .with_timezone(&Utc),
+                    updated_at: DateTime::parse_from_rfc3339(&updated)
+                        .map_err(|error| XduduError::tool(format!("记忆时间无效：{error}")))?
+                        .with_timezone(&Utc),
+                })
+            })
+            .collect()
+        })
+        .await
+    }
+
+    async fn remove_memory(&self, id: Uuid) -> XduduResult<bool> {
+        let id_text = id.to_string();
+        self.run_blocking(move |mut connection| {
+            let transaction = connection
+                .transaction()
+                .map_err(|error| XduduError::tool(format!("开始删除记忆事务失败：{error}")))?;
+            let rowid: Option<i64> = transaction
+                .query_row(
+                    "SELECT rowid FROM memories WHERE id = ?1",
+                    rusqlite::params![id_text],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| XduduError::tool(format!("查询记忆失败：{error}")))?;
+            let Some(rowid) = rowid else {
+                return Ok(false);
+            };
+            transaction
+                .execute(
+                    "DELETE FROM memories_fts WHERE rowid = ?1",
+                    rusqlite::params![rowid],
+                )
+                .map_err(|error| XduduError::tool(format!("删除记忆索引失败：{error}")))?;
+            transaction
+                .execute(
+                    "DELETE FROM memories WHERE id = ?1",
+                    rusqlite::params![id_text],
+                )
+                .map_err(|error| XduduError::tool(format!("删除记忆失败：{error}")))?;
+            transaction
+                .commit()
+                .map_err(|error| XduduError::tool(format!("提交删除记忆事务失败：{error}")))?;
+            Ok(true)
+        })
+        .await
+    }
+
+    async fn search_memories(&self, query: &str, limit: usize) -> XduduResult<Vec<MemoryRecord>> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+        let fts_query = query
+            .split_whitespace()
+            .map(|token| format!("\"{}\"", token.replace('"', "")))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let limit = limit as i64;
+        self.run_blocking(move |connection| {
+            let mut statement = connection
+                .prepare(
+                    "SELECT m.id, m.content, m.source_session_id, m.created_at, m.updated_at
+                     FROM memories_fts f
+                     JOIN memories m ON m.rowid = f.rowid
+                     WHERE memories_fts MATCH ?1
+                     ORDER BY rank LIMIT ?2",
+                )
+                .map_err(|error| XduduError::tool(format!("准备记忆检索失败：{error}")))?;
+            let rows = statement
+                .query_map(rusqlite::params![fts_query, limit], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                })
+                .map_err(|error| XduduError::tool(format!("执行记忆检索失败：{error}")))?;
+            rows.map(|row| {
+                let (id, content, source, created, updated) =
+                    row.map_err(|error| XduduError::tool(format!("解析记忆失败：{error}")))?;
+                Ok(MemoryRecord {
+                    id: Uuid::parse_str(&id)
+                        .map_err(|error| XduduError::tool(format!("记忆 ID 无效：{error}")))?,
+                    content,
+                    source_session_id: source
+                        .map(|value| {
+                            Uuid::parse_str(&value).map_err(|error| {
+                                XduduError::tool(format!("记忆来源会话 ID 无效：{error}"))
+                            })
+                        })
+                        .transpose()?,
+                    created_at: DateTime::parse_from_rfc3339(&created)
+                        .map_err(|error| XduduError::tool(format!("记忆时间无效：{error}")))?
+                        .with_timezone(&Utc),
+                    updated_at: DateTime::parse_from_rfc3339(&updated)
+                        .map_err(|error| XduduError::tool(format!("记忆时间无效：{error}")))?
+                        .with_timezone(&Utc),
+                })
+            })
+            .collect()
+        })
+        .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1163,6 +1398,75 @@ mod tests {
             vec![crate::plan::PlanStep::new("验证计划", "检查持久化结果")],
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn 记忆_写入列表脱敏检索与删除() {
+        let dir = tempdir().unwrap();
+        let store = SqliteSessionStore::new(dir.path()).unwrap();
+        let session = sample_session(dir.path());
+        let session_id = session.id;
+        store.create(&session).await.unwrap();
+
+        // 写入两条记忆，内容自动脱敏。
+        let first = store
+            .add_memory("用户偏好：审批后运行测试 sk-abcdefghijk", Some(session_id))
+            .await
+            .unwrap();
+        assert!(!first.content.contains("sk-abcdefghijk"));
+        assert!(first.content.contains("[已脱敏]"));
+        let second = store
+            .add_memory("项目约定：命令执行前不需要逐条确认", Some(session_id))
+            .await
+            .unwrap();
+
+        // 列表按创建时间倒序。
+        let listed = store.list_memories(10).await.unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].id, second.id);
+        assert_eq!(listed[0].source_session_id, Some(session_id));
+
+        // FTS5 相关性检索命中第二条。
+        let found = store.search_memories("命令执行前", 5).await.unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, second.id);
+        // 不相关查询无结果。
+        assert!(
+            store
+                .search_memories("完全无关词", 5)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // 删除生效：列表与检索都不再返回，重复删除返回 false。
+        assert!(store.remove_memory(first.id).await.unwrap());
+        assert!(!store.remove_memory(first.id).await.unwrap());
+        let listed = store.list_memories(10).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, second.id);
+
+        // 空与超长内容拒绝。
+        assert!(store.add_memory("   ", None).await.is_err());
+        assert!(
+            store
+                .add_memory(&"x".repeat(MAX_MEMORY_BYTES + 1), None)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn 记忆_删除后不再被全文检索命中() {
+        let dir = tempdir().unwrap();
+        let store = SqliteSessionStore::new(dir.path()).unwrap();
+        let memory = store
+            .add_memory("临时测试记忆：端口 8080", None)
+            .await
+            .unwrap();
+        assert_eq!(store.search_memories("8080", 5).await.unwrap().len(), 1);
+        store.remove_memory(memory.id).await.unwrap();
+        assert!(store.search_memories("8080", 5).await.unwrap().is_empty());
     }
 
     #[tokio::test]

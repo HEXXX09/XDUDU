@@ -31,6 +31,8 @@ XDUDU 是一个使用 Rust 实现的终端 AI 编程助手。它把自然语言�
 - stdio 与 Streamable HTTP MCP，外部工具统一进入权限、审批、超时、取消、脱敏和审计链；
 - 只声明 MCP Server 的隔离插件清单，以及 `mcp`、`plugin` 管理和诊断命令；
 - 密钥、Bearer Token、私钥和敏感结构字段的统一输出及会话脱敏；
+- 用户级与项目级自定义指令（`~/.config/xdudu/instructions/*.md` 与 `.xdudu/instructions/*.md`）注入系统提示词，项目指令视为不可信输入且不改变权限边界；
+- 可审查记忆：任务完成后模型生成脱敏建议，TUI 逐条确认后写入；`memory list/add/remove` 管理，SQLite FTS5 本地全文检索注入相关记忆，默认不自动写入；
 - macOS、Linux、Windows CI 与多平台 Release 归档工作流。
 
 旧 TypeScript 运行时及 npm 构建链已删除，项目只需要 Rust 工具链。

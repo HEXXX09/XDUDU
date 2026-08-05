@@ -236,6 +236,7 @@ struct TuiState {
     session_picker: Option<SessionPicker>,
     plan_review: Option<PlanReviewView>,
     model_picker: Option<ModelPicker>,
+    memory_suggest: Option<MemorySuggestView>,
     debug_trace: bool,
 }
 
@@ -286,6 +287,14 @@ struct PlanReviewView {
     selected: usize,
     scroll: usize,
     mode: PlanDialogMode,
+}
+
+#[derive(Debug)]
+struct MemorySuggestView {
+    suggestions: Vec<xdudu_core::MemorySuggestion>,
+    selected: usize,
+    accepted: Vec<bool>,
+    scroll: usize,
 }
 
 #[derive(Clone)]
@@ -390,6 +399,7 @@ impl TuiApp {
             session_picker: None,
             plan_review: None,
             model_picker: None,
+            memory_suggest: None,
             debug_trace: context.debug_trace,
         };
         let app = Self {
@@ -623,6 +633,94 @@ impl TuiApp {
         self.renderer.restore_viewport()?;
         self.renderer.draw_dynamic()?;
         Ok(selected)
+    }
+
+    /// 展示记忆建议，返回用户批准的子集；Esc/Ctrl+C 全部拒绝。
+    pub(crate) async fn review_memories(
+        &self,
+        suggestions: Vec<xdudu_core::MemorySuggestion>,
+    ) -> io::Result<Vec<xdudu_core::MemorySuggestion>> {
+        if suggestions.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.router.set_focus(InputFocus::Picker);
+        {
+            let mut state = self.renderer.state.lock().unwrap();
+            state.input_active = false;
+            state.memory_suggest = Some(MemorySuggestView {
+                accepted: vec![false; suggestions.len()],
+                suggestions,
+                selected: 0,
+                scroll: 0,
+            });
+        }
+        self.renderer.draw_picker()?;
+
+        loop {
+            let Some(event) = self.router.next_for(InputFocus::Picker).await else {
+                continue;
+            };
+            match event {
+                Event::Key(key)
+                    if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+                {
+                    let mut state = self.renderer.state.lock().unwrap();
+                    let Some(view) = state.memory_suggest.as_mut() else {
+                        break;
+                    };
+                    match key.code {
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            view.selected = if view.selected == 0 {
+                                view.suggestions.len() - 1
+                            } else {
+                                view.selected - 1
+                            };
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            view.selected = (view.selected + 1) % view.suggestions.len();
+                        }
+                        KeyCode::PageUp => view.scroll = view.scroll.saturating_sub(5),
+                        KeyCode::PageDown => view.scroll = view.scroll.saturating_add(5),
+                        KeyCode::Char(' ') => {
+                            view.accepted[view.selected] = !view.accepted[view.selected];
+                        }
+                        KeyCode::Enter => break,
+                        KeyCode::Esc => {
+                            view.accepted.fill(false);
+                            break;
+                        }
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            view.accepted.fill(false);
+                            break;
+                        }
+                        _ => {}
+                    }
+                    drop(state);
+                    self.renderer.draw_picker()?;
+                }
+                Event::Resize(_, _) => self.renderer.draw_picker()?,
+                _ => {}
+            }
+        }
+
+        let accepted = {
+            let state = self.renderer.state.lock().unwrap();
+            let view = state.memory_suggest.as_ref().expect("记忆建议视图存在");
+            view.suggestions
+                .iter()
+                .zip(view.accepted.iter())
+                .filter_map(|(suggestion, accepted)| accepted.then_some(suggestion.clone()))
+                .collect::<Vec<_>>()
+        };
+        {
+            let mut state = self.renderer.state.lock().unwrap();
+            state.memory_suggest = None;
+            state.input_active = true;
+        }
+        self.router.set_focus(InputFocus::Composer);
+        self.renderer.restore_viewport()?;
+        self.renderer.draw_dynamic()?;
+        Ok(accepted)
     }
 
     pub(crate) async fn review_plan(&self, plan: &Plan) -> io::Result<Option<PlanReviewChoice>> {
@@ -1288,6 +1386,9 @@ impl TuiRenderer {
         }
         if state.model_picker.is_some() {
             draw_model_picker(&mut stdout, &state, columns, rows, self.color)?;
+        }
+        if state.memory_suggest.is_some() {
+            draw_memory_suggest(&mut stdout, &state, columns, rows, self.color)?;
         }
         Ok(())
     }
@@ -2162,6 +2263,81 @@ fn draw_plan_review(
     reset_color(writer, color)
 }
 
+fn draw_memory_suggest(
+    writer: &mut impl Write,
+    state: &TuiState,
+    columns: u16,
+    rows: u16,
+    color: bool,
+) -> io::Result<()> {
+    let Some(view) = &state.memory_suggest else {
+        return Ok(());
+    };
+    for row in 0..rows {
+        queue!(writer, MoveTo(0, row), Clear(ClearType::CurrentLine))?;
+    }
+    let width = usize::from(columns.saturating_sub(4)).max(20);
+    set_color(writer, color, PRIMARY)?;
+    queue!(
+        writer,
+        MoveTo(2, 0),
+        SetAttribute(Attribute::Bold),
+        Print("建议保存的记忆"),
+        SetAttribute(Attribute::Reset)
+    )?;
+    set_color(writer, color, MUTED)?;
+    queue!(
+        writer,
+        MoveTo(2, 1),
+        Print("↑↓ 选择 · 空格 标记 · Enter 保存 · Esc 全部拒绝")
+    )?;
+
+    let content_height = usize::from(rows.saturating_sub(7)).max(3);
+    let max_scroll = view.suggestions.len().saturating_sub(content_height);
+    let start = view.scroll.min(max_scroll);
+    for (offset, (suggestion, accepted)) in view
+        .suggestions
+        .iter()
+        .zip(view.accepted.iter())
+        .skip(start)
+        .take(content_height)
+        .enumerate()
+    {
+        let row = 3 + offset as u16;
+        let selected = start + offset == view.selected;
+        set_color(writer, color, if selected { PRIMARY } else { TEXT })?;
+        if selected {
+            queue!(writer, SetAttribute(Attribute::Bold))?;
+        }
+        queue!(
+            writer,
+            MoveTo(2, row),
+            Print(if *accepted { "[✓] " } else { "[ ] " }),
+            Print(if selected { "›" } else { " " }),
+            SetAttribute(Attribute::Reset)
+        )?;
+        set_color(writer, color, TEXT)?;
+        queue!(
+            writer,
+            Print(truncate_to_width(
+                &suggestion.content,
+                width.saturating_sub(6)
+            ))
+        )?;
+        set_color(writer, color, MUTED)?;
+        queue!(
+            writer,
+            MoveTo(4, row + 1),
+            Print(truncate_to_width(
+                &suggestion.reason,
+                width.saturating_sub(4)
+            ))
+        )?;
+        reset_color(writer, color)?;
+    }
+    Ok(())
+}
+
 /// 活动区完整高度：chrome 4 行 + 输入块 + 折叠提示 + 建议 + 工具 + 流式尾巴，
 /// 封顶在 [`MAX_ACTIVITY_HEIGHT`]，避免活动区挤没内容滚动区。
 fn layout_height(state: &TuiState, columns: u16, rows: u16) -> u16 {
@@ -2485,6 +2661,7 @@ mod tests {
             session_picker: None,
             plan_review: None,
             model_picker: None,
+            memory_suggest: None,
             debug_trace: false,
         }
     }

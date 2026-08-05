@@ -33,14 +33,15 @@ use xdudu_core::{
     ApprovalGate, ApprovalMode, ApprovalRequest, ApprovalRule, ApprovalScope, ConfigOverrides,
     DefaultProviderFactory, DenyAllApprovalGate, EventSink, JsonApprovalRuleStore,
     JsonChangeLedger, KeyringSecretStore, McpConfigFile, McpServerConfig, McpServerRuntime,
-    McpTransportKind, PermissionMode, Plan, PlanExecutorConfig, PlanGenerationConfig,
-    PlanRevisionConfig, PlanStatus, PlanStore, PluginManifest, Provider, ProviderFactory,
-    ResolvedConfig, SecretSource, SecretStore, SecretString, Session, SessionStatus, SessionStore,
-    SqliteSessionStore, ToolRegistry, WorkspaceLock, XduduError, approval_rules_path, approve_plan,
-    config_paths, generate_plan, load_config, load_mcp_config, load_plugin_manifests,
-    mcp_config_path, plugin_directory, redact_text, register_builtins,
-    register_configured_mcp_tools, reject_plan, resolve_secret, revise_plan, run_agent, run_plan,
-    save_mcp_config, save_plugin_manifest, submit_plan_for_review, write_config_value,
+    McpTransportKind, MemoryStore, MemorySuggestionConfig, PermissionMode, Plan,
+    PlanExecutorConfig, PlanGenerationConfig, PlanRevisionConfig, PlanStatus, PlanStore,
+    PluginManifest, Provider, ProviderFactory, ResolvedConfig, SecretSource, SecretStore,
+    SecretString, Session, SessionStatus, SessionStore, SqliteSessionStore, ToolRegistry,
+    WorkspaceLock, XduduError, approval_rules_path, approve_plan, config_paths, generate_plan,
+    load_config, load_mcp_config, load_plugin_manifests, mcp_config_path, plugin_directory,
+    redact_text, register_builtins, register_configured_mcp_tools, reject_plan, resolve_secret,
+    revise_plan, run_agent, run_plan, save_mcp_config, save_plugin_manifest,
+    submit_plan_for_review, write_config_value,
 };
 
 use crate::approval_prompt::{ApprovalMenuChoice, format_approval_prompt, read_approval_menu};
@@ -138,6 +139,11 @@ enum Command {
     Doctor,
     /// 安全撤销最近一次或指定的 Agent 文件变更。
     Undo(UndoArgs),
+    /// 查看、添加或删除可审查记忆。
+    Memory {
+        #[command(subcommand)]
+        command: MemoryCommand,
+    },
     /// 查询或恢复本地会话。
     Session {
         #[command(subcommand)]
@@ -315,6 +321,19 @@ enum ApprovalCommand {
     Revoke { tool: String },
     /// 清除全部永久审批规则。
     Clear,
+}
+
+#[derive(Debug, Subcommand)]
+enum MemoryCommand {
+    /// 列出记忆，按创建时间倒序。
+    List {
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// 添加一条记忆（内容会先脱敏）。
+    Add { content: String },
+    /// 按 ID 删除一条记忆。
+    Remove { id: Uuid },
 }
 
 struct Runtime {
@@ -552,6 +571,7 @@ async fn execute_prompt_with_cancellation(
     event_sink: &dyn EventSink,
     cancellation: CancellationToken,
 ) -> Result<AgentRunResult, XduduError> {
+    let memories = relevant_memories(runtime, &prompt).await;
     run_agent(AgentRunConfig {
         prompt,
         model: runtime.model.clone(),
@@ -565,8 +585,18 @@ async fn execute_prompt_with_cancellation(
         session_id,
         event_sink: Some(event_sink),
         stream: runtime.stream,
+        memories,
     })
     .await
+}
+
+/// 用当前提示词检索相关记忆（最多 3 条）；检索失败时静默返回空，
+/// 不影响任务执行。
+async fn relevant_memories(runtime: &Runtime, query: &str) -> Vec<String> {
+    match runtime.store.search_memories(query, 3).await {
+        Ok(memories) => memories.into_iter().map(|memory| memory.content).collect(),
+        Err(_) => Vec::new(),
+    }
 }
 
 fn print_banner(runtime: &Runtime, interactive: bool) {
@@ -701,6 +731,10 @@ async fn tui_interactive_loop(
                     run_cancel = None;
                     app.finish_prompt(&result).map_err(XduduError::from)?;
                     session_id = Some(result.session_id);
+                    // 任务完成后：模型生成记忆建议，用户逐条确认后写入。
+                    if result.status == xdudu_core::SessionStatus::Completed {
+                        suggest_memories_in_tui(&app, &mut runtime, result.session_id).await?;
+                    }
                 }
                 TuiSelect::Event(TuiLoopAction::Exit) => break,
                 TuiSelect::Event(TuiLoopAction::Continue) => {}
@@ -917,6 +951,7 @@ async fn start_tui_run(
     let stream = runtime.stream;
     let run_renderer = renderer.clone();
     let task_cancel = cancellation.clone();
+    let memories = relevant_memories(runtime, &prompt).await;
     let future: RunFuture = Box::pin(async move {
         run_agent(AgentRunConfig {
             prompt,
@@ -931,6 +966,7 @@ async fn start_tui_run(
             session_id,
             event_sink: Some(&run_renderer),
             stream,
+            memories,
         })
         .await
     });
@@ -1034,6 +1070,54 @@ async fn read_line_in_tui(app: &TuiApp) -> Result<Option<String>, XduduError> {
             }
         }
     }
+}
+
+/// 任务完成后生成记忆建议并在 TUI 中确认；批准的记忆写入本地存储。
+/// 默认不自动写入；协议或 Provider 失败时静默跳过（不影响任务结果）。
+async fn suggest_memories_in_tui(
+    app: &TuiApp,
+    runtime: &mut Runtime,
+    session_id: Uuid,
+) -> Result<(), XduduError> {
+    let Some(session) = runtime.store.get(session_id).await? else {
+        return Ok(());
+    };
+    let cancellation = CancellationToken::new();
+    let suggestions = match xdudu_core::suggest_memories(MemorySuggestionConfig {
+        session: &session,
+        model: runtime.model.clone(),
+        cwd: runtime.cwd.clone(),
+        provider: runtime.provider.as_ref(),
+        cancellation,
+    })
+    .await
+    {
+        Ok(suggestions) => suggestions,
+        Err(error) => {
+            app.notice(format!("记忆建议跳过：{}", error.message))
+                .map_err(XduduError::from)?;
+            return Ok(());
+        }
+    };
+    if suggestions.is_empty() {
+        return Ok(());
+    }
+    let accepted = app
+        .review_memories(suggestions)
+        .await
+        .map_err(XduduError::from)?;
+    let accepted_count = accepted.len();
+    for suggestion in accepted {
+        runtime
+            .store
+            .add_memory(&suggestion.content, Some(session_id))
+            .await?;
+    }
+    if accepted_count > 0 {
+        app.notice(format!("已保存 {accepted_count} 条记忆。"))
+            .map_err(XduduError::from)?;
+    }
+    Ok(())
 }
 
 /// TUI 斜杠命令处理；"/exit" 返回 [`TuiLoopAction::Exit`]。
@@ -2555,6 +2639,35 @@ async fn handle_auth(command: AuthCommand, resolved: &ResolvedConfig) -> Result<
     Ok(0)
 }
 
+async fn handle_memory(cwd: &PathBuf, command: MemoryCommand) -> Result<u8, XduduError> {
+    let store = SqliteSessionStore::new(cwd)?;
+    match command {
+        MemoryCommand::List { limit } => {
+            let memories = store.list_memories(limit).await?;
+            println!("{}", serde_json::to_string_pretty(&memories)?);
+            Ok(0)
+        }
+        MemoryCommand::Add { content } => {
+            let record = store.add_memory(&content, None).await?;
+            println!(
+                "已添加记忆：{}
+来源：手动添加 · {}\nID：{}",
+                record.content, record.created_at, record.id
+            );
+            Ok(0)
+        }
+        MemoryCommand::Remove { id } => {
+            if store.remove_memory(id).await? {
+                println!("已删除记忆：{id}");
+                Ok(0)
+            } else {
+                eprintln!("找不到记忆：{id}");
+                Ok(1)
+            }
+        }
+    }
+}
+
 async fn handle_approval(command: ApprovalCommand) -> Result<u8, XduduError> {
     let store = JsonApprovalRuleStore::open(approval_rules_path()?).await?;
     match command {
@@ -3156,6 +3269,9 @@ async fn run() -> Result<u8, XduduError> {
         }
         Some(Command::Doctor) => {
             return run_doctor(&cwd, cli_overrides, cli.json).await;
+        }
+        Some(Command::Memory { command }) => {
+            return handle_memory(&cwd, command).await;
         }
         Some(Command::Undo(args)) => {
             let _workspace_lock = WorkspaceLock::acquire(&cwd)?;

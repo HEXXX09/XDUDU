@@ -10,7 +10,10 @@ pub mod config;
 pub mod credentials;
 pub mod error;
 pub mod events;
+pub mod instructions;
 pub mod mcp;
+pub mod memories;
+pub mod memory_suggestion;
 pub mod permission;
 pub mod plan;
 pub mod plan_executor;
@@ -44,10 +47,18 @@ pub use credentials::{
 };
 pub use error::{ErrorKind, XduduError, XduduResult};
 pub use events::{AgentEvent, EventSink, NoopEventSink};
+pub use instructions::{
+    InstructionFile, InstructionSource, load_instructions, render_instructions,
+    user_instruction_dir,
+};
 pub use mcp::{
     McpConfigFile, McpRegistrationReport, McpServerConfig, McpServerRuntime, McpToolInfo,
     McpTransportKind, load_mcp_config, mcp_config_path, register_configured_mcp_tools,
     save_mcp_config,
+};
+pub use memories::{MAX_MEMORY_BYTES, MemoryRecord, MemoryStore};
+pub use memory_suggestion::{
+    MemorySuggestion, MemorySuggestionConfig, build_suggestion_prompt, suggest_memories,
 };
 pub use permission::{PermissionLevel, PermissionMode};
 pub use plan::{

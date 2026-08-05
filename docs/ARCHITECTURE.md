@@ -203,4 +203,4 @@ Cargo 是唯一构建入口。CI 在 Linux、macOS 和 Windows 执行格式、Cl
 
 ## 12. 后续演进
 
-Provider 扩展按当前决定暂缓，DeepSeek 保持主路径。M6 功能与 macOS、Linux、Windows CI 验收已完成。M7 已完成会话恢复、Plan Schema v3、SQLite Schema v4、结构化生成、整份审批/修订、串行 DAG 执行和恢复。`submit_plan` 创建 Draft，`revise_plan` 生成完整新 revision，`complete_step` 以逐项证据确认当前步骤；执行期通过 `revision + execution_version + status` 原子检查点避免并发覆盖。Plan 不保存隐藏推理，也不替代单次请求内部的 ReAct；批准 Plan 不放行任何工具副作用，崩溃后也不会自动重放结果未知的工具。
+Provider 扩展按当前决定暂缓，DeepSeek 保持主路径。M6 功能与 macOS、Linux、Windows CI 验收已完成。M7 已完成会话恢复、Plan Schema v3、SQLite Schema v4、结构化生成、整份审批/修订、串行 DAG 执行和恢复。M8 已完成 stdio 与 Streamable HTTP MCP 客户端、声明式插件清单、动态工具注册与统一权限/审批/脱敏链，并通过 stdio/HTTP 恶意输入、越权、超时、取消与审批链 E2E 及三平台 CI 验收。`submit_plan` 创建 Draft，`revise_plan` 生成完整新 revision，`complete_step` 以逐项证据确认当前步骤；执行期通过 `revision + execution_version + status` 原子检查点避免并发覆盖。Plan 不保存隐藏推理，也不替代单次请求内部的 ReAct；批准 Plan 不放行任何工具副作用，崩溃后也不会自动重放结果未知的工具。

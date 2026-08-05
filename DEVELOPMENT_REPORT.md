@@ -105,8 +105,9 @@ cargo install --path crates/xdudu-cli --locked --force
 - `web_fetch` 只读取 HTML、纯文本和 JSON，不支持登录态、文件下载或私网；
 - Plan 已支持串行 DAG 执行、`complete_step` 证据、暂停/重试/取消和崩溃恢复；
 - 默认输出不包含 Provider 原始思维链；高级 `--debug-trace` 仅输出脱敏后的状态机与执行元数据，Plan 完成时逐条显示验证证据；
-- MCP、插件和 RAG 尚未实现。
+- M8 已完成 stdio 与 Streamable HTTP MCP、声明式插件与统一安全链，并通过 E2E 与三平台 CI 验收；
+- RAG 尚未实现（M9 评审后决定是否引入）。
 
 ## 下一阶段建议
 
-下一阶段进入 M8 前，先完成本地 `/plan` 人工执行验收和三平台 CI。M8 的 MCP/Skills 等能力仍必须复用现有工具权限、审批、脱敏、计划检查点和文件事务边界。
+下一阶段进入 M9：自定义指令、可审查记忆与本地全文检索（人工确认流程，默认不自动写入记忆，不引入向量 RAG），仍必须复用现有工具权限、审批、脱敏、计划检查点和文件事务边界。

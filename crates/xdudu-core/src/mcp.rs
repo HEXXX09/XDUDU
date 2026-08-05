@@ -285,7 +285,9 @@ struct HttpConnection {
 }
 
 enum Connection {
-    Stdio(StdioConnection),
+    // StdioConnection 含 tokio::process::Child，Windows 上显著大于 HttpConnection，
+    // 装箱避免 clippy::large-enum-variant 的跨平台尺寸告警。
+    Stdio(Box<StdioConnection>),
     Http(HttpConnection),
 }
 
@@ -322,7 +324,7 @@ impl McpServerRuntime {
             None
         };
         let connection = match config.transport {
-            McpTransportKind::Stdio => Connection::Stdio(spawn_stdio(&config).await?),
+            McpTransportKind::Stdio => Connection::Stdio(Box::new(spawn_stdio(&config).await?)),
             McpTransportKind::StreamableHttp => Connection::Http(build_http(&config, token).await?),
         };
         let runtime = Self {
@@ -1185,5 +1187,177 @@ mod tests {
             .unwrap();
         assert_eq!(result["isError"], false);
         server.await.unwrap();
+    }
+
+    // ---------- stdio 传输 E2E ----------
+
+    fn python_command() -> &'static str {
+        if cfg!(windows) { "python" } else { "python3" }
+    }
+
+    struct StdioMock {
+        path: std::path::PathBuf,
+        _dir: tempfile::TempDir,
+    }
+
+    /// 生成 mock stdio MCP server 脚本；mode 控制行为：
+    /// `normal` 正常响应；`garbage` 注入非 JSON 与超大行；`silent` 对 tools/call 沉默。
+    fn stdio_mock(mode: &str) -> StdioMock {
+        let dir = tempfile::tempdir().unwrap();
+        let script = format!(
+            "import sys, json\n\
+             sys.stdin.reconfigure(encoding='utf-8')\n\
+             sys.stdout.reconfigure(encoding='utf-8')\n\
+             mode = {mode:?}\n\
+             for raw in sys.stdin:\n\
+             \x20   raw = raw.strip()\n\
+             \x20   if not raw:\n\
+             \x20       continue\n\
+             \x20   if mode == 'garbage':\n\
+             \x20       sys.stdout.write('not-json\\n')\n\
+             \x20       sys.stdout.write('x' * (1024 * 1024 + 100) + '\\n')\n\
+             \x20       sys.stdout.flush()\n\
+             \x20       continue\n\
+             \x20   try:\n\
+             \x20       msg = json.loads(raw)\n\
+             \x20   except Exception:\n\
+             \x20       continue\n\
+             \x20   rid = msg.get('id')\n\
+             \x20   method = msg.get('method')\n\
+             \x20   if mode == 'silent' and method == 'tools/call':\n\
+             \x20       continue\n\
+             \x20   result = None\n\
+             \x20   if method == 'initialize':\n\
+             \x20       result = {{'protocolVersion': '2025-11-25', 'capabilities': {{'tools': {{}}}}, 'serverInfo': {{'name': 'mock', 'version': '1.0'}}}}\n\
+             \x20   elif method == 'tools/list':\n\
+             \x20       result = {{'tools': [{{'name': 'echo', 'description': '回显', 'inputSchema': {{'type': 'object', 'properties': {{}}}}}}]}}\n\
+             \x20   elif method == 'tools/call':\n\
+             \x20       result = {{'content': [{{'type': 'text', 'text': 'ok'}}]}}\n\
+             \x20   if result is not None and rid is not None:\n\
+             \x20       sys.stdout.write(json.dumps({{'jsonrpc': '2.0', 'id': rid, 'result': result}}) + '\\n')\n\
+             \x20       sys.stdout.flush()\n"
+        );
+        let path = dir.path().join(format!("mock_stdio_{mode}.py"));
+        std::fs::write(&path, script).unwrap();
+        StdioMock { path, _dir: dir }
+    }
+
+    fn mock_stdio_config(mock: &StdioMock, timeout: u64) -> McpServerConfig {
+        McpServerConfig {
+            name: "mock".into(),
+            enabled: true,
+            transport: McpTransportKind::Stdio,
+            command: Some(python_command().into()),
+            args: vec![mock.path.to_string_lossy().into_owned()],
+            env: BTreeMap::new(),
+            url: None,
+            credential: None,
+            timeout_seconds: timeout,
+        }
+    }
+
+    #[tokio::test]
+    async fn stdio_mock_server_完成初始化发现与调用() {
+        let mock = stdio_mock("normal");
+        let runtime = McpServerRuntime::new(mock_stdio_config(&mock, 10), &KeyringSecretStore)
+            .await
+            .unwrap();
+        let tools = runtime.list_tools(CancellationToken::new()).await.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "echo");
+        let result = runtime
+            .call_tool("echo", json!({}), CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(result["content"][0]["text"], "ok");
+    }
+
+    #[tokio::test]
+    async fn stdio_恶意畸形输出被拒绝且不崩溃() {
+        let mock = stdio_mock("garbage");
+        // 非 JSON 与超过 1 MiB 的行都会被当作协议错误：握手或发现阶段即拒绝，
+        // 客户端不崩溃、不挂起。
+        let runtime =
+            McpServerRuntime::new(mock_stdio_config(&mock, 10), &KeyringSecretStore).await;
+        match runtime {
+            Ok(runtime) => {
+                let result = runtime.list_tools(CancellationToken::new()).await;
+                assert!(result.is_err());
+            }
+            Err(error) => {
+                assert!(error.message.contains("无效 JSON"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stdio_调用超时返回错误() {
+        let mock = stdio_mock("silent");
+        let runtime = McpServerRuntime::new(mock_stdio_config(&mock, 1), &KeyringSecretStore)
+            .await
+            .unwrap();
+        // 握手与发现正常（silent 只对 tools/call 沉默）。
+        let tools = runtime.list_tools(CancellationToken::new()).await.unwrap();
+        assert_eq!(tools.len(), 1);
+        let started = std::time::Instant::now();
+        let result = runtime
+            .call_tool("echo", json!({}), CancellationToken::new())
+            .await;
+        assert!(result.is_err());
+        assert!(started.elapsed().as_secs() >= 1);
+    }
+
+    #[tokio::test]
+    async fn stdio_取消_终止调用() {
+        let mock = stdio_mock("silent");
+        let runtime = Arc::new(
+            McpServerRuntime::new(mock_stdio_config(&mock, 10), &KeyringSecretStore)
+                .await
+                .unwrap(),
+        );
+        let _ = runtime.list_tools(CancellationToken::new()).await.unwrap();
+        let cancellation = CancellationToken::new();
+        let call = {
+            let runtime = Arc::clone(&runtime);
+            let cancellation = cancellation.clone();
+            tokio::spawn(async move { runtime.call_tool("echo", json!({}), cancellation).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        cancellation.cancel();
+        let result = call.await.unwrap();
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn mcp_工具_拒绝审批时_不向服务器发送调用() {
+        let mock = stdio_mock("silent");
+        let runtime = Arc::new(
+            McpServerRuntime::new(mock_stdio_config(&mock, 2), &KeyringSecretStore)
+                .await
+                .unwrap(),
+        );
+        let tools = runtime.list_tools(CancellationToken::new()).await.unwrap();
+        let registry = crate::tools::ToolRegistry::with_runtime(
+            Arc::new(crate::approval::DenyAllApprovalGate),
+            Arc::new(crate::changes::NoopChangeLedger),
+        );
+        let mut registry = registry;
+        registry
+            .register(McpTool::new(Arc::clone(&runtime), tools[0].clone()))
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let result = registry
+            .execute(
+                "mcp__mock__echo",
+                json!({}),
+                uuid::Uuid::new_v4(),
+                dir.path(),
+                crate::permission::PermissionMode::FullAccess,
+                CancellationToken::new(),
+            )
+            .await;
+        // silent server 对 tools/call 沉默：若审批未拦截，这里会超时；
+        // 立即返回 APPROVAL_DENIED 证明调用从未发送到服务器。
+        assert_eq!(result.error.unwrap().code, "APPROVAL_DENIED");
     }
 }

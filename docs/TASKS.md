@@ -22,9 +22,9 @@
 | M3 | Provider 扩展与容错 | 暂缓，DeepSeek 优先 |
 | M4 | 审批、脱敏、变更账本与撤销 | 已完成 |
 | M5 | SQLite、恢复与上下文管理 | 已完成 |
-| M6 | 搜索、补丁、Git 与受限 Web | 功能完成，Windows CI 修复待推送复验 |
+| M6 | 搜索、补丁、Git 与受限 Web | 已完成 |
 | M7 | Plan 模式与任务执行 | 已完成 |
-| M8 | MCP 与插件 | 功能完成，待最终跨平台验收 |
+| M8 | MCP 与插件 | 已完成 |
 | M9 | 自定义指令、记忆与可选 RAG | 待评审 |
 | M10 | 1.0 发布、诊断与兼容性 | 待开始 |
 
@@ -134,7 +134,10 @@ M2 已由 `main` 的 macOS、Linux 和 Windows CI 矩阵确认。
 - [x] M8-T04：通过统一 ToolRegistry 动态加载并命名空间化外部工具；
 - [x] M8-T05：把 MCP/插件映射到现有权限、审批、脱敏和审计链；
 - [x] M8-T06：实现 mcp/plugin list、show、enable、disable、凭据和 doctor 命令；
-- [ ] M8-T07：完成 stdio/HTTP 恶意输入、越权、超时、取消 E2E 和三平台 CI。
+- [x] M8-T07：完成 stdio/HTTP 恶意输入、越权、超时、取消 E2E 和三平台 CI。
+  - stdio E2E：完整生命周期、畸形/超大输出拒绝、调用超时、取消终止子进程；
+  - 审批链 E2E：审批拒绝时 MCP 工具调用不发送到服务器；
+  - 修复 Windows `clippy::large-enum-variant`（`Connection::Stdio` 装箱）。
 
 ## M9：自定义指令、记忆与可选 RAG
 

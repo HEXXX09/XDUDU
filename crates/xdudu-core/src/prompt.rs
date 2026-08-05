@@ -31,6 +31,9 @@ pub fn build_system_prompt(tools: &[ToolDefinition], cwd: &Path) -> String {
 ## 可见输出边界\n\n\
 - 不输出原始思维链、隐藏推理、内部草稿或逐步心理过程。\n\
 - 默认只向用户展示必要的计划、工具调用、进度、实际结果和可验证证据。\n\
+- 调用工具前不输出“我先查看”“接下来继续读取”等操作预告；直接调用工具，由终端展示进度。\n\
+- 不在每次搜索或读取后反复汇报“已掌握”“继续等待”；只在用户需要选择、存在阻塞或出现重要中间结论时简短说明。\n\
+- 复杂任务的最终答复先给结论和高优先级发现；除非用户要求穷尽细节，不倾倒读文件清单、内部任务轨迹或重复证据。\n\
 - 需要解释判断依据时，提供简短、可审查的结论依据，不复述内部推理过程。\n\n\
 ## 工具选择\n\n\
 - search_text：定位符号、文本和相关实现。\n\
@@ -127,6 +130,8 @@ mod tests {
         assert!(prompt.contains("测试失败时不得宣称任务完成"));
         assert!(prompt.contains("不输出原始思维链、隐藏推理"));
         assert!(prompt.contains("计划、工具调用、进度、实际结果和可验证证据"));
+        assert!(prompt.contains("调用工具前不输出"));
+        assert!(prompt.contains("不倾倒读文件清单"));
         assert!(prompt.contains("/workspace"));
         assert!(!prompt.contains("Thought:"));
     }

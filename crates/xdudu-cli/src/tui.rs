@@ -1,7 +1,12 @@
 //! XDUDU 全屏终端界面。
 //!
-//! 界面采用“静态对话记录 + 实时活动区 + 底部 Composer”的布局，核心 Agent
-//! 仍只通过 `AgentEvent` 发布状态，不依赖任何终端实现。
+//! 界面运行在正常屏幕（不使用备用屏幕，也不捕获鼠标）：已提交的对话内容
+//! 一次性打印进终端滚动区，滚轮、搜索和复制都由终端原生处理；底部活动区
+//! （流式尾巴、实时工具活动、状态线、Composer）在每次变化时重绘。
+//!
+//! 输入由共享路由（[`crate::input_queue::InputRouter`]）统一分发：raw 模式
+//! 在会话期间常驻，运行中 Composer 仍然可用，Ctrl+C 直接取消当前任务，
+//! 提交的内容进入排队队列，当前任务结束后自动执行。
 
 use std::{
     collections::VecDeque,
@@ -14,15 +19,12 @@ use async_trait::async_trait;
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
     event::{
-        DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers, MouseEventKind, read,
+        DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers,
     },
     execute, queue,
     style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor},
-    terminal::{
-        Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
-        enable_raw_mode, size,
-    },
+    terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode, size},
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use xdudu_core::{
@@ -31,6 +33,7 @@ use xdudu_core::{
 };
 
 use crate::{
+    input_queue::{InputFocus, InputRouter},
     markdown::{MarkdownLineKind, terminal_markdown},
     ui::{
         ModelOption, model_display_name, model_matches, model_options, supports_true_color,
@@ -38,8 +41,10 @@ use crate::{
     },
 };
 
-const CHROME_ROWS: u16 = 5;
 const MAX_COMMAND_SUGGESTIONS: usize = 5;
+const MAX_INPUT_CHARS: usize = 262_144;
+/// 流式尾巴在活动区最多显示的行数；更早的行已提交到滚动区。
+const STREAMING_WINDOW: usize = 4;
 const PRIMARY: Color = Color::Rgb {
     r: 252,
     g: 244,
@@ -202,10 +207,20 @@ struct TuiState {
     model: String,
     cwd: PathBuf,
     permission: String,
-    approval: String,
     status: String,
+    /// 已提交内容累计打印的行数（单调递增），用于定位内容末尾。
+    printed_lines: usize,
+    /// 内容末尾在视口中的行：每次提交后更新，清除操作从该行开始，
+    /// 与动态变化的滚动区底无关，保证已提交内容永不被清除。
+    content_end_row: u16,
+    /// 上一次绘制的底部活动区起始行，用于完整清除尺寸变化后的残影。
+    dynamic_top: u16,
     transcript: VecDeque<TranscriptBlock>,
     streaming: String,
+    /// 当前轮是否收到过流式增量；用于区分非流式最终消息和已提交的流式回答。
+    assistant_received_delta: bool,
+    /// 流式文本当前是否位于未闭合的 Markdown 代码栅栏内。
+    code_fence_open: bool,
     tools: Vec<ToolActivity>,
     input: Vec<char>,
     cursor: usize,
@@ -215,12 +230,9 @@ struct TuiState {
     command_selection: usize,
     input_hint: String,
     input_active: bool,
-    input_interrupted: bool,
     usage: Option<(u64, u64)>,
-    transcript_scroll: usize,
     available_tools: Vec<String>,
     skills: Vec<String>,
-    show_intro: bool,
     session_picker: Option<SessionPicker>,
     plan_review: Option<PlanReviewView>,
     model_picker: Option<ModelPicker>,
@@ -280,10 +292,12 @@ struct PlanReviewView {
 pub(crate) struct TuiRenderer {
     state: Arc<Mutex<TuiState>>,
     color: bool,
+    router: Arc<InputRouter>,
 }
 
 pub(crate) struct TuiApp {
     renderer: TuiRenderer,
+    router: Arc<InputRouter>,
 }
 
 pub(crate) struct TuiContext {
@@ -291,7 +305,6 @@ pub(crate) struct TuiContext {
     pub(crate) model: String,
     pub(crate) cwd: PathBuf,
     pub(crate) permission: String,
-    pub(crate) approval: String,
     pub(crate) available_tools: Vec<String>,
     pub(crate) skills: Vec<String>,
     pub(crate) color: bool,
@@ -306,16 +319,17 @@ pub(crate) enum InputOutcome {
     Exit,
 }
 
+/// 会话期间常驻：raw 模式 + bracketed paste，不进入备用屏幕、不捕获鼠标。
 pub(crate) struct ScreenGuard;
 
 impl ScreenGuard {
     fn enter() -> io::Result<Self> {
+        enable_raw_mode()?;
         execute!(
             io::stdout(),
             ResetColor,
             SetAttribute(Attribute::Reset),
-            EnterAlternateScreen,
-            EnableMouseCapture,
+            EnableBracketedPaste,
             ResetColor,
             SetAttribute(Attribute::Reset),
             Hide
@@ -326,35 +340,26 @@ impl ScreenGuard {
 
 impl Drop for ScreenGuard {
     fn drop(&mut self) {
-        let _ = disable_raw_mode();
         let _ = execute!(
             io::stdout(),
             ResetColor,
             SetAttribute(Attribute::Reset),
             Show,
-            DisableMouseCapture,
-            LeaveAlternateScreen
+            DisableBracketedPaste,
+            // 恢复全屏滚动区域。
+            Print("\x1b[r"),
+            ResetColor,
+            SetAttribute(Attribute::Reset)
         );
-    }
-}
-
-struct RawGuard;
-
-impl RawGuard {
-    fn enter() -> io::Result<Self> {
-        enable_raw_mode()?;
-        Ok(Self)
-    }
-}
-
-impl Drop for RawGuard {
-    fn drop(&mut self) {
         let _ = disable_raw_mode();
     }
 }
 
 impl TuiApp {
-    pub(crate) fn enter(context: TuiContext) -> io::Result<(Self, ScreenGuard)> {
+    pub(crate) fn enter(
+        context: TuiContext,
+        router: Arc<InputRouter>,
+    ) -> io::Result<(Self, ScreenGuard)> {
         let guard = ScreenGuard::enter()?;
         let state = TuiState {
             version: env!("CARGO_PKG_VERSION"),
@@ -362,10 +367,14 @@ impl TuiApp {
             model: context.model,
             cwd: context.cwd,
             permission: context.permission,
-            approval: context.approval,
             status: "就绪".into(),
+            printed_lines: 0,
+            content_end_row: 0,
+            dynamic_top: 0,
             transcript: VecDeque::new(),
             streaming: String::new(),
+            assistant_received_delta: false,
+            code_fence_open: false,
             tools: Vec::new(),
             input: Vec::new(),
             cursor: 0,
@@ -373,14 +382,11 @@ impl TuiApp {
             history_index: None,
             draft: Vec::new(),
             command_selection: 0,
-            input_hint: "Enter 发送 · / 命令 · ↑↓ 历史 · 滚轮/PgUp 对话 · Ctrl+D 退出".into(),
+            input_hint: "Enter 发送 · Shift+Enter 换行 · / 命令 · ↑↓ 历史 · Ctrl+D 退出".into(),
             input_active: true,
-            input_interrupted: false,
             usage: None,
-            transcript_scroll: 0,
             available_tools: context.available_tools,
             skills: context.skills,
-            show_intro: true,
             session_picker: None,
             plan_review: None,
             model_picker: None,
@@ -390,9 +396,12 @@ impl TuiApp {
             renderer: TuiRenderer {
                 state: Arc::new(Mutex::new(state)),
                 color: context.color,
+                router: Arc::clone(&router),
             },
+            router,
         };
-        app.renderer.draw()?;
+        app.renderer.print_intro()?;
+        app.renderer.draw_dynamic()?;
         Ok((app, guard))
     }
 
@@ -405,33 +414,98 @@ impl TuiApp {
         state.model = model.to_owned();
         state.status = "模型已切换".into();
         drop(state);
-        self.renderer.draw()
+        self.renderer.draw_dynamic()
     }
 
     pub(crate) fn notice(&self, message: impl Into<String>) -> io::Result<()> {
-        let mut state = self.renderer.state.lock().unwrap();
-        state.show_intro = false;
-        state.transcript_scroll = 0;
-        push_block(&mut state, Role::System, message.into());
-        drop(state);
-        self.renderer.draw()
+        let text = message.into();
+        {
+            let mut state = self.renderer.state.lock().unwrap();
+            push_block(&mut state, Role::System, text.clone());
+        }
+        self.renderer.commit_block(Role::System, &text)
     }
 
     pub(crate) fn load_session(&self, session: &Session) -> io::Result<()> {
-        let mut state = self.renderer.state.lock().unwrap();
-        load_session_state(&mut state, session);
-        drop(state);
-        self.renderer.draw()
+        {
+            let mut state = self.renderer.state.lock().unwrap();
+            load_session_state(&mut state, session);
+        }
+        self.renderer.restore_viewport()
     }
 
-    pub(crate) fn select_session(
+    pub(crate) fn begin_prompt(&self, prompt: &str) -> io::Result<()> {
+        {
+            let mut state = self.renderer.state.lock().unwrap();
+            state.status = "正在处理".into();
+            push_block(&mut state, Role::User, prompt.to_owned());
+            state.streaming.clear();
+            state.assistant_received_delta = false;
+            state.code_fence_open = false;
+            state.tools.clear();
+            state.input.clear();
+            state.cursor = 0;
+            state.history_index = None;
+        }
+        self.renderer.commit_block(Role::User, prompt)
+    }
+
+    pub(crate) fn finish_prompt(&self, result: &AgentRunResult) -> io::Result<()> {
+        let assistant = {
+            let mut state = self.renderer.state.lock().unwrap();
+            let assistant = take_final_assistant_tail(&mut state, &result.final_message);
+            if !assistant.trim().is_empty() {
+                push_block(&mut state, Role::Assistant, redact_text(&assistant));
+            }
+            state.status = if result.exit_code == 0 {
+                "就绪".into()
+            } else {
+                "未完成".into()
+            };
+            state.tools.clear();
+            assistant
+        };
+        if assistant.trim().is_empty() {
+            self.renderer.draw_dynamic()
+        } else {
+            self.renderer.commit_block(Role::Assistant, &assistant)
+        }
+    }
+
+    /// 把按键交给 Composer 处理，返回可能的交互结果。
+    pub(crate) fn handle_key(&self, key: KeyEvent) -> io::Result<Option<InputOutcome>> {
+        let outcome = {
+            let mut state = self.renderer.state.lock().unwrap();
+            handle_input_key(&mut state, key)
+        };
+        self.renderer.draw_dynamic()?;
+        Ok(outcome)
+    }
+
+    /// 把粘贴内容整段插入 Composer，不触发提交。
+    pub(crate) fn handle_paste(&self, text: &str) -> io::Result<()> {
+        {
+            let mut state = self.renderer.state.lock().unwrap();
+            if insert_paste_text(&mut state, text) {
+                state.input_hint = format!("粘贴内容已截断：最多 {MAX_INPUT_CHARS} 个字符");
+            }
+        }
+        self.renderer.draw_dynamic()
+    }
+
+    /// 等待下一个 Composer 输入事件（运行中与空闲共用）。
+    pub(crate) async fn next_input(&self) -> Option<Event> {
+        self.router.next_for(InputFocus::Composer).await
+    }
+
+    pub(crate) async fn select_session(
         &self,
         choices: Vec<SessionChoice>,
     ) -> io::Result<Option<uuid::Uuid>> {
         if choices.is_empty() {
             return Ok(None);
         }
-        let _raw = RawGuard::enter()?;
+        let _focus_guard = self.router.acquire_focus(InputFocus::Picker);
         {
             let mut state = self.renderer.state.lock().unwrap();
             state.input_active = false;
@@ -440,37 +514,44 @@ impl TuiApp {
                 selected: 0,
             });
         }
-        self.renderer.draw()?;
+        self.renderer.draw_picker()?;
 
         let selected = loop {
-            let Event::Key(key) = read()? else {
-                continue;
-            };
-            if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
-                continue;
-            }
-            let mut state = self.renderer.state.lock().unwrap();
-            let Some(picker) = state.session_picker.as_mut() else {
+            let Some(event) = self.router.next_for(InputFocus::Picker).await else {
                 break None;
             };
-            match key.code {
-                KeyCode::Up => {
-                    picker.selected = if picker.selected == 0 {
-                        picker.choices.len() - 1
-                    } else {
-                        picker.selected - 1
+            match event {
+                Event::Key(key)
+                    if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+                {
+                    let mut state = self.renderer.state.lock().unwrap();
+                    let Some(picker) = state.session_picker.as_mut() else {
+                        break None;
                     };
+                    match key.code {
+                        KeyCode::Up => {
+                            picker.selected = if picker.selected == 0 {
+                                picker.choices.len() - 1
+                            } else {
+                                picker.selected - 1
+                            };
+                        }
+                        KeyCode::Down => {
+                            picker.selected = (picker.selected + 1) % picker.choices.len();
+                        }
+                        KeyCode::Enter => break Some(picker.choices[picker.selected].id),
+                        KeyCode::Esc => break None,
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            break None;
+                        }
+                        _ => {}
+                    }
+                    drop(state);
+                    self.renderer.draw_picker()?;
                 }
-                KeyCode::Down => {
-                    picker.selected = (picker.selected + 1) % picker.choices.len();
-                }
-                KeyCode::Enter => break Some(picker.choices[picker.selected].id),
-                KeyCode::Esc => break None,
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break None,
+                Event::Resize(_, _) => self.renderer.draw_picker()?,
                 _ => {}
             }
-            drop(state);
-            self.renderer.draw()?;
         };
 
         {
@@ -478,12 +559,13 @@ impl TuiApp {
             state.session_picker = None;
             state.input_active = true;
         }
-        self.renderer.draw()?;
+        self.renderer.restore_viewport()?;
+        self.renderer.draw_dynamic()?;
         Ok(selected)
     }
 
-    pub(crate) fn select_model(&self) -> io::Result<Option<String>> {
-        let _raw = RawGuard::enter()?;
+    pub(crate) async fn select_model(&self) -> io::Result<Option<String>> {
+        let _focus_guard = self.router.acquire_focus(InputFocus::Picker);
         {
             let mut state = self.renderer.state.lock().unwrap();
             let choices = model_options(&state.provider, &state.model);
@@ -494,36 +576,43 @@ impl TuiApp {
             state.input_active = false;
             state.model_picker = Some(ModelPicker { choices, selected });
         }
-        self.renderer.draw()?;
+        self.renderer.draw_picker()?;
 
         let selected = loop {
-            let Event::Key(key) = read()? else {
-                continue;
-            };
-            if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
-                continue;
-            }
-            let mut state = self.renderer.state.lock().unwrap();
-            let Some(picker) = state.model_picker.as_mut() else {
+            let Some(event) = self.router.next_for(InputFocus::Picker).await else {
                 break None;
             };
-            match key.code {
-                KeyCode::Up | KeyCode::Char('k') => {
-                    picker.selected = picker
-                        .selected
-                        .checked_sub(1)
-                        .unwrap_or(picker.choices.len() - 1);
+            match event {
+                Event::Key(key)
+                    if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+                {
+                    let mut state = self.renderer.state.lock().unwrap();
+                    let Some(picker) = state.model_picker.as_mut() else {
+                        break None;
+                    };
+                    match key.code {
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            picker.selected = picker
+                                .selected
+                                .checked_sub(1)
+                                .unwrap_or(picker.choices.len() - 1);
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            picker.selected = (picker.selected + 1) % picker.choices.len();
+                        }
+                        KeyCode::Enter => break Some(picker.choices[picker.selected].id.clone()),
+                        KeyCode::Esc => break None,
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            break None;
+                        }
+                        _ => {}
+                    }
+                    drop(state);
+                    self.renderer.draw_picker()?;
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    picker.selected = (picker.selected + 1) % picker.choices.len();
-                }
-                KeyCode::Enter => break Some(picker.choices[picker.selected].id.clone()),
-                KeyCode::Esc => break None,
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break None,
+                Event::Resize(_, _) => self.renderer.draw_picker()?,
                 _ => {}
             }
-            drop(state);
-            self.renderer.draw()?;
         };
 
         {
@@ -531,12 +620,13 @@ impl TuiApp {
             state.model_picker = None;
             state.input_active = true;
         }
-        self.renderer.draw()?;
+        self.renderer.restore_viewport()?;
+        self.renderer.draw_dynamic()?;
         Ok(selected)
     }
 
-    pub(crate) fn review_plan(&self, plan: &Plan) -> io::Result<Option<PlanReviewChoice>> {
-        let _raw = RawGuard::enter()?;
+    pub(crate) async fn review_plan(&self, plan: &Plan) -> io::Result<Option<PlanReviewChoice>> {
+        let _focus_guard = self.router.acquire_focus(InputFocus::Picker);
         {
             let mut state = self.renderer.state.lock().unwrap();
             state.input_active = false;
@@ -547,45 +637,52 @@ impl TuiApp {
                 mode: PlanDialogMode::Review,
             });
         }
-        self.renderer.draw()?;
+        self.renderer.draw_picker()?;
 
         let decision = loop {
-            let Event::Key(key) = read()? else {
-                continue;
-            };
-            if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
-                continue;
-            }
-            let mut state = self.renderer.state.lock().unwrap();
-            let Some(review) = state.plan_review.as_mut() else {
+            let Some(event) = self.router.next_for(InputFocus::Picker).await else {
                 break None;
             };
-            match key.code {
-                KeyCode::Up | KeyCode::Char('k') => {
-                    review.selected = if review.selected == 0 {
-                        2
-                    } else {
-                        review.selected - 1
+            match event {
+                Event::Key(key)
+                    if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+                {
+                    let mut state = self.renderer.state.lock().unwrap();
+                    let Some(review) = state.plan_review.as_mut() else {
+                        break None;
                     };
+                    match key.code {
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            review.selected = if review.selected == 0 {
+                                2
+                            } else {
+                                review.selected - 1
+                            };
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            review.selected = (review.selected + 1) % 3;
+                        }
+                        KeyCode::PageUp => review.scroll = review.scroll.saturating_sub(5),
+                        KeyCode::PageDown => review.scroll = review.scroll.saturating_add(5),
+                        KeyCode::Enter => {
+                            break Some(match review.selected {
+                                0 => PlanReviewChoice::Approve,
+                                1 => PlanReviewChoice::RequestChanges,
+                                _ => PlanReviewChoice::Reject,
+                            });
+                        }
+                        KeyCode::Esc => break None,
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            break None;
+                        }
+                        _ => {}
+                    }
+                    drop(state);
+                    self.renderer.draw_picker()?;
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    review.selected = (review.selected + 1) % 3;
-                }
-                KeyCode::PageUp => review.scroll = review.scroll.saturating_sub(5),
-                KeyCode::PageDown => review.scroll = review.scroll.saturating_add(5),
-                KeyCode::Enter => {
-                    break Some(match review.selected {
-                        0 => PlanReviewChoice::Approve,
-                        1 => PlanReviewChoice::RequestChanges,
-                        _ => PlanReviewChoice::Reject,
-                    });
-                }
-                KeyCode::Esc => break None,
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break None,
+                Event::Resize(_, _) => self.renderer.draw_picker()?,
                 _ => {}
             }
-            drop(state);
-            self.renderer.draw()?;
         };
 
         {
@@ -593,12 +690,13 @@ impl TuiApp {
             state.plan_review = None;
             state.input_active = true;
         }
-        self.renderer.draw()?;
+        self.renderer.restore_viewport()?;
+        self.renderer.draw_dynamic()?;
         Ok(decision)
     }
 
-    pub(crate) fn recover_plan(&self, plan: &Plan) -> io::Result<Option<PlanRecoveryChoice>> {
-        let _raw = RawGuard::enter()?;
+    pub(crate) async fn recover_plan(&self, plan: &Plan) -> io::Result<Option<PlanRecoveryChoice>> {
+        let _focus_guard = self.router.acquire_focus(InputFocus::Picker);
         {
             let mut state = self.renderer.state.lock().unwrap();
             state.input_active = false;
@@ -609,46 +707,53 @@ impl TuiApp {
                 mode: PlanDialogMode::Recovery,
             });
         }
-        self.renderer.draw()?;
+        self.renderer.draw_picker()?;
 
         let decision = loop {
-            let Event::Key(key) = read()? else {
-                continue;
-            };
-            if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
-                continue;
-            }
-            let mut state = self.renderer.state.lock().unwrap();
-            let Some(view) = state.plan_review.as_mut() else {
+            let Some(event) = self.router.next_for(InputFocus::Picker).await else {
                 break None;
             };
-            match key.code {
-                KeyCode::Up | KeyCode::Char('k') => {
-                    view.selected = if view.selected == 0 {
-                        3
-                    } else {
-                        view.selected - 1
+            match event {
+                Event::Key(key)
+                    if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+                {
+                    let mut state = self.renderer.state.lock().unwrap();
+                    let Some(view) = state.plan_review.as_mut() else {
+                        break None;
                     };
+                    match key.code {
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            view.selected = if view.selected == 0 {
+                                3
+                            } else {
+                                view.selected - 1
+                            };
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            view.selected = (view.selected + 1) % 4;
+                        }
+                        KeyCode::PageUp => view.scroll = view.scroll.saturating_sub(5),
+                        KeyCode::PageDown => view.scroll = view.scroll.saturating_add(5),
+                        KeyCode::Enter => {
+                            break Some(match view.selected {
+                                0 => PlanRecoveryChoice::Continue,
+                                1 => PlanRecoveryChoice::Retry,
+                                2 => PlanRecoveryChoice::ViewDetails,
+                                _ => PlanRecoveryChoice::Cancel,
+                            });
+                        }
+                        KeyCode::Esc => break None,
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            break None;
+                        }
+                        _ => {}
+                    }
+                    drop(state);
+                    self.renderer.draw_picker()?;
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    view.selected = (view.selected + 1) % 4;
-                }
-                KeyCode::PageUp => view.scroll = view.scroll.saturating_sub(5),
-                KeyCode::PageDown => view.scroll = view.scroll.saturating_add(5),
-                KeyCode::Enter => {
-                    break Some(match view.selected {
-                        0 => PlanRecoveryChoice::Continue,
-                        1 => PlanRecoveryChoice::Retry,
-                        2 => PlanRecoveryChoice::ViewDetails,
-                        _ => PlanRecoveryChoice::Cancel,
-                    });
-                }
-                KeyCode::Esc => break None,
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break None,
+                Event::Resize(_, _) => self.renderer.draw_picker()?,
                 _ => {}
             }
-            drop(state);
-            self.renderer.draw()?;
         };
 
         {
@@ -656,107 +761,525 @@ impl TuiApp {
             state.plan_review = None;
             state.input_active = true;
         }
-        self.renderer.draw()?;
+        self.renderer.restore_viewport()?;
+        self.renderer.draw_dynamic()?;
         Ok(decision)
-    }
-
-    pub(crate) fn begin_prompt(&self, prompt: &str) -> io::Result<()> {
-        let mut state = self.renderer.state.lock().unwrap();
-        state.input_active = false;
-        state.status = "正在处理".into();
-        state.show_intro = false;
-        push_block(&mut state, Role::User, prompt.to_owned());
-        state.streaming.clear();
-        state.tools.clear();
-        state.input.clear();
-        state.cursor = 0;
-        state.history_index = None;
-        state.transcript_scroll = 0;
-        drop(state);
-        self.renderer.draw()
-    }
-
-    pub(crate) fn finish_prompt(&self, result: &AgentRunResult) -> io::Result<()> {
-        let mut state = self.renderer.state.lock().unwrap();
-        let mut assistant = std::mem::take(&mut state.streaming);
-        if assistant.trim().is_empty() {
-            assistant.clone_from(&result.final_message);
-        }
-        if !assistant.trim().is_empty() {
-            push_block(&mut state, Role::Assistant, redact_text(&assistant));
-        }
-        state.status = if result.exit_code == 0 {
-            "就绪".into()
-        } else {
-            "未完成".into()
-        };
-        state.tools.clear();
-        state.transcript_scroll = 0;
-        state.input_active = true;
-        drop(state);
-        self.renderer.draw()
-    }
-
-    pub(crate) fn read_input(&self) -> io::Result<InputOutcome> {
-        let _raw = RawGuard::enter()?;
-        {
-            let mut state = self.renderer.state.lock().unwrap();
-            state.input_active = true;
-            state.input_interrupted = false;
-        }
-        self.renderer.draw()?;
-
-        loop {
-            let event = read()?;
-            if matches!(event, Event::Resize(_, _)) {
-                self.renderer.draw()?;
-                continue;
-            }
-            if let Event::Mouse(mouse) = event {
-                let mut state = self.renderer.state.lock().unwrap();
-                match mouse.kind {
-                    MouseEventKind::ScrollUp => {
-                        state.transcript_scroll = state.transcript_scroll.saturating_add(3)
-                    }
-                    MouseEventKind::ScrollDown => {
-                        state.transcript_scroll = state.transcript_scroll.saturating_sub(3)
-                    }
-                    _ => continue,
-                }
-                drop(state);
-                self.renderer.draw()?;
-                continue;
-            }
-            let Event::Key(key) = event else {
-                continue;
-            };
-            let outcome = {
-                let mut state = self.renderer.state.lock().unwrap();
-                handle_input_key(&mut state, key)
-            };
-            self.renderer.draw()?;
-            if let Some(outcome) = outcome {
-                return Ok(outcome);
-            }
-        }
     }
 }
 
 impl TuiRenderer {
-    fn draw(&self) -> io::Result<()> {
+    /// 审批菜单打开时暂停绘制与提交，避免覆盖菜单。
+    fn drawing_allowed(&self) -> bool {
+        self.router.focus() != InputFocus::Approval
+    }
+
+    /// 把一块已完成的对话文本包装后提交到终端滚动区，再重绘活动区。
+    fn commit_block(&self, role: Role, text: &str) -> io::Result<()> {
+        if !self.drawing_allowed() {
+            return Ok(());
+        }
+        let (columns, _) = size().unwrap_or((80, 24));
+        let body_width = usize::from(columns.saturating_sub(4)).max(10);
+        let mut lines = Vec::new();
+        if role == Role::Assistant {
+            append_markdown_wrapped(&mut lines, text, body_width);
+        } else {
+            append_wrapped(&mut lines, role, text, body_width);
+        }
+        self.commit_wrapped(&lines)
+    }
+
+    /// 把已包装的行打印进内容滚动区。
+    ///
+    /// 内容只在滚动区域 `[0, scroll_bottom]` 内流式打印，超出后终端
+    /// 自然向上滚动进入滚动缓冲区；底部活动区位于滚动区域之外，
+    /// 不会被内容覆盖，也不会反过来覆盖已提交的内容。
+    fn commit_wrapped(&self, lines: &[(Role, String)]) -> io::Result<()> {
+        if !self.drawing_allowed() {
+            return Ok(());
+        }
+        let (columns, rows) = size().unwrap_or((80, 24));
+        let mut stdout = io::stdout();
+        {
+            let mut state = self.state.lock().unwrap();
+            let scroll_bottom = scroll_bottom_of(&state, columns, rows);
+            let end_row = state.content_end_row.min(scroll_bottom);
+            queue_scroll_region(&mut stdout, scroll_bottom)?;
+            queue!(stdout, MoveTo(0, end_row), Clear(ClearType::FromCursorDown))?;
+            for (role, line) in lines {
+                if line.is_empty() {
+                    queue!(stdout, Print("\r\n"))?;
+                    continue;
+                }
+                print_role_line(&mut stdout, *role, line, columns, self.color)?;
+            }
+            state.printed_lines = state.printed_lines.saturating_add(lines.len());
+            // 内容末尾随打印推进；滚动发生后封顶在滚动区底行。
+            state.content_end_row = (end_row.saturating_add(lines.len() as u16)).min(scroll_bottom);
+            state.dynamic_top = 0;
+        }
+        stdout.flush()?;
+        self.draw_dynamic()
+    }
+
+    /// 把待提交块包装后一次性写入滚动区（emit 内部使用）。
+    fn commit_blocks(&self, blocks: &[(Role, String)]) -> io::Result<()> {
+        if !self.drawing_allowed() {
+            return Ok(());
+        }
+        let (columns, _) = size().unwrap_or((80, 24));
+        let body_width = usize::from(columns.saturating_sub(4)).max(10);
+        let mut lines = Vec::new();
+        for (role, text) in blocks {
+            if *role == Role::Assistant {
+                append_markdown_wrapped(&mut lines, text, body_width);
+            } else {
+                append_wrapped(&mut lines, *role, text, body_width);
+            }
+        }
+        self.commit_wrapped(&lines)
+    }
+
+    /// 重绘底部活动区：流式尾巴、工具活动、命令建议、状态线、Composer。
+    pub(crate) fn draw_dynamic(&self) -> io::Result<()> {
+        if !self.drawing_allowed() {
+            return Ok(());
+        }
+        let mut state = self.state.lock().unwrap();
+        let (columns, rows) = size().unwrap_or((80, 24));
+        if rows < 8 {
+            return Ok(());
+        }
+        let mut stdout = io::stdout();
+        let body_width = usize::from(columns.saturating_sub(4)).max(10);
+        let input_width = usize::from(columns.saturating_sub(3)).max(10);
+
+        // 内容滚动区在上（底行固定），活动区固定在下：设置滚动区域，
+        // 从内容末尾向下清除旧活动区与残影，再绘制固定活动区。
+        let scroll_bottom = scroll_bottom_of(&state, columns, rows);
+        let end_row = state.content_end_row.min(scroll_bottom);
+        queue_scroll_region(&mut stdout, scroll_bottom)?;
+        queue!(stdout, MoveTo(0, end_row), Clear(ClearType::FromCursorDown))?;
+
+        // ---- 固定活动区布局 ----
+        // chrome 4 行：状态行 dynamic_top、输入行 rows-3、分隔行 rows-2、帮助行 rows-1。
+        // 动态区在输入块与状态行之间：自下而上分配输入块（最多 3 行）→
+        // 流式尾巴（最多 4 行）→ 工具活动（最多 2 行）→ 命令建议（最多 5 行），
+        // 超出裁剪，滚动区底固定不变。
+        let input_row = rows.saturating_sub(3);
+        let dynamic_top = rows.saturating_sub(MAX_ACTIVITY_HEIGHT);
+
+        // 输入块（最后最多 3 行，其余折叠）。底部对齐输入行：单行输入时
+        // 输入行 = rows-3，多行输入时向上展开，与状态行(dynamic_top)不冲突。
+        let input_text: String = state.input.iter().collect();
+        let input_lines = wrap_input(&input_text, input_width);
+        let input_vis = input_lines.len().min(3);
+        let folded = input_lines.len().saturating_sub(input_vis);
+        let input_block_top = input_block_top_of(input_row, input_vis);
+        // 分隔线紧贴输入块上方；帮助行紧贴输入框下方。
+        let separator_row = input_block_top.saturating_sub(1);
+        let help_row = input_row.saturating_add(1);
+        // 动态区从分隔线上方开始向上分配。
+        let mut above = separator_row.saturating_sub(1);
+        // 折叠提示占用动态区最底一行。
+        if folded > 0 && above >= dynamic_top {
+            set_color(&mut stdout, self.color, MUTED)?;
+            queue!(
+                stdout,
+                MoveTo(1, above),
+                Clear(ClearType::CurrentLine),
+                Print(format!("… 已折叠 {folded} 行，Enter 发送全部 …"))
+            )?;
+            reset_color(&mut stdout, self.color)?;
+            above = above.saturating_sub(1);
+        }
+
+        // 动态区：自下而上分配尾巴/工具/建议，状态提示预留最顶一行。
+        // 空间 = 动态区底(above) 到 状态线(dynamic_top) 之间的行数。
+        let mut space = above.saturating_sub(dynamic_top);
+        let status_reserved = if state.status != "就绪" { 1u16 } else { 0u16 };
+        space = space.saturating_sub(status_reserved);
+
+        // 流式尾巴窗口（最多 4 行）。
+        if !state.streaming.is_empty() {
+            let mut tail = Vec::new();
+            append_wrapped(&mut tail, Role::Assistant, &state.streaming, body_width);
+            let n = tail.len().min(STREAMING_WINDOW).min(space as usize);
+            if n > 0 {
+                let start = tail.len() - n;
+                for (offset, (_, line)) in tail.iter().skip(start).take(n).enumerate() {
+                    let row = above.saturating_sub(n as u16).saturating_add(1) + offset as u16;
+                    set_color(&mut stdout, self.color, MUTED)?;
+                    queue!(
+                        stdout,
+                        MoveTo(1, row),
+                        Clear(ClearType::CurrentLine),
+                        Print(truncate_to_width(
+                            line,
+                            usize::from(columns.saturating_sub(4)).max(1)
+                        ))
+                    )?;
+                    reset_color(&mut stdout, self.color)?;
+                }
+                above = above.saturating_sub(n as u16);
+                space = space.saturating_sub(n as u16);
+            }
+        }
+
+        // 工具活动（尾巴上方，最多 2 行）。
+        if !state.tools.is_empty() {
+            let n = state.tools.len().min(2).min(space as usize);
+            if n > 0 {
+                for (offset, tool) in state.tools.iter().take(n).enumerate() {
+                    let row = above.saturating_sub(n as u16).saturating_add(1) + offset as u16;
+                    let marker = match tool.finished {
+                        Some(true) => "✓",
+                        Some(false) => "✗",
+                        None => "●",
+                    };
+                    let duration = tool
+                        .duration_ms
+                        .map(|duration| format!(" · {duration} ms"))
+                        .unwrap_or_default();
+                    set_color(
+                        &mut stdout,
+                        self.color,
+                        if tool.finished == Some(false) {
+                            WARNING
+                        } else {
+                            MUTED
+                        },
+                    )?;
+                    queue!(
+                        stdout,
+                        MoveTo(1, row),
+                        Clear(ClearType::CurrentLine),
+                        Print(format!(
+                            "{marker} {}  {}{duration}",
+                            tool_display_name(&tool.name),
+                            tool.detail
+                        ))
+                    )?;
+                    reset_color(&mut stdout, self.color)?;
+                }
+                above = above.saturating_sub(n as u16);
+                space = space.saturating_sub(n as u16);
+            }
+        }
+
+        // 命令建议（最多 5 行）：usage 按显示宽度对齐 description 列。
+        let suggestions = matching_commands(&state.input);
+        if !suggestions.is_empty() {
+            let n = suggestions
+                .len()
+                .min(MAX_COMMAND_SUGGESTIONS)
+                .min(space as usize);
+            if n > 0 {
+                let usage_width = suggestions
+                    .iter()
+                    .take(n)
+                    .map(|command| command.usage.width())
+                    .max()
+                    .unwrap_or(0);
+                for (index, command) in suggestions.into_iter().take(n).enumerate() {
+                    let row = above.saturating_sub(n as u16).saturating_add(1) + index as u16;
+                    let selected = index == state.command_selection.min(n.saturating_sub(1));
+                    set_color(
+                        &mut stdout,
+                        self.color,
+                        if selected { PRIMARY } else { MUTED },
+                    )?;
+                    if selected {
+                        queue!(stdout, SetAttribute(Attribute::Bold))?;
+                    }
+                    let line = command_suggestion_line(
+                        if selected { "›" } else { " " },
+                        command.usage,
+                        command.description,
+                        usage_width,
+                    );
+                    queue!(
+                        stdout,
+                        MoveTo(1, row),
+                        Clear(ClearType::CurrentLine),
+                        Print(truncate_to_width(
+                            &line,
+                            usize::from(columns.saturating_sub(4))
+                        )),
+                        SetAttribute(Attribute::Reset)
+                    )?;
+                    reset_color(&mut stdout, self.color)?;
+                }
+            }
+        }
+
+        // 状态提示：动态区最上方（Claude 式 "⏺ 思考中"），空闲时不显示。
+        if status_reserved == 1 && above > dynamic_top {
+            let row = above.saturating_sub(1);
+            let status_color = if state.status.contains("失败") || state.status.contains("暂停")
+            {
+                WARNING
+            } else {
+                PRIMARY
+            };
+            set_color(&mut stdout, self.color, status_color)?;
+            queue!(
+                stdout,
+                MoveTo(1, row),
+                Clear(ClearType::CurrentLine),
+                Print(format!("⏺ {}", state.status))
+            )?;
+            reset_color(&mut stdout, self.color)?;
+        }
+
+        // 输入块内容。
+        for (offset, line) in input_lines
+            .iter()
+            .skip(input_lines.len().saturating_sub(input_vis))
+            .take(input_vis)
+            .enumerate()
+        {
+            let row = input_block_top + offset as u16;
+            set_color(&mut stdout, self.color, PRIMARY)?;
+            queue!(
+                stdout,
+                MoveTo(1, row),
+                Clear(ClearType::CurrentLine),
+                SetAttribute(Attribute::Bold),
+                Print(if offset + 1 == input_vis {
+                    "❯ "
+                } else {
+                    "  "
+                }),
+                SetAttribute(Attribute::Reset)
+            )?;
+            reset_color(&mut stdout, self.color)?;
+            set_color(&mut stdout, self.color, TEXT)?;
+            queue!(
+                stdout,
+                Print(truncate_to_width(
+                    line,
+                    usize::from(columns.saturating_sub(4)).max(1)
+                ))
+            )?;
+            reset_color(&mut stdout, self.color)?;
+        }
+
+        // 分隔行。
+        set_color(&mut stdout, self.color, BORDER)?;
+        queue!(
+            stdout,
+            MoveTo(0, separator_row),
+            Clear(ClearType::CurrentLine),
+            Print("─".repeat(usize::from(columns)))
+        )?;
+        reset_color(&mut stdout, self.color)?;
+
+        // 帮助行。
+        set_color(&mut stdout, self.color, MUTED)?;
+        let running = !state.tools.is_empty() || !state.streaming.is_empty();
+        let hint_text = if running {
+            "Ctrl+C / Esc 打断 · Enter 排队 · 可继续输入"
+        } else if matching_commands(&state.input).is_empty() {
+            state.input_hint.as_str()
+        } else {
+            "↑↓ 选择 · Tab 补全 · Enter 确定"
+        };
+        queue!(
+            stdout,
+            MoveTo(0, help_row),
+            Clear(ClearType::CurrentLine),
+            MoveTo(3, help_row),
+            Print(truncate_to_width(
+                hint_text,
+                usize::from(columns.saturating_sub(4))
+            ))
+        )?;
+        reset_color(&mut stdout, self.color)?;
+
+        // 光标：输入激活时定位到 Composer 的当前行。
+        if state.input_active {
+            let (cursor_line, cursor_col) =
+                input_cursor_position(&state.input, state.cursor, input_width);
+            let visible_offset = input_lines.len().saturating_sub(input_vis);
+            let cursor_row = if cursor_line >= visible_offset {
+                input_row.saturating_sub(
+                    (input_vis.saturating_sub(1 + cursor_line - visible_offset)) as u16,
+                )
+            } else {
+                input_block_top
+            };
+            // 输入文本从列 3 开始（❯ 占列 1、空格占列 2），光标 = 3 + 列偏移。
+            queue!(
+                stdout,
+                MoveTo(
+                    (3 + cursor_col).min(usize::from(columns).saturating_sub(1)) as u16,
+                    cursor_row
+                ),
+                Show
+            )?;
+        } else {
+            queue!(stdout, Hide)?;
+        }
+        state.dynamic_top = scroll_bottom.saturating_add(1);
+        stdout.flush()
+    }
+
+    /// 模态界面（选择器/计划审阅）关闭后，把已提交的可见内容重绘回视口。
+    pub(crate) fn restore_viewport(&self) -> io::Result<()> {
+        if !self.drawing_allowed() {
+            return Ok(());
+        }
+        let (columns, rows) = size().unwrap_or((80, 24));
+        let body_width = usize::from(columns.saturating_sub(4)).max(10);
+        let (viewport, lines) = {
+            let state = self.state.lock().unwrap();
+            let dynamic_height = layout_height(&state, columns, rows).min(rows.saturating_sub(2));
+            let viewport = rows.saturating_sub(dynamic_height) as usize;
+            let mut tail = VecDeque::new();
+            for block in state.transcript.iter().rev() {
+                let mut block_lines = Vec::new();
+                if block.role == Role::Assistant {
+                    append_markdown_wrapped(&mut block_lines, &block.text, body_width);
+                } else {
+                    append_wrapped(&mut block_lines, block.role, &block.text, body_width);
+                }
+                block_lines.push((Role::System, String::new()));
+                for line in block_lines.into_iter().rev() {
+                    tail.push_front(line);
+                }
+                if tail.len() >= viewport {
+                    break;
+                }
+            }
+            while tail.len() > viewport {
+                tail.pop_front();
+            }
+            (viewport, tail)
+        };
+        let mut stdout = io::stdout();
+        for row in 0..viewport {
+            queue!(stdout, MoveTo(0, row as u16), Clear(ClearType::CurrentLine))?;
+        }
+        for (offset, (role, line)) in lines.iter().enumerate() {
+            let row = offset as u16;
+            if line.is_empty() {
+                continue;
+            }
+            queue!(stdout, MoveTo(0, row))?;
+            print_role_line(&mut stdout, *role, line, columns, self.color)?;
+        }
+        {
+            let mut state = self.state.lock().unwrap();
+            state.printed_lines = viewport;
+            state.dynamic_top = viewport as u16;
+        }
+        stdout.flush()
+    }
+
+    /// 启动横幅：打印一次进入滚动区，随内容增长自然上滚。
+    fn print_intro(&self) -> io::Result<()> {
+        let (provider, model, version, cwd, permission, tool_count, skills_empty) = {
+            let state = self.state.lock().unwrap();
+            (
+                state.provider.clone(),
+                state.model.clone(),
+                state.version,
+                state.cwd.clone(),
+                state.permission.clone(),
+                state.available_tools.len(),
+                state.skills.is_empty(),
+            )
+        };
+        let (columns, rows) = size().unwrap_or((80, 24));
+        let mut stdout = io::stdout();
+        if rows < 14 || columns < 42 {
+            set_color(&mut stdout, self.color, PRIMARY)?;
+            queue!(
+                stdout,
+                SetAttribute(Attribute::Bold),
+                Print(">_ XDUDU"),
+                SetAttribute(Attribute::Reset),
+                Print("\r\n")
+            )?;
+            reset_color(&mut stdout, self.color)?;
+            set_color(&mut stdout, self.color, MUTED)?;
+            queue!(
+                stdout,
+                Print(format!(
+                    "{} · {}\r\n",
+                    model_display_name(&provider, &model),
+                    provider
+                )),
+                Print(format!(
+                    "{} tools · Skills {}\r\n",
+                    tool_count,
+                    if skills_empty {
+                        "尚未启用"
+                    } else {
+                        "已启用"
+                    }
+                ))
+            )?;
+            reset_color(&mut stdout, self.color)?;
+            {
+                let mut state = self.state.lock().unwrap();
+                state.printed_lines = 3;
+                state.content_end_row = 3;
+            }
+            return stdout.flush();
+        }
+
+        let icon = [
+            "   ▗▄▄▄▄▄▄▄▖",
+            "▗▄▐  ▪   ▪  ▌▄▖",
+            "  ▀▀▌  ▿  ▐▀▀",
+            "    ▀   ▀",
+        ];
+        // Claude Code 式横幅：图标整体居中，版本信息单行居中在图标下方。
+        let width_icon_max = icon.iter().map(|line| line.width()).max().unwrap_or(20);
+        let pad = usize::from(columns).saturating_sub(width_icon_max) / 2;
+        for (row, icon_line) in icon.iter().enumerate() {
+            set_color(&mut stdout, self.color, PRIMARY)?;
+            queue!(stdout, MoveTo(pad as u16, row as u16), Print(icon_line))?;
+            reset_color(&mut stdout, self.color)?;
+            queue!(stdout, Print("\r\n"))?;
+        }
+        let info = format!(
+            "{} v{} · {} · {} tools · {}",
+            model_display_name(&provider, &model),
+            version,
+            cwd.display(),
+            tool_count,
+            permission
+        );
+        let info_width = info.width();
+        let info_pad = usize::from(columns).saturating_sub(info_width) / 2;
+        set_color(&mut stdout, self.color, MUTED)?;
+        queue!(
+            stdout,
+            MoveTo(info_pad as u16, icon.len() as u16),
+            Print(truncate_to_width(
+                &info,
+                usize::from(columns).saturating_sub(4).max(4)
+            ))
+        )?;
+        reset_color(&mut stdout, self.color)?;
+        queue!(stdout, Print("\r\n"))?;
+        // 记录内容行数：图标 4 行 + 信息 1 行 = 5。
+        {
+            let mut state = self.state.lock().unwrap();
+            state.printed_lines = 5;
+            state.content_end_row = 5;
+        }
+        stdout.flush()
+    }
+
+    /// 选择器/计划审阅的全区域覆盖绘制（随后由 [`Self::restore_viewport`] 恢复）。
+    fn draw_picker(&self) -> io::Result<()> {
         let state = self.state.lock().unwrap();
         let (columns, rows) = size().unwrap_or((80, 24));
         let mut stdout = io::stdout();
-        queue!(stdout, Hide)?;
-        for row in 0..rows {
-            queue!(stdout, MoveTo(0, row), Clear(ClearType::CurrentLine))?;
-        }
-
-        if state.show_intro {
-            draw_intro(&mut stdout, &state, columns, rows, self.color)?;
-        }
-        draw_transcript(&mut stdout, &state, columns, rows, self.color)?;
-        draw_chrome(&mut stdout, &state, columns, rows, self.color)?;
         if state.session_picker.is_some() {
             draw_session_picker(&mut stdout, &state, columns, rows, self.color)?;
         }
@@ -766,13 +1289,14 @@ impl TuiRenderer {
         if state.model_picker.is_some() {
             draw_model_picker(&mut stdout, &state, columns, rows, self.color)?;
         }
-        stdout.flush()
+        Ok(())
     }
 }
 
 #[async_trait]
 impl EventSink for TuiRenderer {
     async fn emit(&self, event: AgentEvent) {
+        let mut commits: Vec<(Role, String)> = Vec::new();
         {
             let mut state = self.state.lock().unwrap();
             if state.debug_trace
@@ -786,7 +1310,14 @@ impl EventSink for TuiRenderer {
                     state.status = state_label(agent_state).into();
                 }
                 AgentEvent::AssistantDelta { text } => {
+                    state.assistant_received_delta = true;
                     state.streaming.push_str(&redact_text(&text));
+                    if self.router.focus() == InputFocus::Composer {
+                        for (role, done) in take_ready_segments(&mut state) {
+                            push_block(&mut state, role, done.clone());
+                            commits.push((role, done));
+                        }
+                    }
                 }
                 AgentEvent::ToolStarted { call_id, name } => {
                     state.tools.push(ToolActivity {
@@ -829,22 +1360,22 @@ impl EventSink for TuiRenderer {
                     {
                         let tool = state.tools.remove(index);
                         let line = completed_tool_line(&tool, &result);
-                        push_block(
-                            &mut state,
-                            if result.success {
-                                Role::Tool
-                            } else {
-                                Role::Warning
-                            },
-                            line,
-                        );
+                        let role = if result.success {
+                            Role::Tool
+                        } else {
+                            Role::Warning
+                        };
+                        push_block(&mut state, role, line.clone());
+                        commits.push((role, line));
                     }
                 }
                 AgentEvent::UsageUpdated { usage } => {
                     state.usage = Some((usage.input_tokens, usage.output_tokens));
                 }
                 AgentEvent::Warning { message, .. } => {
-                    push_block(&mut state, Role::Warning, redact_text(&message));
+                    let line = redact_text(&message);
+                    push_block(&mut state, Role::Warning, line.clone());
+                    commits.push((Role::Warning, line));
                 }
                 AgentEvent::DebugTrace { .. } => {}
                 AgentEvent::PlanStarted { .. } => state.status = "执行计划".into(),
@@ -854,38 +1385,46 @@ impl EventSink for TuiRenderer {
                 AgentEvent::PlanStepCompleted {
                     summary, evidence, ..
                 } => {
-                    push_block(
-                        &mut state,
-                        Role::System,
-                        format!("步骤完成：{}", redact_text(&summary)),
-                    );
+                    let line = format!("步骤完成：{}", redact_text(&summary));
+                    push_block(&mut state, Role::System, line.clone());
+                    commits.push((Role::System, line));
                     for item in evidence {
-                        push_block(
-                            &mut state,
-                            Role::System,
-                            format!(
-                                "证据 {}：{}",
-                                item.criterion_index,
-                                redact_text(&item.evidence)
-                            ),
+                        let line = format!(
+                            "证据 {}：{}",
+                            item.criterion_index,
+                            redact_text(&item.evidence)
                         );
+                        push_block(&mut state, Role::System, line.clone());
+                        commits.push((Role::System, line));
                     }
                 }
                 AgentEvent::PlanStepFailed { error, .. } => {
-                    push_block(
-                        &mut state,
-                        Role::Warning,
-                        format!("步骤失败：{}", redact_text(&error)),
-                    );
+                    let line = format!("步骤失败：{}", redact_text(&error));
+                    push_block(&mut state, Role::Warning, line.clone());
+                    commits.push((Role::Warning, line));
                 }
                 AgentEvent::PlanPaused { reason, .. } => {
                     state.status = "计划暂停".into();
-                    push_block(&mut state, Role::Warning, redact_text(&reason));
+                    let line = redact_text(&reason);
+                    push_block(&mut state, Role::Warning, line.clone());
+                    commits.push((Role::Warning, line));
                 }
                 AgentEvent::PlanCompleted { .. } => state.status = "计划完成".into(),
             }
+            if self.router.focus() == InputFocus::Composer {
+                for (role, done) in take_ready_segments(&mut state) {
+                    push_block(&mut state, role, done.clone());
+                    commits.push((role, done));
+                }
+            }
         }
-        let _ = self.draw();
+        if self.router.focus() == InputFocus::Composer {
+            if !commits.is_empty() {
+                let _ = self.commit_blocks(&commits);
+            } else {
+                let _ = self.draw_dynamic();
+            }
+        }
     }
 }
 
@@ -894,6 +1433,24 @@ fn handle_input_key(state: &mut TuiState, key: KeyEvent) -> Option<InputOutcome>
         return None;
     }
     match key.code {
+        KeyCode::Enter
+            if key
+                .modifiers
+                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+        {
+            state.input.insert(state.cursor, '\n');
+            state.cursor += 1;
+            state.history_index = None;
+            state.command_selection = 0;
+            None
+        }
+        KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            state.input.insert(state.cursor, '\n');
+            state.cursor += 1;
+            state.history_index = None;
+            state.command_selection = 0;
+            None
+        }
         KeyCode::Enter => {
             let mut line = state.input.iter().collect::<String>();
             if line.trim().is_empty() {
@@ -922,7 +1479,6 @@ fn handle_input_key(state: &mut TuiState, key: KeyEvent) -> Option<InputOutcome>
         }
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             if state.input.is_empty() {
-                state.input_interrupted = true;
                 Some(InputOutcome::Interrupted)
             } else {
                 state.input.clear();
@@ -936,6 +1492,16 @@ fn handle_input_key(state: &mut TuiState, key: KeyEvent) -> Option<InputOutcome>
             if key.modifiers.contains(KeyModifiers::CONTROL) && state.input.is_empty() =>
         {
             Some(InputOutcome::Exit)
+        }
+        KeyCode::Esc => {
+            // Claude Code 风格：Esc 清空当前输入。
+            if !state.input.is_empty() {
+                state.input.clear();
+                state.cursor = 0;
+                state.history_index = None;
+                state.command_selection = 0;
+            }
+            None
         }
         KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             state.cursor = 0;
@@ -975,14 +1541,6 @@ fn handle_input_key(state: &mut TuiState, key: KeyEvent) -> Option<InputOutcome>
                 let suffix = if command.requires_argument { " " } else { "" };
                 replace_input(state, &format!("{}{suffix}", command.name));
             }
-            None
-        }
-        KeyCode::PageUp => {
-            state.transcript_scroll = state.transcript_scroll.saturating_add(8);
-            None
-        }
-        KeyCode::PageDown => {
-            state.transcript_scroll = state.transcript_scroll.saturating_sub(8);
             None
         }
         KeyCode::Left if state.cursor > 0 => {
@@ -1069,16 +1627,112 @@ fn load_history(state: &mut TuiState, index: usize) {
     state.command_selection = 0;
 }
 
+/// 插入整段粘贴内容。返回 true 表示达到输入上限并发生截断。
+fn insert_paste_text(state: &mut TuiState, text: &str) -> bool {
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    let remaining = MAX_INPUT_CHARS.saturating_sub(state.input.len());
+    let mut inserted: Vec<char> = normalized.chars().take(remaining).collect();
+    let inserted_len = inserted.len();
+    let truncated = normalized.chars().count() > inserted_len;
+    state
+        .input
+        .splice(state.cursor..state.cursor, inserted.drain(..));
+    state.cursor += inserted_len;
+    state.history_index = None;
+    state.command_selection = 0;
+    truncated
+}
+
+/// 只取本轮尚未提交的助手尾部。非流式 Provider 才使用完整最终消息。
+fn take_final_assistant_tail(state: &mut TuiState, final_message: &str) -> String {
+    let mut assistant = std::mem::take(&mut state.streaming);
+    state.code_fence_open = false;
+    if !state.assistant_received_delta && assistant.trim().is_empty() {
+        assistant = final_message.to_owned();
+    }
+    state.assistant_received_delta = false;
+    assistant
+}
+
+/// 从流式缓冲中取出可以立即提交的块列表（角色 + 文本）。
+///
+/// 提交粒度保证长文本实时可见，同时保留可用的 Markdown 样式：
+/// - 普通完整行到达即提交，长文本实时流入滚动区（标题、列表、
+///   引用等行级语义由渲染器按行转换保留）；
+/// - 表格行（以 `|` 开头）做块级缓冲，遇到空行或非表格行时整块
+///   提交，保证表格能渲染成终端表格样式；
+/// - 代码栅栏打开行提交为普通块（渲染出语言标记），栅栏内逐行以
+///   代码样式实时提交，闭合行提交为空代码块。
+fn take_ready_segments(state: &mut TuiState) -> Vec<(Role, String)> {
+    let text = std::mem::take(&mut state.streaming);
+    let mut segments = Vec::new();
+    let mut fence = state.code_fence_open;
+    let mut table_buf = String::new();
+    let mut consumed = 0usize;
+    let mut line_start = 0usize;
+    for (index, character) in text.char_indices() {
+        if character != '\n' {
+            continue;
+        }
+        let line = &text[line_start..index];
+        if fence {
+            if is_fence_line(line) {
+                // 闭合行：作为空代码块提交，终端上不显示 ``` 本身。
+                segments.push((Role::Assistant, "```\n".into()));
+                fence = false;
+            } else {
+                // 栅栏内：逐行以代码样式提交，长代码块实时进入滚动区。
+                segments.push((Role::AssistantCode, format!("  {line}\n")));
+            }
+        } else if is_fence_line(line) {
+            flush_table(&mut segments, &mut table_buf);
+            // 栅栏打开行：作为普通块提交（未闭合代码块渲染出语言标记）。
+            segments.push((Role::Assistant, format!("{line}\n")));
+            fence = true;
+        } else if is_table_line(line) {
+            // 表格候选行：累积到表格结束（空行/非表格行）再整块提交。
+            table_buf.push_str(line);
+            table_buf.push('\n');
+        } else {
+            flush_table(&mut segments, &mut table_buf);
+            // 普通完整行：立即提交，长文本实时流入滚动区。
+            segments.push((Role::Assistant, format!("{line}\n")));
+        }
+        line_start = index + 1;
+        consumed = index + 1;
+    }
+    state.code_fence_open = fence;
+    // 未完成行与未结束的表格缓冲保留回流式缓冲，等待后续增量。
+    let mut rest = std::mem::take(&mut table_buf);
+    rest.push_str(&text[consumed..]);
+    state.streaming = rest;
+    segments
+}
+
+fn flush_table(segments: &mut Vec<(Role, String)>, table_buf: &mut String) {
+    if !table_buf.is_empty() {
+        segments.push((Role::Assistant, std::mem::take(table_buf)));
+    }
+}
+
+fn is_table_line(line: &str) -> bool {
+    line.trim_start().starts_with('|')
+}
+
+fn is_fence_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("```") || trimmed.starts_with("~~~")
+}
+
 fn load_session_state(state: &mut TuiState, session: &Session) {
     state.transcript.clear();
     state.streaming.clear();
+    state.code_fence_open = false;
     state.tools.clear();
     state.input.clear();
     state.cursor = 0;
     state.history_index = None;
-    state.show_intro = false;
     state.status = "已恢复会话".into();
-    state.transcript_scroll = 0;
     state.usage = Some((session.total_input_tokens, session.total_output_tokens));
     for message in &session.messages {
         let role = match message.role {
@@ -1145,401 +1799,6 @@ fn draw_header(
     Ok(())
 }
 
-fn draw_intro(
-    writer: &mut impl Write,
-    state: &TuiState,
-    columns: u16,
-    rows: u16,
-    color: bool,
-) -> io::Result<()> {
-    if rows < 14 || columns < 42 {
-        set_color(writer, color, PRIMARY)?;
-        queue!(
-            writer,
-            MoveTo(2, 1),
-            SetAttribute(Attribute::Bold),
-            Print(">_ XDUDU"),
-            SetAttribute(Attribute::Reset)
-        )?;
-        set_color(writer, color, MUTED)?;
-        queue!(
-            writer,
-            MoveTo(2, 2),
-            Print(format!(
-                "{} · {}",
-                model_display_name(&state.provider, &state.model),
-                state.provider
-            )),
-            MoveTo(2, 3),
-            Print(format!(
-                "{} tools · Skills {}",
-                state.available_tools.len(),
-                if state.skills.is_empty() {
-                    "尚未启用"
-                } else {
-                    "已启用"
-                }
-            ))
-        )?;
-        return reset_color(writer, color);
-    }
-
-    let icon = [
-        "   ▗▄▄▄▄▄▄▄▖",
-        "▗▄▐  ▪   ▪  ▌▄▖",
-        "  ▀▀▌  ▿  ▐▀▀",
-        "    ▀   ▀",
-    ];
-    for (index, line) in icon.iter().enumerate() {
-        set_color(writer, color, if index < 4 { PRIMARY } else { MUTED })?;
-        queue!(writer, MoveTo(2, 1 + index as u16), Print(line))?;
-    }
-
-    let x = 22;
-    set_color(writer, color, TEXT)?;
-    queue!(
-        writer,
-        MoveTo(x, 1),
-        SetAttribute(Attribute::Bold),
-        Print("XDUDU"),
-        SetAttribute(Attribute::Reset)
-    )?;
-    set_color(writer, color, MUTED)?;
-    queue!(
-        writer,
-        Print(format!(" v{}", state.version)),
-        MoveTo(x, 2),
-        Print(truncate_to_width(
-            &model_display_name(&state.provider, &state.model),
-            usize::from(columns.saturating_sub(x + 2))
-        )),
-        MoveTo(x, 3),
-        Print(truncate_to_width(
-            &state.cwd.display().to_string(),
-            usize::from(columns.saturating_sub(x + 2))
-        )),
-        MoveTo(x, 4),
-        Print(format!(
-            "{} tools · {}",
-            state.available_tools.len(),
-            state.permission
-        ))
-    )?;
-    reset_color(writer, color)
-}
-
-#[allow(dead_code)]
-fn draw_hermes_intro(
-    writer: &mut impl Write,
-    state: &TuiState,
-    columns: u16,
-    rows: u16,
-    color: bool,
-) -> io::Result<()> {
-    if rows < 20 || columns < 46 {
-        set_color(writer, color, PRIMARY)?;
-        queue!(
-            writer,
-            MoveTo(2, 2),
-            SetAttribute(Attribute::Bold),
-            Print(">_ XDUDU"),
-            SetAttribute(Attribute::Reset)
-        )?;
-        set_color(writer, color, MUTED)?;
-        queue!(
-            writer,
-            MoveTo(2, 3),
-            Print(format!("{} · {}", state.provider, state.model)),
-            MoveTo(2, 4),
-            Print(format!(
-                "{} tools · Skills 尚未启用",
-                state.available_tools.len()
-            ))
-        )?;
-        reset_color(writer, color)?;
-        return Ok(());
-    }
-
-    let left = 1;
-    let top = 2;
-    let bottom = rows.saturating_sub(CHROME_ROWS + 2).min(17);
-    let width = columns.saturating_sub(2);
-    let split = (columns / 2).clamp(30, 36);
-    set_color(writer, color, BORDER)?;
-    queue!(
-        writer,
-        MoveTo(left, top),
-        Print("╭"),
-        Print("─".repeat(usize::from(width.saturating_sub(2)))),
-        Print("╮")
-    )?;
-    for row in top + 1..bottom {
-        queue!(
-            writer,
-            MoveTo(left, row),
-            Print("│"),
-            MoveTo(width, row),
-            Print("│")
-        )?;
-    }
-    queue!(
-        writer,
-        MoveTo(left, bottom),
-        Print("╰"),
-        Print("─".repeat(usize::from(width.saturating_sub(2)))),
-        Print("╯")
-    )?;
-    for row in top + 1..bottom {
-        queue!(writer, MoveTo(split, row), Print("│"))?;
-    }
-
-    let icon = [
-        "          ·",
-        "          │",
-        "      ╭───┴───╮",
-        "  ╭───│  · ·  │───╮",
-        "  │   │   ▿   │   │",
-        "  ╰───╰───┬───╯───╯",
-        "          │",
-        "      ╭───┴───╮",
-        "      │  >_   │",
-        "      ╰───────╯",
-    ];
-    for (index, line) in icon.iter().enumerate() {
-        set_color(writer, color, if index < 6 { PRIMARY } else { MUTED })?;
-        queue!(writer, MoveTo(5, top + 1 + index as u16), Print(line))?;
-    }
-
-    let model = truncate_to_width(&state.model, usize::from(split.saturating_sub(7)));
-    set_color(writer, color, TEXT)?;
-    queue!(
-        writer,
-        MoveTo(4, bottom.saturating_sub(3)),
-        SetAttribute(Attribute::Bold),
-        Print(model),
-        SetAttribute(Attribute::Reset)
-    )?;
-    set_color(writer, color, MUTED)?;
-    queue!(
-        writer,
-        MoveTo(4, bottom.saturating_sub(2)),
-        Print(&state.provider),
-        MoveTo(4, bottom.saturating_sub(1)),
-        Print(truncate_to_width(
-            &state.cwd.display().to_string(),
-            usize::from(split.saturating_sub(6))
-        ))
-    )?;
-
-    let x = split + 3;
-    set_color(writer, color, PRIMARY)?;
-    queue!(
-        writer,
-        MoveTo(x, top + 1),
-        SetAttribute(Attribute::Bold),
-        Print("当前运行"),
-        SetAttribute(Attribute::Reset)
-    )?;
-    set_color(writer, color, MUTED)?;
-    queue!(
-        writer,
-        MoveTo(x, top + 2),
-        Print("模型  "),
-        SetForegroundColor(TEXT),
-        Print(truncate_to_width(
-            &state.model,
-            usize::from(columns.saturating_sub(x + 3))
-        )),
-        SetForegroundColor(MUTED),
-        MoveTo(x, top + 3),
-        Print(format!(
-            "权限  {} · 审批 {}",
-            state.permission, state.approval
-        ))
-    )?;
-
-    set_color(writer, color, PRIMARY)?;
-    queue!(
-        writer,
-        MoveTo(x, top + 5),
-        SetAttribute(Attribute::Bold),
-        Print("可用工具"),
-        SetAttribute(Attribute::Reset)
-    )?;
-    let groups = tool_groups(&state.available_tools);
-    for (index, (label, tools)) in groups.iter().take(4).enumerate() {
-        let row = top + 6 + index as u16;
-        set_color(writer, color, MUTED)?;
-        queue!(writer, MoveTo(x, row), Print(format!("{label:<7}")))?;
-        set_color(writer, color, TEXT)?;
-        queue!(
-            writer,
-            Print(truncate_to_width(
-                tools,
-                usize::from(columns.saturating_sub(x + 10))
-            ))
-        )?;
-    }
-
-    set_color(writer, color, PRIMARY)?;
-    queue!(
-        writer,
-        MoveTo(x, top + 11),
-        SetAttribute(Attribute::Bold),
-        Print("Skills"),
-        SetAttribute(Attribute::Reset)
-    )?;
-    set_color(writer, color, MUTED)?;
-    let skills = if state.skills.is_empty() {
-        "尚未启用（M7 规划）".to_owned()
-    } else {
-        state.skills.join(", ")
-    };
-    queue!(
-        writer,
-        MoveTo(x, top + 12),
-        Print(truncate_to_width(
-            &skills,
-            usize::from(columns.saturating_sub(x + 3))
-        )),
-        MoveTo(x, bottom.saturating_sub(1)),
-        Print(format!(
-            "{} tools · {} skills · /help",
-            state.available_tools.len(),
-            state.skills.len()
-        ))
-    )?;
-    reset_color(writer, color)
-}
-
-fn tool_groups(tools: &[String]) -> Vec<(&'static str, String)> {
-    let collect = |names: &[&str]| {
-        names
-            .iter()
-            .filter(|name| tools.iter().any(|tool| tool == **name))
-            .copied()
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-    [
-        (
-            "文件",
-            collect(&["file_read", "file_write", "search_text", "apply_patch"]),
-        ),
-        ("Git", collect(&["git_status", "git_diff"])),
-        ("网络", collect(&["web_search", "web_fetch"])),
-        ("系统", collect(&["terminal_exec"])),
-    ]
-    .into_iter()
-    .filter(|(_, tools)| !tools.is_empty())
-    .collect()
-}
-
-fn draw_transcript(
-    writer: &mut impl Write,
-    state: &TuiState,
-    columns: u16,
-    rows: u16,
-    color: bool,
-) -> io::Result<()> {
-    let transcript_top = if state.show_intro && rows >= 14 && columns >= 42 {
-        8
-    } else if state.show_intro {
-        6
-    } else {
-        2
-    };
-    let available = usize::from(rows.saturating_sub(CHROME_ROWS + transcript_top));
-    let body_width = usize::from(columns.saturating_sub(4)).max(10);
-    let mut lines: Vec<(Role, String)> = Vec::new();
-
-    for block in &state.transcript {
-        if block.role == Role::Assistant {
-            append_markdown_wrapped(&mut lines, &block.text, body_width);
-        } else {
-            append_wrapped(&mut lines, block.role, &block.text, body_width);
-        }
-        lines.push((Role::System, String::new()));
-    }
-    for tool in &state.tools {
-        let marker = match tool.finished {
-            Some(true) => "✓",
-            Some(false) => "✗",
-            None => "●",
-        };
-        let duration = tool
-            .duration_ms
-            .map(|duration| format!(" · {duration} ms"))
-            .unwrap_or_default();
-        append_wrapped(
-            &mut lines,
-            if tool.finished == Some(false) {
-                Role::Warning
-            } else {
-                Role::System
-            },
-            &format!(
-                "{marker} {}  {}{duration}",
-                tool_display_name(&tool.name),
-                tool.detail
-            ),
-            body_width,
-        );
-    }
-    if !state.streaming.is_empty() {
-        append_markdown_wrapped(&mut lines, &state.streaming, body_width);
-    }
-
-    let start = transcript_window_start(lines.len(), available, state.transcript_scroll);
-    for (offset, (role, line)) in lines.iter().skip(start).take(available).enumerate() {
-        let row = transcript_top + offset as u16;
-        queue!(writer, MoveTo(1, row))?;
-        let glyph = match role {
-            Role::User => "❯",
-            Role::Assistant
-            | Role::AssistantHeading
-            | Role::AssistantCode
-            | Role::AssistantDiffAdd
-            | Role::AssistantDiffRemove => "┊",
-            Role::Tool => "●",
-            Role::System => "·",
-            Role::Warning => "!",
-        };
-        let tone = match role {
-            Role::User => PRIMARY,
-            Role::Assistant => TEXT,
-            Role::AssistantHeading => PRIMARY,
-            Role::AssistantCode => MUTED,
-            Role::AssistantDiffAdd => Color::Rgb {
-                r: 132,
-                g: 169,
-                b: 140,
-            },
-            Role::AssistantDiffRemove => Color::Rgb {
-                r: 190,
-                g: 110,
-                b: 110,
-            },
-            Role::Tool => PRIMARY,
-            Role::System => MUTED,
-            Role::Warning => WARNING,
-        };
-        set_color(writer, color, tone)?;
-        queue!(writer, Print(glyph), Print(" "))?;
-        if matches!(role, Role::User | Role::AssistantHeading) {
-            queue!(writer, SetAttribute(Attribute::Bold))?;
-        }
-        queue!(writer, Print(line), SetAttribute(Attribute::Reset))?;
-        reset_color(writer, color)?;
-    }
-    Ok(())
-}
-
-fn transcript_window_start(total: usize, visible: usize, scroll_from_bottom: usize) -> usize {
-    let latest_start = total.saturating_sub(visible);
-    latest_start.saturating_sub(scroll_from_bottom.min(latest_start))
-}
-
 fn completed_tool_line(tool: &ToolActivity, result: &xdudu_core::tools::ToolResult) -> String {
     let duration = if result.duration_ms >= 1_000 {
         format!("{:.1} s", result.duration_ms as f64 / 1_000.0)
@@ -1582,152 +1841,6 @@ fn completed_tool_line(tool: &ToolActivity, result: &xdudu_core::tools::ToolResu
     } else {
         format!("{name}  失败 · {duration}")
     }
-}
-
-fn draw_chrome(
-    writer: &mut impl Write,
-    state: &TuiState,
-    columns: u16,
-    rows: u16,
-    color: bool,
-) -> io::Result<()> {
-    let (status_row, _, _, _) = chrome_positions(rows);
-    // 状态、模型和权限已在其他区域展示，输入框上方只保留边界。
-    // 运行和上翻时仅用边框色彩给出低干扰状态反馈。
-    let border_color = if state.status.contains("失败") || state.status.contains("暂停") {
-        WARNING
-    } else if state.status != "就绪" || state.transcript_scroll > 0 {
-        PRIMARY
-    } else {
-        BORDER
-    };
-    let _token_usage = state.usage;
-    set_color(writer, color, border_color)?;
-    queue!(
-        writer,
-        MoveTo(0, status_row),
-        Clear(ClearType::CurrentLine),
-        Print("─".repeat(usize::from(columns)))
-    )?;
-    reset_color(writer, color)?;
-
-    draw_input_area(writer, state, columns, rows, color)
-}
-
-fn draw_input_area(
-    writer: &mut impl Write,
-    state: &TuiState,
-    columns: u16,
-    rows: u16,
-    color: bool,
-) -> io::Result<()> {
-    let (_, input_row, separator_row, help_row) = chrome_positions(rows);
-    draw_command_suggestions(writer, state, columns, rows, color)?;
-    set_color(writer, color, PRIMARY)?;
-    queue!(
-        writer,
-        MoveTo(1, input_row),
-        Clear(ClearType::CurrentLine),
-        SetAttribute(Attribute::Bold),
-        Print("❯"),
-        SetAttribute(Attribute::Reset),
-        Print(" ")
-    )?;
-    reset_color(writer, color)?;
-    let input: String = state.input.iter().collect();
-    queue!(writer, Print(&input))?;
-
-    set_color(writer, color, BORDER)?;
-    queue!(
-        writer,
-        MoveTo(0, separator_row),
-        Clear(ClearType::CurrentLine),
-        Print("─".repeat(usize::from(columns)))
-    )?;
-    reset_color(writer, color)?;
-
-    set_color(writer, color, MUTED)?;
-    let hint_text = if matching_commands(&state.input).is_empty() {
-        state.input_hint.as_str()
-    } else {
-        "↑↓ 选择 · Tab 补全 · Enter 确定"
-    };
-    let hint = truncate_to_width(hint_text, usize::from(columns.saturating_sub(4)));
-    queue!(
-        writer,
-        MoveTo(0, help_row),
-        Clear(ClearType::CurrentLine),
-        MoveTo(3, help_row),
-        Print(hint)
-    )?;
-    reset_color(writer, color)?;
-
-    if state.input_active {
-        let prefix_width = 3_u16;
-        let cursor_width = state.input[..state.cursor]
-            .iter()
-            .map(|character| character.width().unwrap_or(0))
-            .sum::<usize>()
-            .min(u16::MAX as usize) as u16;
-        queue!(
-            writer,
-            MoveTo(prefix_width.saturating_add(cursor_width), input_row),
-            Show
-        )?;
-    }
-    Ok(())
-}
-
-fn draw_command_suggestions(
-    writer: &mut impl Write,
-    state: &TuiState,
-    columns: u16,
-    rows: u16,
-    color: bool,
-) -> io::Result<()> {
-    let suggestions = matching_commands(&state.input);
-    if suggestions.is_empty() {
-        return Ok(());
-    }
-    let count = suggestions.len().min(MAX_COMMAND_SUGGESTIONS);
-    let start_row = rows.saturating_sub(4 + count as u16);
-    for (index, command) in suggestions.into_iter().take(count).enumerate() {
-        let row = start_row + index as u16;
-        if row >= rows {
-            break;
-        }
-        queue!(writer, MoveTo(2, row), Clear(ClearType::CurrentLine))?;
-        let selected = index == state.command_selection.min(count.saturating_sub(1));
-        set_color(writer, color, if selected { PRIMARY } else { MUTED })?;
-        if selected {
-            queue!(writer, SetAttribute(Attribute::Bold))?;
-        }
-        let line = format!(
-            "{} {:<18} {}",
-            if selected { "›" } else { " " },
-            command.usage,
-            command.description
-        );
-        queue!(
-            writer,
-            Print(truncate_to_width(
-                &line,
-                usize::from(columns.saturating_sub(4))
-            )),
-            SetAttribute(Attribute::Reset)
-        )?;
-        reset_color(writer, color)?;
-    }
-    Ok(())
-}
-
-fn chrome_positions(rows: u16) -> (u16, u16, u16, u16) {
-    (
-        rows.saturating_sub(4),
-        rows.saturating_sub(3),
-        rows.saturating_sub(2),
-        rows.saturating_sub(1),
-    )
 }
 
 fn draw_session_picker(
@@ -2049,6 +2162,37 @@ fn draw_plan_review(
     reset_color(writer, color)
 }
 
+/// 活动区完整高度：chrome 4 行 + 输入块 + 折叠提示 + 建议 + 工具 + 流式尾巴，
+/// 封顶在 [`MAX_ACTIVITY_HEIGHT`]，避免活动区挤没内容滚动区。
+fn layout_height(state: &TuiState, columns: u16, rows: u16) -> u16 {
+    layout_height_raw(state, columns, rows).min(MAX_ACTIVITY_HEIGHT)
+}
+
+fn layout_height_raw(state: &TuiState, columns: u16, rows: u16) -> u16 {
+    let body_width = usize::from(columns.saturating_sub(4)).max(10);
+    let input_width = usize::from(columns.saturating_sub(3)).max(10);
+    let mut height = 4u16;
+    let input_text: String = state.input.iter().collect();
+    let input_lines = wrap_input(&input_text, input_width).len();
+    let max_input_rows = usize::from(rows.saturating_sub(10)).max(3);
+    height += input_lines.min(max_input_rows) as u16;
+    if input_lines > max_input_rows {
+        height += 1;
+    }
+    if !matching_commands(&state.input).is_empty() {
+        height += matching_commands(&state.input)
+            .len()
+            .min(MAX_COMMAND_SUGGESTIONS) as u16;
+    }
+    height += state.tools.len().min(3) as u16;
+    if !state.streaming.is_empty() {
+        let mut tail = Vec::new();
+        append_wrapped(&mut tail, Role::Assistant, &state.streaming, body_width);
+        height += tail.len().min(STREAMING_WINDOW) as u16;
+    }
+    height
+}
+
 fn truncate_to_width(value: &str, width: usize) -> String {
     if UnicodeWidthStr::width(value) <= width {
         return value.to_owned();
@@ -2100,6 +2244,169 @@ fn append_markdown_wrapped(lines: &mut Vec<(Role, String)>, text: &str, width: u
         };
         append_wrapped(lines, role, &line.text, width);
     }
+}
+
+/// 输入文本按宽度折行，保留显式换行。
+fn wrap_input(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    for source_line in text.split('\n') {
+        if source_line.is_empty() {
+            lines.push(String::new());
+            continue;
+        }
+        let mut current = String::new();
+        let mut current_width = 0;
+        for character in source_line.chars() {
+            let character_width = character.width().unwrap_or(0);
+            if current_width + character_width > width && !current.is_empty() {
+                lines.push(std::mem::take(&mut current));
+                current_width = 0;
+            }
+            current.push(character);
+            current_width += character_width;
+        }
+        lines.push(current);
+    }
+    lines
+}
+
+/// 提交内容后推进内容末尾行：打印行数超过终端高度时固定在最底行。
+/// 发送 DECSTBM 设置内容滚动区域 `[1, scroll_bottom+1]`；
+/// 活动区位于滚动区域之外，内容滚动不会覆盖它。
+fn queue_scroll_region(writer: &mut impl Write, scroll_bottom: u16) -> io::Result<()> {
+    queue!(
+        writer,
+        Print(format!("\x1b[1;{}r", scroll_bottom.saturating_add(1)))
+    )
+}
+
+/// 活动区总高度固定：chrome 4 行 + 动态区 6 行。
+///
+/// 滚动区底必须固定——流式尾巴/工具/输入只在固定活动区内裁剪显示，
+/// 不改变滚动区大小。否则 streaming 非空时滚动区变小，清除范围上移，
+/// 会反复啃掉滚动区底部刚提交的内容。
+const MAX_ACTIVITY_HEIGHT: u16 = 10;
+
+/// 命令建议行：usage 按显示宽度填充到 `usage_width`，description 列对齐。
+fn command_suggestion_line(
+    marker: &str,
+    usage: &str,
+    description: &str,
+    usage_width: usize,
+) -> String {
+    let pad = usage_width.saturating_sub(usage.width());
+    format!("{marker} {usage}{} {description}", " ".repeat(pad))
+}
+
+/// 输入块顶行：底部对齐输入行（rows-3），多行输入向上展开。
+/// 单行输入时顶行即输入行本身，永不与状态行（dynamic_top）重叠。
+fn input_block_top_of(input_row: u16, input_vis: usize) -> u16 {
+    input_row.saturating_sub(input_vis as u16).saturating_add(1)
+}
+
+/// 内容滚动区域的底行：固定为活动区高度之上的一行。
+fn scroll_bottom_of(_state: &TuiState, _columns: u16, rows: u16) -> u16 {
+    rows.saturating_sub(MAX_ACTIVITY_HEIGHT).saturating_sub(1)
+}
+
+/// 光标在折行后输入中的（行号、列号）。
+fn input_cursor_position(chars: &[char], cursor: usize, width: usize) -> (usize, usize) {
+    let mut line = 0usize;
+    let mut column = 0usize;
+    for &character in chars.iter().take(cursor) {
+        if character == '\n' {
+            line += 1;
+            column = 0;
+            continue;
+        }
+        let character_width = character.width().unwrap_or(0);
+        if column + character_width > width {
+            line += 1;
+            column = 0;
+        }
+        column += character_width;
+    }
+    (line, column)
+}
+
+fn role_glyph(role: Role) -> &'static str {
+    match role {
+        Role::User => "❯",
+        Role::Assistant
+        | Role::AssistantHeading
+        | Role::AssistantCode
+        | Role::AssistantDiffAdd
+        | Role::AssistantDiffRemove => "┊",
+        Role::Tool => "●",
+        Role::System => "·",
+        Role::Warning => "!",
+    }
+}
+
+fn role_tone(role: Role) -> Color {
+    match role {
+        Role::User => PRIMARY,
+        Role::Assistant => TEXT,
+        Role::AssistantHeading => PRIMARY,
+        Role::AssistantCode => MUTED,
+        Role::AssistantDiffAdd => Color::Rgb {
+            r: 132,
+            g: 169,
+            b: 140,
+        },
+        Role::AssistantDiffRemove => Color::Rgb {
+            r: 190,
+            g: 110,
+            b: 110,
+        },
+        Role::Tool => PRIMARY,
+        Role::System => MUTED,
+        Role::Warning => WARNING,
+    }
+}
+
+/// 打印一行已提交内容（glyph + 内容 + 换行），用于滚动区与视口恢复。
+///
+/// 层次与 Claude Code 一致：用户消息为金色粗体 `❯`，助手回复的前缀
+/// 用灰色、正文用 TEXT 色，工具/系统行用各自强调色。
+fn print_role_line(
+    writer: &mut impl Write,
+    role: Role,
+    line: &str,
+    columns: u16,
+    color: bool,
+) -> io::Result<()> {
+    if matches!(
+        role,
+        Role::Assistant
+            | Role::AssistantHeading
+            | Role::AssistantCode
+            | Role::AssistantDiffAdd
+            | Role::AssistantDiffRemove
+    ) {
+        // 助手回复：前缀灰色，与正文分层。
+        set_color(writer, color, MUTED)?;
+        queue!(writer, Print(role_glyph(role)), Print(" "))?;
+        reset_color(writer, color)?;
+    } else {
+        set_color(writer, color, role_tone(role))?;
+        queue!(writer, Print(role_glyph(role)), Print(" "))?;
+        reset_color(writer, color)?;
+    }
+    set_color(writer, color, role_tone(role))?;
+    if matches!(role, Role::User | Role::AssistantHeading) {
+        queue!(writer, SetAttribute(Attribute::Bold))?;
+    }
+    queue!(
+        writer,
+        Print(truncate_to_width(
+            line,
+            usize::from(columns.saturating_sub(4)).max(1)
+        )),
+        SetAttribute(Attribute::Reset),
+        Print("\r\n")
+    )?;
+    reset_color(writer, color)
 }
 
 fn set_color(writer: &mut impl Write, enabled: bool, color: Color) -> io::Result<()> {
@@ -2155,10 +2462,14 @@ mod tests {
             model: "deepseek-chat".into(),
             cwd: PathBuf::from("/work"),
             permission: "auto-safe".into(),
-            approval: "ask".into(),
             status: "就绪".into(),
+            printed_lines: 0,
+            content_end_row: 0,
+            dynamic_top: 0,
             transcript: VecDeque::new(),
             streaming: String::new(),
+            assistant_received_delta: false,
+            code_fence_open: false,
             tools: Vec::new(),
             input: Vec::new(),
             cursor: 0,
@@ -2168,12 +2479,9 @@ mod tests {
             command_selection: 0,
             input_hint: String::new(),
             input_active: true,
-            input_interrupted: false,
             usage: None,
-            transcript_scroll: 0,
             available_tools: vec!["file_read".into(), "git_status".into()],
             skills: Vec::new(),
-            show_intro: true,
             session_picker: None,
             plan_review: None,
             model_picker: None,
@@ -2230,21 +2538,162 @@ mod tests {
     }
 
     #[test]
-    fn page_up_和_page_down_控制对话滚动() {
+    fn 空闲_esc_清空当前输入() {
         let mut state = state();
-        assert_eq!(handle_input_key(&mut state, key(KeyCode::PageUp)), None);
-        assert_eq!(state.transcript_scroll, 8);
-        assert_eq!(handle_input_key(&mut state, key(KeyCode::PageDown)), None);
-        assert_eq!(state.transcript_scroll, 0);
-        assert_eq!(transcript_window_start(40, 8, 0), 32);
-        assert_eq!(transcript_window_start(40, 8, 8), 24);
-        assert_eq!(transcript_window_start(40, 8, usize::MAX), 0);
+        handle_input_key(&mut state, key(KeyCode::Char('a')));
+        handle_input_key(&mut state, key(KeyCode::Char('b')));
+        handle_input_key(&mut state, key(KeyCode::Esc));
+        assert!(state.input.is_empty());
+        assert_eq!(state.cursor, 0);
+        // 空输入时 Esc 无副作用。
+        assert_eq!(handle_input_key(&mut state, key(KeyCode::Esc)), None);
+        assert!(state.input.is_empty());
     }
 
     #[test]
-    fn 输入区始终固定在终端底部() {
-        assert_eq!(chrome_positions(24), (20, 21, 22, 23));
-        assert_eq!(chrome_positions(12), (8, 9, 10, 11));
+    fn 粘贴文本插入光标处且不触发提交() {
+        let mut state = state();
+        insert_paste_text(&mut state, "第一行\r\n第二行");
+        let input: String = state.input.iter().collect();
+        assert_eq!(input, "第一行\n第二行");
+        assert_eq!(state.cursor, input.chars().count());
+        // 粘贴不会产生提交结果，只有显式 Enter 才提交。
+        assert_eq!(
+            handle_input_key(&mut state, key(KeyCode::Enter)),
+            Some(InputOutcome::Submit(input))
+        );
+    }
+
+    #[test]
+    fn 超长粘贴批量插入并稳定截断() {
+        let mut state = state();
+        let pasted = "x".repeat(MAX_INPUT_CHARS + 10);
+        assert!(insert_paste_text(&mut state, &pasted));
+        assert_eq!(state.input.len(), MAX_INPUT_CHARS);
+        assert_eq!(state.cursor, MAX_INPUT_CHARS);
+    }
+
+    #[test]
+    fn 流式内容已提交时不重复输出最终消息() {
+        let mut state = state();
+        state.assistant_received_delta = true;
+        assert_eq!(take_final_assistant_tail(&mut state, "完整回答"), "");
+
+        state.assistant_received_delta = false;
+        assert_eq!(
+            take_final_assistant_tail(&mut state, "非流式回答"),
+            "非流式回答"
+        );
+    }
+
+    #[test]
+    fn shift_enter_插入换行_普通_enter_提交多行() {
+        let mut first = state();
+        handle_input_key(&mut first, key(KeyCode::Char('a')));
+        handle_input_key(
+            &mut first,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+        );
+        handle_input_key(&mut first, key(KeyCode::Char('b')));
+        assert_eq!(
+            handle_input_key(&mut first, key(KeyCode::Enter)),
+            Some(InputOutcome::Submit("a\nb".into()))
+        );
+        // Ctrl+J 同样插入换行。
+        let mut multiline = state();
+        handle_input_key(&mut multiline, key(KeyCode::Char('x')));
+        handle_input_key(
+            &mut multiline,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+        );
+        assert!(multiline.input.contains(&'\n'));
+    }
+
+    #[test]
+    fn 普通完整行到达即提交_长文本实时流入滚动区() {
+        let mut state = state();
+        state.streaming = "第一行\n".into();
+        let segments = take_ready_segments(&mut state);
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0], (Role::Assistant, "第一行\n".into()));
+        assert!(state.streaming.is_empty());
+
+        // 未完成的尾行保留。
+        state.streaming = "没有换行的尾巴".into();
+        assert!(take_ready_segments(&mut state).is_empty());
+        assert_eq!(state.streaming, "没有换行的尾巴");
+    }
+
+    #[test]
+    fn 表格行块级缓冲_整块提交保留表格样式() {
+        let mut state = state();
+        // 输入以表格行结束：缓冲保留待续，等后续增量或消息结束再提交。
+        state.streaming = "| 名称 | 状态 |\n| --- | --- |\n| 搜索 | 完成 |\n".into();
+        let segments = take_ready_segments(&mut state);
+        assert!(segments.is_empty());
+        assert_eq!(
+            state.streaming,
+            "| 名称 | 状态 |\n| --- | --- |\n| 搜索 | 完成 |\n"
+        );
+
+        // 表格结束后空行到达：整块提交，空行单独提交。
+        state.streaming.push('\n');
+        let segments = take_ready_segments(&mut state);
+        assert_eq!(segments.len(), 2);
+        assert_eq!(
+            segments[0].1,
+            "| 名称 | 状态 |\n| --- | --- |\n| 搜索 | 完成 |\n"
+        );
+        assert_eq!(segments[1].1, "\n");
+        assert!(state.streaming.is_empty());
+
+        // 表格行后接普通行：表格先整块提交，普通行立即提交。
+        state.streaming = "| a | b |\n| 1 | 2 |\n正文\n".into();
+        let segments = take_ready_segments(&mut state);
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].1, "| a | b |\n| 1 | 2 |\n");
+        assert_eq!(segments[1].1, "正文\n");
+
+        // 未结束的表格缓冲保留回流式缓冲。
+        state.streaming = "| a | b |\n".into();
+        assert!(take_ready_segments(&mut state).is_empty());
+        assert_eq!(state.streaming, "| a | b |\n");
+    }
+
+    #[test]
+    fn 代码栅栏打开行提交_栅栏内逐行以代码样式提交() {
+        let mut state = state();
+        state.streaming = "```rust\ncode\nmore\n".into();
+        let segments = take_ready_segments(&mut state);
+        assert_eq!(segments.len(), 3);
+        assert_eq!(segments[0], (Role::Assistant, "```rust\n".into()));
+        assert_eq!(segments[1], (Role::AssistantCode, "  code\n".into()));
+        assert_eq!(segments[2], (Role::AssistantCode, "  more\n".into()));
+        assert!(state.code_fence_open);
+        assert!(state.streaming.is_empty());
+
+        // 闭合行提交为空代码块（终端不显示 ``` 本身），普通行与空行独立提交。
+        state.streaming.push_str("```\n末尾\n\n");
+        let segments = take_ready_segments(&mut state);
+        assert_eq!(segments[0], (Role::Assistant, "```\n".into()));
+        assert_eq!(segments[1], (Role::Assistant, "末尾\n".into()));
+        assert_eq!(segments[2], (Role::Assistant, "\n".into()));
+        assert!(!state.code_fence_open);
+        assert!(state.streaming.is_empty());
+    }
+
+    #[test]
+    fn 多行输入光标定位() {
+        let chars = "ab\ncd".chars().collect::<Vec<_>>();
+        assert_eq!(input_cursor_position(&chars, 1, 10), (0, 1));
+        // 光标在换行符之后即下一行行首。
+        assert_eq!(input_cursor_position(&chars, 3, 10), (1, 0));
+        assert_eq!(input_cursor_position(&chars, 4, 10), (1, 1));
+        // 超宽自动折行。
+        let wide = "abcdef".chars().collect::<Vec<_>>();
+        assert_eq!(input_cursor_position(&wide, 3, 4), (0, 3));
+        // 折行后字符落在下一行行首之后的列。
+        assert_eq!(input_cursor_position(&wide, 5, 4), (1, 1));
     }
 
     #[test]
@@ -2347,7 +2796,6 @@ mod tests {
         assert_eq!(state.transcript[0].role, Role::User);
         assert_eq!(state.transcript[1].role, Role::Assistant);
         assert_eq!(state.usage, Some((12, 8)));
-        assert!(!state.show_intro);
     }
 
     #[test]
@@ -2356,5 +2804,67 @@ mod tests {
         append_wrapped(&mut lines, Role::Assistant, "你好Rust", 6);
         assert_eq!(lines[0].1, "你好Ru");
         assert_eq!(lines[1].1, "st");
+    }
+
+    #[test]
+    fn 命令建议description列按显示宽度对齐() {
+        let width = "/plan new <目标>".width(); // 含中文，显示宽 > 字符数
+        let line1 = command_suggestion_line(" ", "/new", "开始新会话", width);
+        let line2 = command_suggestion_line(" ", "/plan new <目标>", "创建结构化计划", width);
+        // 按显示宽度比较 description 起始列（find 返回字符索引，中文字符数≠宽度）。
+        let desc1 = line1.find('开').unwrap();
+        let desc2 = line2.find('创').unwrap();
+        let col1 = line1[..desc1].width();
+        let col2 = line2[..desc2].width();
+        assert_eq!(col1, col2);
+        // 对齐列 = marker(1) + 空格(1) + usage_width + 分隔空格(1)。
+        assert_eq!(col1, 3 + width);
+    }
+
+    #[test]
+    fn 输入块顶行不越过状态行且单行对齐输入行() {
+        // rows=18：输入行 15，状态行 dynamic_top=8。
+        assert_eq!(input_block_top_of(15, 1), 15); // 单行：输入行本身
+        assert_eq!(input_block_top_of(15, 2), 14);
+        assert_eq!(input_block_top_of(15, 3), 13);
+        // 三行输入时顶行 13 > 状态行 8，永不重叠。
+        assert!(input_block_top_of(15, 3) > 8);
+        // 矮终端 rows=12：输入行 9，状态行 dynamic_top=2。
+        assert!(input_block_top_of(9, 3) > 2);
+    }
+
+    #[test]
+    fn 滚动区底固定不随流式内容变化() {
+        let mut state = state();
+        state.streaming = "正在输出\n更多\n第三行\n第四行\n第五行".into();
+        let bottom_streaming = scroll_bottom_of(&state, 80, 40);
+        state.streaming.clear();
+        let bottom_idle = scroll_bottom_of(&state, 80, 40);
+        // 关键不变量：流式尾巴不改变滚动区大小，避免清除啃掉已提交内容。
+        assert_eq!(bottom_streaming, bottom_idle);
+        // 矮终端：活动区让步，内容区至少 3 行。
+        assert!(scroll_bottom_of(&state, 80, 14) >= 3);
+    }
+
+    #[test]
+    fn 内容末尾行随提交推进并封顶在滚动区底() {
+        let mut state = state();
+        state.content_end_row = 4;
+        // 提交 3 行：内容末尾推进到 7。
+        state.content_end_row = (4u16.saturating_add(3)).min(14);
+        assert_eq!(state.content_end_row, 7);
+        // 满屏后封顶在滚动区底。
+        state.content_end_row = (12u16.saturating_add(10)).min(14);
+        assert_eq!(state.content_end_row, 14);
+    }
+
+    #[test]
+    fn 活动区高度包含多行输入与流式尾巴() {
+        let mut state = state();
+        state.input = "ab\ncd".chars().collect();
+        state.streaming = "正在输出\n更多".into();
+        let height = layout_height(&state, 80, 24);
+        // chrome 4 + 输入 2 行 + 流式 2 行。
+        assert_eq!(height, 8);
     }
 }

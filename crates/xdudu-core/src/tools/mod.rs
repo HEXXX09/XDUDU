@@ -202,6 +202,7 @@ pub trait Tool: Send + Sync {
     async fn execute(&self, input: Value, context: ToolContext) -> ToolResult;
 }
 
+#[derive(Clone)]
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
     approval_gate: Arc<dyn ApprovalGate>,

@@ -1,20 +1,31 @@
 //! 审批菜单的终端键盘交互。
+//!
+//! 全屏 TUI 会话中，菜单从共享输入路由（[`crate::input_queue::InputRouter`]）
+//! 消费事件并渲染在终端底部活动区；非 TUI 会话保持阻塞读取与整屏渲染。
 
-use std::io::{self, Write};
+use std::{
+    io::{self, Write},
+    sync::Arc,
+};
 
 use crossterm::{
-    cursor::{Hide, MoveToColumn, MoveUp, Show},
+    cursor::{Hide, MoveTo, MoveToColumn, MoveUp, Show},
     event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, read},
     execute, queue,
     style::Print,
-    terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode},
+    terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode, size},
 };
 use serde_json::Value;
 use xdudu_core::{ApprovalRequest, redact_value};
 
-use crate::ui::TerminalTheme;
+use crate::{
+    input_queue::{InputFocus, InputRouter},
+    ui::TerminalTheme,
+};
 
 const OPTION_COUNT: usize = 4;
+/// TUI 路径菜单占用的底部行数：提示两行 + 四个选项。
+const MENU_ROWS: u16 = 6;
 
 pub(crate) fn format_approval_prompt(theme: TerminalTheme, request: &ApprovalRequest) -> String {
     let title = match request.tool_name.as_str() {
@@ -224,7 +235,80 @@ fn finish_menu(
     writer.flush()
 }
 
-pub(crate) fn read_approval_menu(
+/// 读取审批选择。
+///
+/// TUI 会话（路由激活）从共享输入路由消费事件并渲染在终端底部；
+/// 否则在 `spawn_blocking` 中阻塞读取并整屏渲染。失败时返回 `Ok(None)`，
+/// 由调用方按“无法读取审批输入”拒绝。
+pub(crate) async fn read_approval_menu(
+    theme: TerminalTheme,
+    prompt: &str,
+    router: Option<Arc<InputRouter>>,
+    fullscreen: bool,
+) -> io::Result<Option<ApprovalMenuChoice>> {
+    if router.as_deref().is_some_and(InputRouter::is_active) {
+        read_approval_menu_tui(theme, prompt, router.as_ref().expect("已检查路由激活")).await
+    } else {
+        let prompt = prompt.to_owned();
+        let choice = match tokio::task::spawn_blocking(move || {
+            read_approval_menu_legacy(theme, &prompt, fullscreen)
+        })
+        .await
+        {
+            Ok(Ok(choice)) => Some(choice),
+            _ => None,
+        };
+        Ok(choice)
+    }
+}
+
+/// TUI 路径：渲染在终端底部活动区，从共享输入路由消费键盘事件。
+async fn read_approval_menu_tui(
+    theme: TerminalTheme,
+    prompt: &str,
+    router: &InputRouter,
+) -> io::Result<Option<ApprovalMenuChoice>> {
+    let _focus_guard = router.acquire_focus(InputFocus::Approval);
+    let mut stdout = io::stdout();
+    let (_, rows) = size().unwrap_or((80, 24));
+    let top = rows.saturating_sub(MENU_ROWS + 1);
+    execute!(stdout, Hide)?;
+    let result = async {
+        let mut state = ApprovalMenuState::default();
+        render_menu_region(&mut stdout, &theme, prompt, state, top)?;
+        loop {
+            let Some(Event::Key(key)) = router.next_for(InputFocus::Approval).await else {
+                break Ok(None);
+            };
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            let previous = state.selected;
+            if let Some(choice) = state.handle_key(key) {
+                finish_menu_region(&mut stdout, &theme, choice, top)?;
+                break Ok(Some(choice));
+            }
+            if state.selected != previous {
+                render_menu_region(&mut stdout, &theme, prompt, state, top)?;
+            }
+        }
+    }
+    .await;
+    let show_result = execute!(stdout, Show);
+    match result {
+        Ok(choice) => {
+            show_result?;
+            Ok(choice)
+        }
+        Err(error) => {
+            let _ = show_result;
+            Err(error)
+        }
+    }
+}
+
+/// 非 TUI 路径：保持既有阻塞读取与整屏渲染。
+fn read_approval_menu_legacy(
     theme: TerminalTheme,
     prompt: &str,
     fullscreen: bool,
@@ -259,6 +343,66 @@ pub(crate) fn read_approval_menu(
             render_menu(&mut writer, state, true, theme)?;
         }
     }
+}
+
+/// TUI 路径渲染：提示与选项固定在底部区域，不影响已提交的滚动内容。
+fn render_menu_region(
+    writer: &mut impl Write,
+    theme: &TerminalTheme,
+    prompt: &str,
+    state: ApprovalMenuState,
+    top: u16,
+) -> io::Result<()> {
+    queue!(
+        writer,
+        MoveTo(0, top),
+        Clear(ClearType::FromCursorDown),
+        MoveTo(0, top),
+        // raw 模式不翻译换行，提示中的换行需要显式回车。
+        Print(prompt.replace('\n', "\r\n"))
+    )?;
+    for (index, choice) in ApprovalMenuChoice::ALL.iter().enumerate() {
+        let row = top + 2 + index as u16;
+        let marker = if index == state.selected {
+            format!("  {} ", theme.accent("●"))
+        } else {
+            format!("  {} ", theme.muted("○"))
+        };
+        queue!(
+            writer,
+            MoveTo(0, row),
+            Clear(ClearType::CurrentLine),
+            Print(marker),
+            Print(choice.label())
+        )?;
+    }
+    writer.flush()
+}
+
+/// TUI 路径收尾：清除选项并显示结果行。
+fn finish_menu_region(
+    writer: &mut impl Write,
+    theme: &TerminalTheme,
+    choice: ApprovalMenuChoice,
+    top: u16,
+) -> io::Result<()> {
+    for index in 0..OPTION_COUNT {
+        let row = top + 2 + index as u16;
+        queue!(writer, MoveTo(0, row), Clear(ClearType::CurrentLine))?;
+    }
+    let marker = match choice {
+        ApprovalMenuChoice::Deny => theme.danger("✗"),
+        _ => theme.success("✓"),
+    };
+    queue!(
+        writer,
+        MoveTo(0, top + 2),
+        Print("  "),
+        Print(marker),
+        Print(" "),
+        Print(choice.result_label())
+    )?;
+    writer.flush()
 }
 
 #[cfg(test)]

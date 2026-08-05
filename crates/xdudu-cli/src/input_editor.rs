@@ -10,12 +10,17 @@ use std::{
 
 use crossterm::{
     cursor::MoveToColumn,
-    event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, read},
-    queue,
+    event::{
+        DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers, read,
+    },
+    execute, queue,
     style::Print,
     terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode},
 };
 use unicode_width::UnicodeWidthStr;
+
+const MAX_INPUT_CHARS: usize = 262_144;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ReadResult {
@@ -63,6 +68,20 @@ const COMMANDS: [(&str, &str, bool); 18] = [
 ];
 
 impl LineState {
+    fn insert_paste(&mut self, value: &str) -> bool {
+        self.snapshot();
+        let normalized = value.replace("\r\n", "\n").replace('\r', "\n");
+        let remaining = MAX_INPUT_CHARS.saturating_sub(self.chars.len());
+        let mut inserted: Vec<char> = normalized.chars().take(remaining).collect();
+        let inserted_len = inserted.len();
+        let truncated = normalized.chars().count() > inserted_len;
+        self.chars
+            .splice(self.cursor..self.cursor, inserted.drain(..));
+        self.cursor += inserted_len;
+        self.history_index = None;
+        truncated
+    }
+
     fn handle_key(&mut self, key: KeyEvent, history: &[String]) -> Option<ReadResult> {
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             return None;
@@ -398,6 +417,23 @@ impl Drop for RawModeGuard {
     }
 }
 
+/// 启用 bracketed paste：粘贴内容以单个 `Event::Paste` 到达，不会把
+/// 其中的换行当作 Enter 提交。
+struct BracketedPasteGuard;
+
+impl BracketedPasteGuard {
+    fn enter() -> io::Result<Self> {
+        execute!(io::stdout(), EnableBracketedPaste)?;
+        Ok(Self)
+    }
+}
+
+impl Drop for BracketedPasteGuard {
+    fn drop(&mut self) {
+        let _ = execute!(io::stdout(), DisableBracketedPaste);
+    }
+}
+
 impl InputEditor {
     pub(crate) fn with_workspace(cwd: &Path) -> Self {
         let mut workspace_paths = Vec::new();
@@ -415,6 +451,7 @@ impl InputEditor {
         }
 
         let _guard = RawModeGuard::enter()?;
+        let _paste = BracketedPasteGuard::enter()?;
         let mut stdout = io::stdout();
         let mut state = LineState::default();
         let mut rendered_rows = 1;
@@ -495,11 +532,7 @@ impl InputEditor {
                     )?;
                 }
                 Event::Paste(value) => {
-                    state.snapshot();
-                    for character in value.chars().filter(|character| *character != '\r') {
-                        state.chars.insert(state.cursor, character);
-                        state.cursor += 1;
-                    }
+                    state.insert_paste(&value);
                     redraw(
                         &mut stdout,
                         prompt,
@@ -564,12 +597,16 @@ fn redraw(
     workspace_paths: &[String],
     rendered_rows: &mut u16,
 ) -> io::Result<()> {
-    let line: String = state.chars.iter().collect();
-    let (columns, _) = crossterm::terminal::size().unwrap_or((80, 24));
+    let (columns, rows) = crossterm::terminal::size().unwrap_or((80, 24));
     let width = usize::from(columns.max(10));
+    let max_visible = width
+        .saturating_mul(usize::from(rows.saturating_sub(8)).max(3))
+        .max(256);
+    let (visible, visible_cursor) = visible_input(&state.chars, state.cursor, max_visible);
+    let line: String = visible.iter().collect();
     let prompt_width = UnicodeWidthStr::width(prompt);
-    let cursor = screen_position(&state.chars, state.cursor, prompt_width, width);
-    let end = screen_position(&state.chars, state.chars.len(), prompt_width, width);
+    let cursor = screen_position(&visible, visible_cursor, prompt_width, width);
+    let end = screen_position(&visible, visible.len(), prompt_width, width);
     let suggestions = state.command_matches();
     let path_suggestions = matching_paths(&state.chars, workspace_paths);
     queue!(
@@ -607,6 +644,31 @@ fn redraw(
     )?;
     *rendered_rows = end.1.saturating_add(1).saturating_add(suggestion_rows);
     writer.flush()
+}
+
+/// 长输入只渲染光标周围的窗口，内部仍保留并发送全部内容。
+fn visible_input(chars: &[char], cursor: usize, limit: usize) -> (Vec<char>, usize) {
+    if chars.len() <= limit {
+        return (chars.to_vec(), cursor);
+    }
+    let half = limit / 2;
+    let start = cursor
+        .saturating_sub(half)
+        .min(chars.len().saturating_sub(limit));
+    let end = start.saturating_add(limit).min(chars.len());
+    let mut visible = Vec::with_capacity(limit + 64);
+    let prefix = if start > 0 {
+        format!("… 已折叠 {start} 个字符 …\n")
+    } else {
+        String::new()
+    };
+    visible.extend(prefix.chars());
+    let prefix_len = visible.len();
+    visible.extend_from_slice(&chars[start..end]);
+    if end < chars.len() {
+        visible.extend("\n… 后续内容已折叠 …".chars());
+    }
+    (visible, prefix_len + cursor.saturating_sub(start))
 }
 
 fn matching_paths(chars: &[char], paths: &[String]) -> Vec<String> {
@@ -749,5 +811,27 @@ mod tests {
         state.handle_key(key(KeyCode::Char('m')), &[]);
         assert!(state.complete_path(&["src/main.rs".into()]));
         assert_eq!(state.chars.iter().collect::<String>(), "@src/main.rs ");
+    }
+
+    #[test]
+    fn 粘贴不提交且超长内容会截断() {
+        let mut state = LineState::default();
+        assert!(!state.insert_paste("第一行\r\n第二行"));
+        assert_eq!(state.chars.iter().collect::<String>(), "第一行\n第二行");
+        assert!(state.handle_key(key(KeyCode::Left), &[]).is_none());
+
+        let mut large = LineState::default();
+        assert!(large.insert_paste(&"x".repeat(MAX_INPUT_CHARS + 1)));
+        assert_eq!(large.chars.len(), MAX_INPUT_CHARS);
+    }
+
+    #[test]
+    fn 长输入只渲染光标附近但保留全部内容() {
+        let chars = "x".repeat(1_000).chars().collect::<Vec<_>>();
+        let (visible, cursor) = visible_input(&chars, chars.len(), 100);
+        assert!(visible.len() < chars.len());
+        assert!(visible.iter().collect::<String>().contains("已折叠"));
+        assert!(cursor <= visible.len());
+        assert_eq!(chars.len(), 1_000);
     }
 }

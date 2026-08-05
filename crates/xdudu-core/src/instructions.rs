@@ -197,11 +197,13 @@ mod tests {
         let (files, warnings) = load_instructions(root.path());
         assert!(files.is_empty());
         assert!(
-            warnings.iter().any(|warning| warning.contains("符号链接")),
+            warnings.iter().any(|warning| warning.contains("64 KiB")),
             "{warnings:?}"
         );
+        // 符号链接仅 Unix 上创建；Windows 上验证目录内 md 全被大小限制拦截。
+        #[cfg(unix)]
         assert!(
-            warnings.iter().any(|warning| warning.contains("64 KiB")),
+            warnings.iter().any(|warning| warning.contains("符号链接")),
             "{warnings:?}"
         );
     }

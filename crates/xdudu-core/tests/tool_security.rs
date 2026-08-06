@@ -50,6 +50,89 @@ async fn 默认审批策略拒绝副作用工具() {
     assert!(!dir.path().join("blocked.txt").exists());
 }
 
+#[tokio::test]
+async fn auto_safe_白名单命令豁免审批() {
+    // 默认 DenyAll：若仍按 ProcessExecution 一律审批，pwd/echo/ls 会被拒。
+    let dir = tempdir().unwrap();
+    let mut registry = ToolRegistry::new();
+    register_builtins(&mut registry).unwrap();
+    for input in [
+        json!({"command": "pwd"}),
+        json!({"command": "echo", "args": ["hello"]}),
+        json!({"command": "ls"}),
+    ] {
+        let result = execute(
+            &registry,
+            "terminal_exec",
+            input.clone(),
+            dir.path(),
+            PermissionMode::AutoSafe,
+        )
+        .await;
+        assert!(
+            result.success,
+            "白名单命令应豁免审批并可执行：input={input:?} error={:?}",
+            result.error
+        );
+        assert!(
+            result.approval.is_none(),
+            "豁免审批时不应写入审批记录：input={input:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn auto_safe_非白名单不经审批直接拒绝() {
+    let dir = tempdir().unwrap();
+    let mut registry = ToolRegistry::new();
+    register_builtins(&mut registry).unwrap();
+    let result = execute(
+        &registry,
+        "terminal_exec",
+        json!({"command": "node", "args": ["--version"]}),
+        dir.path(),
+        PermissionMode::AutoSafe,
+    )
+    .await;
+    // 应在执行阶段 UNSAFE_COMMAND，而不是先弹审批再被 DenyAll 拒。
+    assert_eq!(result.error.unwrap().code, "UNSAFE_COMMAND");
+    assert!(result.approval.is_none());
+}
+
+#[tokio::test]
+async fn full_access_非白名单命令仍需审批() {
+    let dir = tempdir().unwrap();
+    let mut registry = ToolRegistry::new();
+    register_builtins(&mut registry).unwrap();
+    let result = execute(
+        &registry,
+        "terminal_exec",
+        // `true` 不在 auto-safe 白名单；full-access 下会真正启动进程，故仍需审批。
+        json!({"command": "true"}),
+        dir.path(),
+        PermissionMode::FullAccess,
+    )
+    .await;
+    assert_eq!(result.error.unwrap().code, "APPROVAL_DENIED");
+}
+
+#[tokio::test]
+async fn full_access_白名单命令同样豁免审批() {
+    let dir = tempdir().unwrap();
+    let mut registry = ToolRegistry::new();
+    register_builtins(&mut registry).unwrap();
+    let result = execute(
+        &registry,
+        "terminal_exec",
+        json!({"command": "pwd"}),
+        dir.path(),
+        PermissionMode::FullAccess,
+    )
+    .await;
+    assert!(result.success, "{:?}", result.error);
+    assert!(result.approval.is_none());
+}
+
 #[test]
 fn 内置工具定义完整() {
     let definitions = registry().definitions();

@@ -199,6 +199,13 @@ pub trait Tool: Send + Sync {
     async fn preflight(&self, _input: &Value, _context: &ToolContext) -> Option<ToolResult> {
         None
     }
+    /// 按本次输入判断是否需要进入审批门。
+    ///
+    /// 默认跟随静态 `side_effect.requires_approval()`。工具可覆盖以实现
+    /// “auto-safe 白名单命令豁免审批”等调用级策略。
+    async fn needs_approval(&self, _input: &Value, _context: &ToolContext) -> bool {
+        self.definition().side_effect.requires_approval()
+    }
     async fn execute(&self, input: Value, context: ToolContext) -> ToolResult;
 }
 
@@ -366,7 +373,8 @@ impl ToolRegistry {
             }
         }
         let mut approval = None;
-        if definition.side_effect.requires_approval() {
+        if definition.side_effect.requires_approval() && tool.needs_approval(&input, &context).await
+        {
             let request = ApprovalRequest {
                 id: Uuid::new_v4(),
                 session_id,

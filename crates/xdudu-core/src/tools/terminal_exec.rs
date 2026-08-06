@@ -91,6 +91,33 @@ async fn check_auto_safe(
     }
 }
 
+fn parse_args(input: &Value) -> Vec<String> {
+    input
+        .get("args")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| value.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn parse_env(input: &Value) -> HashMap<String, String> {
+    input
+        .get("env")
+        .and_then(Value::as_object)
+        .map(|env| {
+            env.iter()
+                .filter_map(|(key, value)| {
+                    value.as_str().map(|value| (key.clone(), value.to_owned()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 async fn resolve_safe_executable(command: &str, workspace: &Path) -> Option<PathBuf> {
     let real_workspace = tokio::fs::canonicalize(workspace).await.ok()?;
     let path = std::env::var_os("PATH")?;
@@ -173,6 +200,31 @@ impl Tool for TerminalExecTool {
         }
     }
 
+    /// auto-safe 白名单命令（pwd/echo/ls/只读 git）豁免审批，对齐 Claude Code：
+    /// 安全命令直接放行，危险命令才询问。full-access 下白名单同样豁免；
+    /// 白名单外命令仍需审批。auto-safe 下白名单外会在执行阶段以
+    /// `UNSAFE_COMMAND` 拒绝，故也不弹审批。
+    async fn needs_approval(&self, input: &Value, context: &ToolContext) -> bool {
+        let Some(command) = input.get("command").and_then(Value::as_str) else {
+            return true;
+        };
+        let args = parse_args(input);
+        let env_overrides = parse_env(input);
+        let requested_cwd = input
+            .get("cwd")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| context.cwd.to_str().unwrap_or("."));
+        let cwd = match resolve_directory(Path::new(requested_cwd), &context.cwd).await {
+            Ok(path) => path,
+            // 路径非法时执行阶段会直接失败，无需先打扰用户审批。
+            Err(_) => return false,
+        };
+        match check_auto_safe(command, &args, &cwd, &env_overrides).await {
+            Ok(()) => false,
+            Err(_) => context.permission_mode == PermissionMode::FullAccess,
+        }
+    }
+
     fn validate(&self, input: &Value) -> Result<(), Vec<String>> {
         let map = object(input)?;
         let mut issues = Vec::new();
@@ -231,16 +283,7 @@ impl Tool for TerminalExecTool {
 
     async fn execute(&self, input: Value, context: ToolContext) -> ToolResult {
         let command = input["command"].as_str().unwrap();
-        let args = input
-            .get("args")
-            .and_then(Value::as_array)
-            .map(|values| {
-                values
-                    .iter()
-                    .map(|value| value.as_str().unwrap().to_owned())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        let args = parse_args(&input);
         let requested_cwd = input
             .get("cwd")
             .and_then(Value::as_str)
@@ -261,15 +304,7 @@ impl Tool for TerminalExecTool {
                 );
             }
         };
-        let env_overrides = input
-            .get("env")
-            .and_then(Value::as_object)
-            .map(|env| {
-                env.iter()
-                    .map(|(key, value)| (key.clone(), value.as_str().unwrap().to_owned()))
-                    .collect::<HashMap<_, _>>()
-            })
-            .unwrap_or_default();
+        let env_overrides = parse_env(&input);
         if context.permission_mode != PermissionMode::FullAccess {
             if let Err(reason) = check_auto_safe(command, &args, &cwd, &env_overrides).await {
                 return ToolResult::failure(

@@ -1162,6 +1162,11 @@ async fn handle_tui_command(
             *session_id = None;
             app.notice("已开始新会话。").map_err(XduduError::from)?;
         }
+        "/vim" => {
+            app.toggle_vim().map_err(XduduError::from)?;
+            app.notice("已切换 Vim 模式。输入 Esc 可进入普通模式，帮助行会显示当前模式。")
+                .map_err(XduduError::from)?;
+        }
         "/model" => {
             if let Some(model) = app.select_model().await.map_err(XduduError::from)? {
                 runtime.model = model;

@@ -230,6 +230,12 @@ struct TuiState {
     command_selection: usize,
     input_hint: String,
     input_active: bool,
+    /// Vim 模式开关（/vim 切换）。
+    vim_enabled: bool,
+    /// Vim 普通模式（true）或插入模式（false）。
+    vim_normal: bool,
+    /// 记录普通模式上次按键，用于 dd 等组合键。
+    vim_last: Option<char>,
     usage: Option<(u64, u64)>,
     available_tools: Vec<String>,
     skills: Vec<String>,
@@ -393,6 +399,9 @@ impl TuiApp {
             command_selection: 0,
             input_hint: "Enter 发送 · Shift+Enter 换行 · / 命令 · ↑↓ 历史 · Ctrl+D 退出".into(),
             input_active: true,
+            vim_enabled: false,
+            vim_normal: false,
+            vim_last: None,
             usage: None,
             available_tools: context.available_tools,
             skills: context.skills,
@@ -499,6 +508,17 @@ impl TuiApp {
             if insert_paste_text(&mut state, text) {
                 state.input_hint = format!("粘贴内容已截断：最多 {MAX_INPUT_CHARS} 个字符");
             }
+        }
+        self.renderer.draw_dynamic()
+    }
+
+    /// 切换 Vim 模式；开启时进入插入模式，关闭时恢复常规键位。
+    pub(crate) fn toggle_vim(&self) -> io::Result<()> {
+        {
+            let mut state = self.renderer.state.lock().unwrap();
+            state.vim_enabled = !state.vim_enabled;
+            state.vim_normal = false;
+            state.vim_last = None;
         }
         self.renderer.draw_dynamic()
     }
@@ -1178,6 +1198,12 @@ impl TuiRenderer {
         let running = !state.tools.is_empty() || !state.streaming.is_empty();
         let hint_text = if running {
             "Ctrl+C / Esc 打断 · Enter 排队 · 可继续输入"
+        } else if state.vim_enabled {
+            if state.vim_normal {
+                "Vim 普通模式 · i/a/A/I 输入 · j/k 历史 · h/l 移动 · 0/$ 行首尾 · x 删除 · dd 清空 · Enter 发送"
+            } else {
+                "Vim 插入模式 · Esc 返回 · Enter 发送"
+            }
         } else if matching_commands(&state.input).is_empty() {
             state.input_hint.as_str()
         } else {
@@ -1529,10 +1555,143 @@ impl EventSink for TuiRenderer {
     }
 }
 
+/// Vim 普通模式键位：j/k 历史、h/l 移动、0/$ 行首尾、
+/// i/a/A/I 进入插入、x/X 删除字符、D 删到行尾、dd 清空输入。
+fn handle_vim_normal(state: &mut TuiState, key: KeyEvent) -> Option<InputOutcome> {
+    match key.code {
+        KeyCode::Char('i') => {
+            state.vim_normal = false;
+            state.vim_last = None;
+            None
+        }
+        KeyCode::Char('a') => {
+            if state.cursor < state.input.len() {
+                state.cursor += 1;
+            }
+            state.vim_normal = false;
+            state.vim_last = None;
+            None
+        }
+        KeyCode::Char('A') => {
+            state.cursor = state.input.len();
+            state.vim_normal = false;
+            state.vim_last = None;
+            None
+        }
+        KeyCode::Char('I') => {
+            state.cursor = 0;
+            state.vim_normal = false;
+            state.vim_last = None;
+            None
+        }
+        KeyCode::Char('h') if state.cursor > 0 => {
+            state.cursor -= 1;
+            state.vim_last = None;
+            None
+        }
+        KeyCode::Char('l') if state.cursor < state.input.len() => {
+            state.cursor += 1;
+            state.vim_last = None;
+            None
+        }
+        KeyCode::Char('0') => {
+            state.cursor = 0;
+            state.vim_last = None;
+            None
+        }
+        KeyCode::Char('$') => {
+            state.cursor = state.input.len();
+            state.vim_last = None;
+            None
+        }
+        KeyCode::Char('k') => {
+            // Vim k=上：向更早的历史移动。
+            state.vim_last = None;
+            if !state.history.is_empty() {
+                let index = match state.history_index {
+                    None => {
+                        state.draft.clone_from(&state.input);
+                        state.history.len() - 1
+                    }
+                    Some(index) => index.saturating_sub(1),
+                };
+                load_history(state, index);
+            }
+            None
+        }
+        KeyCode::Char('j') => {
+            // Vim j=下：向更新的历史/草稿移动。
+            state.vim_last = None;
+            match state.history_index {
+                Some(index) if index + 1 < state.history.len() => load_history(state, index + 1),
+                Some(_) => {
+                    state.input.clone_from(&state.draft);
+                    state.cursor = state.input.len();
+                    state.history_index = None;
+                }
+                None => {}
+            }
+            None
+        }
+        KeyCode::Char('x') => {
+            if state.cursor < state.input.len() {
+                state.input.remove(state.cursor);
+            }
+            state.vim_last = None;
+            None
+        }
+        KeyCode::Char('X') if state.cursor > 0 => {
+            state.cursor -= 1;
+            state.input.remove(state.cursor);
+            state.vim_last = None;
+            None
+        }
+        KeyCode::Char('D') => {
+            state.input.truncate(state.cursor);
+            state.vim_last = None;
+            None
+        }
+        KeyCode::Char('d') => {
+            if state.vim_last == Some('d') {
+                state.input.clear();
+                state.cursor = 0;
+                state.vim_last = None;
+            } else {
+                state.vim_last = Some('d');
+            }
+            None
+        }
+        KeyCode::Esc => {
+            state.vim_last = None;
+            // 普通模式 Esc 无操作。
+            None
+        }
+        KeyCode::Enter => {
+            state.vim_last = None;
+            handle_input_key_regular(state, key)
+        }
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            state.vim_last = None;
+            handle_input_key_regular(state, key)
+        }
+        _ => {
+            state.vim_last = None;
+            None
+        }
+    }
+}
+
 fn handle_input_key(state: &mut TuiState, key: KeyEvent) -> Option<InputOutcome> {
     if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
         return None;
     }
+    if state.vim_enabled && state.vim_normal {
+        return handle_vim_normal(state, key);
+    }
+    handle_input_key_regular(state, key)
+}
+
+fn handle_input_key_regular(state: &mut TuiState, key: KeyEvent) -> Option<InputOutcome> {
     match key.code {
         KeyCode::Enter
             if key
@@ -1595,8 +1754,12 @@ fn handle_input_key(state: &mut TuiState, key: KeyEvent) -> Option<InputOutcome>
             Some(InputOutcome::Exit)
         }
         KeyCode::Esc => {
-            // Claude Code 风格：Esc 清空当前输入。
-            if !state.input.is_empty() {
+            if state.vim_enabled {
+                // Vim 插入模式：Esc 返回普通模式，不清空输入。
+                state.vim_normal = true;
+                state.vim_last = None;
+            } else if !state.input.is_empty() {
+                // 常规模式：Esc 清空当前输入。
                 state.input.clear();
                 state.cursor = 0;
                 state.history_index = None;
@@ -2655,6 +2818,9 @@ mod tests {
             command_selection: 0,
             input_hint: String::new(),
             input_active: true,
+            vim_enabled: false,
+            vim_normal: false,
+            vim_last: None,
             usage: None,
             available_tools: vec!["file_read".into(), "git_status".into()],
             skills: Vec::new(),
@@ -2712,6 +2878,61 @@ mod tests {
             handle_input_key(&mut state, key(KeyCode::Enter)),
             Some(InputOutcome::Command("/model".into()))
         );
+    }
+
+    #[test]
+    fn vim_普通模式_移动删除与历史() {
+        let mut state = state();
+        state.vim_enabled = true;
+        state.vim_normal = false; // 插入模式
+        state.history = vec!["第一条历史".into(), "第二条历史".into()];
+        // 插入模式下输入 "abcd"。
+        handle_input_key(&mut state, key(KeyCode::Char('a')));
+        handle_input_key(&mut state, key(KeyCode::Char('b')));
+        handle_input_key(&mut state, key(KeyCode::Char('c')));
+        handle_input_key(&mut state, key(KeyCode::Char('d')));
+        assert_eq!(state.input.iter().collect::<String>(), "abcd");
+        // Esc 进入普通模式（不清空）。
+        handle_input_key(&mut state, key(KeyCode::Esc));
+        assert!(state.vim_normal);
+        assert_eq!(state.input.iter().collect::<String>(), "abcd");
+        // h/l 移动、x 删除、D 删尾、dd 清空。
+        handle_input_key(&mut state, key(KeyCode::Char('h')));
+        assert_eq!(state.cursor, 3);
+        // x 删除光标处字符（此处为 'd'），光标移到行尾。
+        handle_input_key(&mut state, key(KeyCode::Char('x')));
+        assert_eq!(state.input.iter().collect::<String>(), "abc");
+        // h 回退到 'c' 前，D 删除光标到行尾。
+        handle_input_key(&mut state, key(KeyCode::Char('h')));
+        handle_input_key(&mut state, key(KeyCode::Char('D')));
+        assert_eq!(state.input.iter().collect::<String>(), "ab");
+        handle_input_key(&mut state, key(KeyCode::Char('d')));
+        handle_input_key(&mut state, key(KeyCode::Char('d')));
+        assert!(state.input.is_empty());
+        // k=上：先到最新"第二条历史"，再向上到"第一条历史"；j=下回到草稿。
+        handle_input_key(&mut state, key(KeyCode::Char('k')));
+        assert_eq!(state.input.iter().collect::<String>(), "第二条历史");
+        handle_input_key(&mut state, key(KeyCode::Char('k')));
+        assert_eq!(state.input.iter().collect::<String>(), "第一条历史");
+        handle_input_key(&mut state, key(KeyCode::Char('j')));
+        assert_eq!(state.input.iter().collect::<String>(), "第二条历史");
+        handle_input_key(&mut state, key(KeyCode::Char('j')));
+        assert!(state.input.is_empty());
+        // i 进入插入模式；普通模式未知键无副作用。
+        handle_input_key(&mut state, key(KeyCode::Char('i')));
+        assert!(!state.vim_normal);
+        handle_input_key(&mut state, key(KeyCode::Char('z')));
+        assert!(state.input.iter().collect::<String>().ends_with('z'));
+    }
+
+    #[test]
+    fn vim_插入模式_esc_返回普通且不清空() {
+        let mut state = state();
+        state.vim_enabled = true;
+        handle_input_key(&mut state, key(KeyCode::Char('x')));
+        handle_input_key(&mut state, key(KeyCode::Esc));
+        assert!(state.vim_normal);
+        assert_eq!(state.input.iter().collect::<String>(), "x");
     }
 
     #[test]

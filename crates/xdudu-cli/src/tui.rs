@@ -428,6 +428,16 @@ impl TuiApp {
         self.renderer.clone()
     }
 
+    /// 更新显示的权限模式（Shift+Tab 循环切换后同步到界面）。
+    pub(crate) fn set_permission(&self, permission: &str) -> io::Result<()> {
+        {
+            let mut state = self.renderer.state.lock().unwrap();
+            state.permission = permission.to_owned();
+            state.status = format!("权限：{permission}");
+        }
+        self.renderer.draw_dynamic()
+    }
+
     pub(crate) fn set_model(&self, model: &str) -> io::Result<()> {
         let mut state = self.renderer.state.lock().unwrap();
         state.model = model.to_owned();

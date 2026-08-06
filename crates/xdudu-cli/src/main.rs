@@ -862,6 +862,11 @@ async fn handle_tui_running_event(
             if is_ctrl_d(&key) {
                 return Ok(TuiLoopAction::Continue);
             }
+            if is_backtab(&key) {
+                app.notice("权限模式将在下一个任务生效：请在任务结束后按 Shift+Tab 切换。")
+                    .map_err(XduduError::from)?;
+                return Ok(TuiLoopAction::Continue);
+            }
             match app.handle_key(key).map_err(XduduError::from)? {
                 Some(InputOutcome::Submit(line) | InputOutcome::Command(line)) => {
                     pending.push_back(line);
@@ -893,32 +898,53 @@ async fn handle_tui_idle_event(
         Event::Resize(_, _) => {
             app.renderer().draw_dynamic().map_err(XduduError::from)?;
         }
-        Event::Key(key) => match app.handle_key(key).map_err(XduduError::from)? {
-            Some(InputOutcome::Submit(line)) => {
-                start_tui_run(
-                    app,
-                    runtime,
-                    renderer,
-                    line,
-                    *session_id,
-                    run_future,
-                    run_cancel,
-                )
-                .await?;
-            }
-            Some(InputOutcome::Command(input)) => {
-                handle_tui_command(app, runtime, renderer, &input, session_id).await?;
-            }
-            Some(InputOutcome::Interrupted) => {
-                app.notice("再次按 Ctrl+D 或输入 /exit 可退出。")
+        Event::Key(key) => {
+            if is_backtab(&key) {
+                runtime.permission_mode = next_permission_mode(runtime.permission_mode);
+                app.set_permission(runtime.permission_mode.as_str())
                     .map_err(XduduError::from)?;
+                return Ok(TuiLoopAction::Continue);
             }
-            Some(InputOutcome::Exit) => return Ok(TuiLoopAction::Exit),
-            None => {}
-        },
+            match app.handle_key(key).map_err(XduduError::from)? {
+                Some(InputOutcome::Submit(line)) => {
+                    start_tui_run(
+                        app,
+                        runtime,
+                        renderer,
+                        line,
+                        *session_id,
+                        run_future,
+                        run_cancel,
+                    )
+                    .await?;
+                }
+                Some(InputOutcome::Command(input)) => {
+                    handle_tui_command(app, runtime, renderer, &input, session_id).await?;
+                }
+                Some(InputOutcome::Interrupted) => {
+                    app.notice("再次按 Ctrl+D 或输入 /exit 可退出。")
+                        .map_err(XduduError::from)?;
+                }
+                Some(InputOutcome::Exit) => return Ok(TuiLoopAction::Exit),
+                None => {}
+            }
+        }
         _ => {}
     }
     Ok(TuiLoopAction::Continue)
+}
+
+/// 权限模式循环：read-only → auto-safe → full-access。
+fn next_permission_mode(current: PermissionMode) -> PermissionMode {
+    match current {
+        PermissionMode::ReadOnly => PermissionMode::AutoSafe,
+        PermissionMode::AutoSafe => PermissionMode::FullAccess,
+        PermissionMode::FullAccess => PermissionMode::ReadOnly,
+    }
+}
+
+fn is_backtab(key: &KeyEvent) -> bool {
+    key.kind == KeyEventKind::Press && key.code == KeyCode::BackTab
 }
 
 /// 排队输入：命令直接执行，普通提示启动新任务。
@@ -1161,6 +1187,13 @@ async fn handle_tui_command(
         "/new" => {
             *session_id = None;
             app.notice("已开始新会话。").map_err(XduduError::from)?;
+        }
+        "/permission" => {
+            app.notice(format!(
+                "当前权限模式：{} · Shift+Tab 循环切换（read-only → auto-safe → full-access）。",
+                runtime.permission_mode.as_str()
+            ))
+            .map_err(XduduError::from)?;
         }
         "/vim" => {
             app.toggle_vim().map_err(XduduError::from)?;

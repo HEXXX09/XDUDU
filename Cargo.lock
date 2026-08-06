@@ -3198,6 +3198,7 @@ dependencies = [
  "crossterm",
  "futures-util",
  "pulldown-cmark",
+ "reqwest",
  "rpassword",
  "serde",
  "serde_json",

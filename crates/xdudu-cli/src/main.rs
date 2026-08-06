@@ -8,6 +8,7 @@ mod markdown;
 mod renderer;
 mod tui;
 mod ui;
+mod version_check;
 
 use std::io::Write as _;
 use std::{
@@ -366,6 +367,7 @@ fn overrides(cli: &Cli) -> ConfigOverrides {
         no_stream: cli.no_stream.then_some(true),
         color: cli.no_color.then_some(false),
         debug_trace: cli.debug_trace.then_some(true),
+        telemetry_enabled: None,
     }
 }
 
@@ -690,6 +692,20 @@ async fn tui_interactive_loop(
         }
     }
 
+    // 启动时静默检查 GitHub Releases 新版本；结果在空闲时提示。
+    let update_available: Arc<std::sync::Mutex<Option<String>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    {
+        let slot = Arc::clone(&update_available);
+        tokio::spawn(async move {
+            if let Some(latest) = version_check::fetch_latest_version().await
+                && version_check::is_newer(env!("CARGO_PKG_VERSION"), &latest)
+            {
+                *slot.lock().unwrap() = Some(latest);
+            }
+        });
+    }
+
     let mut pending: VecDeque<String> = VecDeque::new();
     let mut run_future: Option<RunFuture> = None;
     let mut run_cancel: Option<CancellationToken> = None;
@@ -759,6 +775,12 @@ async fn tui_interactive_loop(
                 }
             }
         } else {
+            if let Some(latest) = update_available.lock().unwrap().take() {
+                app.notice(format!(
+                    "发现新版本 v{latest}：可通过 cargo install --path crates/xdudu-cli --locked --force 升级。"
+                ))
+                .map_err(XduduError::from)?;
+            }
             if let Some(next) = pending.pop_front() {
                 match handle_queued_tui_input(
                     &app,

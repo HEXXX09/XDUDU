@@ -146,6 +146,33 @@ pub async fn run_doctor(
         },
     });
 
+    match xdudu_core::SqliteSessionStore::new(cwd) {
+        Ok(_) => checks.push(DoctorCheck {
+            name: "database",
+            status: CheckStatus::Pass,
+            message: "会话数据库可访问。".into(),
+        }),
+        Err(error) => checks.push(DoctorCheck {
+            name: "database",
+            status: CheckStatus::Fail,
+            message: format!("会话数据库不可访问：{}", error.message),
+        }),
+    }
+
+    checks.push(DoctorCheck {
+        name: "telemetry",
+        status: if resolved.config.telemetry.enabled {
+            CheckStatus::Warn
+        } else {
+            CheckStatus::Pass
+        },
+        message: if resolved.config.telemetry.enabled {
+            "遥测已显式开启（默认关闭）。".into()
+        } else {
+            "遥测保持默认关闭，XDUDU 不发送任何数据。".into()
+        },
+    });
+
     let ok = !checks
         .iter()
         .any(|check| matches!(check.status, CheckStatus::Fail));

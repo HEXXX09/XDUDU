@@ -330,6 +330,7 @@ xdudu-core
 
 详细资料：
 
+- [版本兼容与迁移策略](docs/COMPATIBILITY.md)
 - [系统架构](docs/ARCHITECTURE.md)
 - [详细设计](docs/DESIGN.md)
 - [v0.3.0 阶段设计与验收](docs/NEXT_PHASE_DESIGN.md)

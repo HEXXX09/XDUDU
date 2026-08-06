@@ -86,6 +86,15 @@ pub struct AppConfig {
     pub provider: ProviderConfig,
     pub agent: AgentConfig,
     pub output: OutputConfig,
+    pub telemetry: TelemetryConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TelemetryConfig {
+    /// 遥测默认关闭；XDUDU 当前不发送任何数据，未来若引入必须保持
+    /// 默认关闭并显式授权。
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -114,6 +123,7 @@ pub struct ConfigOverrides {
     pub no_stream: Option<bool>,
     pub color: Option<bool>,
     pub debug_trace: Option<bool>,
+    pub telemetry_enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -124,6 +134,13 @@ struct FileConfig {
     agent: FileAgent,
     #[serde(default)]
     output: FileOutput,
+    #[serde(default)]
+    telemetry: FileTelemetry,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+struct FileTelemetry {
+    enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -357,6 +374,13 @@ fn apply_file(
         source,
         sources,
     );
+    set(
+        &mut config.telemetry.enabled,
+        &file.telemetry.enabled,
+        "telemetry.enabled",
+        source,
+        sources,
+    );
 }
 
 fn validate_project_trust(
@@ -446,6 +470,10 @@ fn env_file(provider: &str) -> FileConfig {
                 .and_then(|value| value.parse().ok()),
             color: env::var("NO_COLOR").ok().map(|_| false),
             debug_trace: value("XDUDU_DEBUG_TRACE", "XYCLI_DEBUG_TRACE")
+                .and_then(|value| value.parse().ok()),
+        },
+        telemetry: FileTelemetry {
+            enabled: value("XDUDU_TELEMETRY_ENABLED", "XYCLI_TELEMETRY_ENABLED")
                 .and_then(|value| value.parse().ok()),
         },
     }
@@ -549,6 +577,7 @@ fn load_config_from_paths(
             color: env::var_os("NO_COLOR").is_none(),
             debug_trace: false,
         },
+        telemetry: TelemetryConfig { enabled: false },
     };
     let mut sources = [
         ("provider.name", ConfigSource::Default),
@@ -565,6 +594,7 @@ fn load_config_from_paths(
         ("output.no_stream", ConfigSource::Default),
         ("output.color", ConfigSource::Default),
         ("output.debug_trace", ConfigSource::Default),
+        ("telemetry.enabled", ConfigSource::Default),
     ]
     .into_iter()
     .map(|(key, source)| (key.to_owned(), source))
@@ -607,6 +637,9 @@ fn load_config_from_paths(
             no_stream: overrides.no_stream,
             color: overrides.color,
             debug_trace: overrides.debug_trace,
+        },
+        telemetry: FileTelemetry {
+            enabled: overrides.telemetry_enabled,
         },
     };
     apply_file(&mut config, &cli, ConfigSource::Cli, &mut sources);
@@ -679,6 +712,7 @@ pub fn write_config_value(
                 | "output.no_stream"
                 | "output.color"
                 | "output.debug_trace"
+                | "telemetry.enabled"
         )
     {
         return Err(config_error(format!("不支持的配置项：{key}")));
@@ -730,7 +764,7 @@ pub fn write_config_value(
             return Err(config_error(format!("{key} 超出允许范围。")));
         }
         Value::Integer(number)
-    } else if key.starts_with("output.") {
+    } else if key.starts_with("output.") || key == "telemetry.enabled" {
         Value::Boolean(
             raw_value
                 .parse()

@@ -416,7 +416,8 @@ fn validate_project_trust(
         let rank = |mode| match mode {
             ApprovalMode::Never => 0,
             ApprovalMode::Ask => 1,
-            ApprovalMode::Always => 2,
+            ApprovalMode::AcceptEdits => 2,
+            ApprovalMode::Always => 3,
         };
         if rank(requested) > rank(current) {
             return Err(config_error(format!(

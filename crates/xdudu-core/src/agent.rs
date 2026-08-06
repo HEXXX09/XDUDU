@@ -3,6 +3,7 @@
 use std::{
     collections::BTreeSet,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use async_trait::async_trait;
@@ -38,7 +39,8 @@ pub struct AgentRunConfig<'a> {
     pub provider: &'a dyn Provider,
     pub tool_registry: &'a ToolRegistry,
     pub session_store: &'a dyn SessionStore,
-    pub permission_mode: PermissionMode,
+    /// 共享的当前权限模式：每轮循环读取最新值，支持运行中切换即时生效。
+    pub permission_mode: Arc<std::sync::Mutex<PermissionMode>>,
     pub cancellation: CancellationToken,
     pub session_id: Option<Uuid>,
     pub event_sink: Option<&'a dyn EventSink>,
@@ -577,13 +579,15 @@ pub async fn run_agent(config: AgentRunConfig<'_>) -> XduduResult<AgentRunResult
                             }),
                         )
                     } else {
+                        // 每次工具调用前读取最新权限模式（运行中切换即时生效）。
+                        let permission_mode = *config.permission_mode.lock().unwrap();
                         let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel(64);
                         let execution = config.tool_registry.execute_with_progress(
                             &call.name,
                             call.input.clone(),
                             session.id,
                             &config.cwd,
-                            config.permission_mode,
+                            permission_mode,
                             config.cancellation.child_token(),
                             Some(progress_tx),
                         );
@@ -827,7 +831,7 @@ mod tests {
             provider,
             tool_registry: registry,
             session_store: store,
-            permission_mode: PermissionMode::AutoSafe,
+            permission_mode: Arc::new(std::sync::Mutex::new(PermissionMode::AutoSafe)),
             cancellation: CancellationToken::new(),
             session_id: None,
             event_sink: None,
@@ -1126,6 +1130,109 @@ mod tests {
         let result = run_agent(cfg).await.unwrap();
         assert_eq!(result.status, SessionStatus::Incomplete);
         assert_eq!(result.exit_code, 1);
+    }
+
+    #[tokio::test]
+    async fn 运行中切换权限模式_下一个工具调用即时生效() {
+        let dir = tempdir().unwrap();
+        let shared = Arc::new(std::sync::Mutex::new(PermissionMode::ReadOnly));
+        let call = ToolCall {
+            id: "call-write".into(),
+            name: "file_write".into(),
+            input: json!({"path":"a.txt","content":"x","createIfMissing":true}),
+        };
+        // 第二轮 chat 前延迟 200ms，为运行中切换提供确定窗口。
+        // 每次 chat 前延迟 200ms，保证"第一轮 ToolFinished 后测试切换"
+        // 一定发生在第二轮工具调用读取权限之前（确定性窗口）。
+        struct SlowProvider {
+            responses: Mutex<VecDeque<ProviderResponse>>,
+        }
+        #[async_trait]
+        impl Provider for SlowProvider {
+            fn name(&self) -> &'static str {
+                "slow-mock"
+            }
+            async fn chat(&self, _request: ProviderRequest) -> XduduResult<ProviderResponse> {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                self.responses
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .ok_or_else(|| XduduError::provider("没有更多模拟响应", false))
+            }
+        }
+        let provider = SlowProvider {
+            responses: Mutex::new(VecDeque::from([
+                tool_response(vec![call.clone()]),
+                tool_response(vec![call.clone()]),
+                text_response("完成"),
+            ])),
+        };
+        let registry = ToolRegistry::with_runtime(
+            Arc::new(crate::approval::AllowAllApprovalGate),
+            Arc::new(crate::changes::NoopChangeLedger),
+        );
+        let mut registry = registry;
+        register_builtins(&mut registry).unwrap();
+        // 任务内与任务外各持一个存储实例（同一目录，读取一致）。
+        let store = JsonSessionStore::new(dir.path());
+        let store_outer = JsonSessionStore::new(dir.path());
+
+        // 全部所有物移入任务，避免借用局部。
+        let shared_task = Arc::clone(&shared);
+        let sink = Arc::new(RecordingEventSink::default());
+        let sink_task = Arc::clone(&sink);
+        let run = tokio::spawn(async move {
+            let cwd_dir = tempfile::tempdir().unwrap();
+            let cfg = AgentRunConfig {
+                prompt: "测试任务".into(),
+                model: "test".into(),
+                max_turns: 3,
+                cwd: cwd_dir.path().to_path_buf(),
+                provider: &provider,
+                tool_registry: &registry,
+                session_store: &store,
+                permission_mode: shared_task,
+                cancellation: CancellationToken::new(),
+                session_id: None,
+                event_sink: Some(sink_task.as_ref()),
+                stream: false,
+                memories: Vec::new(),
+            };
+            run_agent(cfg).await.unwrap()
+        });
+        // 确定性等待：第一轮工具调用（权限拒绝）完成后切换为 full-access，
+        // 模拟运行中 Shift+Tab；第二轮应即时生效。
+        for _ in 0..200 {
+            let finished = sink
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ToolFinished { .. }));
+            if finished {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        *shared.lock().unwrap() = PermissionMode::FullAccess;
+        let result = run.await.unwrap();
+
+        let session = store_outer.get(result.session_id).await.unwrap().unwrap();
+        // 第一轮：read-only 下 file_write 被权限拒绝；切换后第二轮成功。
+        eprintln!("第一轮 error: {:?}", session.tool_calls[0].error);
+        eprintln!("第二轮 error: {:?}", session.tool_calls[1].error);
+        assert_eq!(session.tool_calls[0].status, ToolCallStatus::Denied);
+        assert!(
+            session.tool_calls[0]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("权限不足")),
+            "第一轮应为权限拒绝，实际：{:?}",
+            session.tool_calls[0].error
+        );
+        // 运行中切换到 full-access 后，第二个工具调用即时生效。
+        assert_eq!(session.tool_calls[1].status, ToolCallStatus::Succeeded);
     }
 
     #[tokio::test]

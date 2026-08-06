@@ -1207,17 +1207,25 @@ impl TuiRenderer {
         set_color(&mut stdout, self.color, MUTED)?;
         let running = !state.tools.is_empty() || !state.streaming.is_empty();
         let hint_text = if running {
-            "Ctrl+C / Esc 打断 · Enter 排队 · 可继续输入"
+            "Ctrl+C / Esc 打断 · Enter 排队 · 可继续输入".to_owned()
         } else if state.vim_enabled {
             if state.vim_normal {
                 "Vim 普通模式 · i/a/A/I 输入 · j/k 历史 · h/l 移动 · 0/$ 行首尾 · x 删除 · dd 清空 · Enter 发送"
+                    .to_owned()
             } else {
-                "Vim 插入模式 · Esc 返回 · Enter 发送"
+                "Vim 插入模式 · Esc 返回 · Enter 发送".to_owned()
             }
         } else if matching_commands(&state.input).is_empty() {
-            state.input_hint.as_str()
+            format!(
+                "⏵ {} mode on · Shift+Tab 切换 · {}",
+                state.permission,
+                state
+                    .input_hint
+                    .split_once(" · / 命令")
+                    .map_or(state.input_hint.as_str(), |(prefix, _)| prefix)
+            )
         } else {
-            "↑↓ 选择 · Tab 补全 · Enter 确定"
+            "↑↓ 选择 · Tab 补全 · Enter 确定".to_owned()
         };
         queue!(
             stdout,
@@ -1225,7 +1233,7 @@ impl TuiRenderer {
             Clear(ClearType::CurrentLine),
             MoveTo(3, help_row),
             Print(truncate_to_width(
-                hint_text,
+                &hint_text,
                 usize::from(columns.saturating_sub(4))
             ))
         )?;

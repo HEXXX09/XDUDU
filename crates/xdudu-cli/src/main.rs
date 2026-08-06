@@ -37,11 +37,11 @@ use xdudu_core::{
     McpTransportKind, MemoryStore, MemorySuggestionConfig, PermissionMode, Plan,
     PlanExecutorConfig, PlanGenerationConfig, PlanRevisionConfig, PlanStatus, PlanStore,
     PluginManifest, Provider, ProviderFactory, ResolvedConfig, SecretSource, SecretStore,
-    SecretString, Session, SessionStatus, SessionStore, SqliteSessionStore, ToolRegistry,
-    WorkspaceLock, XduduError, approval_rules_path, approve_plan, config_paths, generate_plan,
-    load_config, load_mcp_config, load_plugin_manifests, mcp_config_path, plugin_directory,
-    redact_text, register_builtins, register_configured_mcp_tools, reject_plan, resolve_secret,
-    revise_plan, run_agent, run_plan, save_mcp_config, save_plugin_manifest,
+    SecretString, Session, SessionStatus, SessionStore, SideEffectKind, SqliteSessionStore,
+    ToolRegistry, WorkspaceLock, XduduError, approval_rules_path, approve_plan, config_paths,
+    generate_plan, load_config, load_mcp_config, load_plugin_manifests, mcp_config_path,
+    plugin_directory, redact_text, register_builtins, register_configured_mcp_tools, reject_plan,
+    resolve_secret, revise_plan, run_agent, run_plan, save_mcp_config, save_plugin_manifest,
     submit_plan_for_review, write_config_value,
 };
 
@@ -344,6 +344,10 @@ struct Runtime {
     max_turns: u32,
     cwd: PathBuf,
     permission_mode: PermissionMode,
+    /// 运行中可变的共享权限模式（Shift+Tab 切换即时生效）。
+    shared_permission: Arc<std::sync::Mutex<PermissionMode>>,
+    /// /plan 生成期间锁定只读时保存的原权限模式，执行/取消时恢复。
+    plan_restore_mode: Option<PermissionMode>,
     registry: ToolRegistry,
     store: Arc<SqliteSessionStore>,
     renderer: ConsoleRenderer,
@@ -389,6 +393,9 @@ struct ConsoleApprovalGate {
     persistent_rules: JsonApprovalRuleStore,
     /// TUI 会话安装的共享输入路由；激活时审批菜单从路由消费事件。
     router: Option<Arc<InputRouter>>,
+    /// accept-edits 模式：工作区文件编辑自动接受（本会话），
+    /// 命令与网络访问仍走 ask 流程。
+    accept_edits: bool,
 }
 
 impl ConsoleApprovalGate {
@@ -398,6 +405,7 @@ impl ConsoleApprovalGate {
         theme: TerminalTheme,
         fullscreen: bool,
         router: Option<Arc<InputRouter>>,
+        accept_edits: bool,
     ) -> Self {
         Self {
             can_prompt,
@@ -406,6 +414,7 @@ impl ConsoleApprovalGate {
             session_rules: tokio::sync::Mutex::new(BTreeSet::new()),
             persistent_rules,
             router,
+            accept_edits,
         }
     }
 }
@@ -414,6 +423,17 @@ impl ConsoleApprovalGate {
 impl ApprovalGate for ConsoleApprovalGate {
     async fn review(&self, request: &ApprovalRequest) -> ApprovalDecision {
         let rule = ApprovalRule::from_request(request);
+        // accept-edits：工作区文件编辑自动接受（本会话），其余仍询问。
+        if self.accept_edits && request.side_effect == SideEffectKind::WorkspaceWrite {
+            self.session_rules
+                .lock()
+                .await
+                .insert((request.session_id, rule.clone()));
+            return ApprovalDecision::approve_with_scope(
+                "accept-edits 模式自动接受工作区文件编辑。",
+                ApprovalScope::Session,
+            );
+        }
         if self.persistent_rules.contains(&rule).await {
             return ApprovalDecision::approve_with_scope(
                 "命中用户永久审批规则。",
@@ -493,12 +513,13 @@ async fn create_runtime(
     let approval_gate: Arc<dyn ApprovalGate> = match approval_mode {
         ApprovalMode::Always => Arc::new(AllowAllApprovalGate),
         ApprovalMode::Never => Arc::new(DenyAllApprovalGate),
-        ApprovalMode::Ask => Arc::new(ConsoleApprovalGate::new(
+        ApprovalMode::AcceptEdits | ApprovalMode::Ask => Arc::new(ConsoleApprovalGate::new(
             interactive && !resolved.config.output.json,
             JsonApprovalRuleStore::open(approval_rules_path()?).await?,
             theme,
             rich_terminal,
             Some(Arc::clone(&input_router)),
+            approval_mode == ApprovalMode::AcceptEdits,
         )),
     };
     let mut registry = ToolRegistry::with_runtime(approval_gate, change_ledger);
@@ -511,6 +532,10 @@ async fn create_runtime(
         max_turns: resolved.config.agent.max_turns,
         cwd: cwd.clone(),
         permission_mode: resolved.config.agent.permission_mode()?,
+        shared_permission: Arc::new(std::sync::Mutex::new(
+            resolved.config.agent.permission_mode()?,
+        )),
+        plan_restore_mode: None,
         registry,
         store: Arc::new(SqliteSessionStore::new(&cwd)?),
         renderer: ConsoleRenderer::new(
@@ -582,7 +607,7 @@ async fn execute_prompt_with_cancellation(
         provider: runtime.provider.as_ref(),
         tool_registry: &runtime.registry,
         session_store: runtime.store.as_ref(),
-        permission_mode: runtime.permission_mode,
+        permission_mode: Arc::clone(&runtime.shared_permission),
         cancellation,
         session_id,
         event_sink: Some(event_sink),
@@ -900,8 +925,10 @@ async fn handle_tui_idle_event(
         }
         Event::Key(key) => {
             if is_backtab(&key) {
-                runtime.permission_mode = next_permission_mode(runtime.permission_mode);
-                app.set_permission(runtime.permission_mode.as_str())
+                let next = next_permission_mode(runtime.permission_mode);
+                runtime.permission_mode = next;
+                *runtime.shared_permission.lock().unwrap() = next;
+                app.set_permission(next.as_str())
                     .map_err(XduduError::from)?;
                 return Ok(TuiLoopAction::Continue);
             }
@@ -932,6 +959,46 @@ async fn handle_tui_idle_event(
         _ => {}
     }
     Ok(TuiLoopAction::Continue)
+}
+
+/// 应用权限模式到运行时与共享引用，并同步界面徽标。
+fn apply_permission_mode(
+    app: &TuiApp,
+    runtime: &mut Runtime,
+    mode: PermissionMode,
+) -> Result<(), XduduError> {
+    runtime.permission_mode = mode;
+    *runtime.shared_permission.lock().unwrap() = mode;
+    app.set_permission(mode.as_str())
+        .map_err(XduduError::from)?;
+    Ok(())
+}
+
+/// 审阅结束后若计划被拒绝，恢复生成期锁定的原权限模式。
+async fn maybe_restore_after_review(
+    app: &TuiApp,
+    runtime: &mut Runtime,
+    plan_id: Uuid,
+) -> Result<(), XduduError> {
+    if runtime.plan_restore_mode.is_none() {
+        return Ok(());
+    }
+    if let Some(plan) = runtime.store.get_plan(plan_id).await?
+        && plan.status == PlanStatus::Rejected
+    {
+        restore_plan_mode(app, runtime)?;
+    }
+    Ok(())
+}
+
+/// 恢复 plan 生成期间锁定的原权限模式（执行/取消/拒绝/失败时调用）。
+fn restore_plan_mode(app: &TuiApp, runtime: &mut Runtime) -> Result<(), XduduError> {
+    if let Some(mode) = runtime.plan_restore_mode.take() {
+        apply_permission_mode(app, runtime, mode)?;
+        app.notice(format!("已恢复权限模式：{}。", mode.as_str()))
+            .map_err(XduduError::from)?;
+    }
+    Ok(())
 }
 
 /// 权限模式循环：read-only → auto-safe → full-access。
@@ -995,7 +1062,7 @@ async fn start_tui_run(
     let model = runtime.model.clone();
     let max_turns = runtime.max_turns;
     let cwd = runtime.cwd.clone();
-    let permission_mode = runtime.permission_mode;
+    let permission_mode = Arc::clone(&runtime.shared_permission);
     let stream = runtime.stream;
     let run_renderer = renderer.clone();
     let task_cancel = cancellation.clone();
@@ -1301,7 +1368,9 @@ async fn handle_tui_command(
         }
         "/plan" => {
             if let Some(plan) = pending_plan_for_session(runtime, *session_id).await? {
+                let plan_id = plan.id;
                 review_plan_in_tui(runtime, app, plan).await?;
+                maybe_restore_after_review(app, runtime, plan_id).await?;
             } else if let Some(plan) = paused_plan_for_session(runtime, *session_id).await? {
                 recover_plan_in_tui(runtime, app, plan).await?;
             } else if let Some(id) = *session_id
@@ -1380,6 +1449,7 @@ async fn handle_tui_command(
                 return Ok(TuiLoopAction::Continue);
             };
             cancel_plan(runtime, plan.id).await?;
+            restore_plan_mode(app, runtime)?;
             app.notice("计划已取消；既有副作用未撤销。")
                 .map_err(XduduError::from)?;
         }
@@ -1421,12 +1491,22 @@ async fn handle_tui_command(
             {
                 app.notice("正在生成结构化计划…")
                     .map_err(XduduError::from)?;
+                // 生成与审阅期间锁定只读，批准执行/取消/失败时恢复。
+                if runtime.plan_restore_mode.is_none() {
+                    runtime.plan_restore_mode = Some(runtime.permission_mode);
+                    apply_permission_mode(app, runtime, PermissionMode::ReadOnly)?;
+                    app.notice("计划生成与审阅期间已锁定只读；批准执行时将恢复原权限模式。")
+                        .map_err(XduduError::from)?;
+                }
                 match create_plan_for_review(runtime, goal.to_owned(), *session_id).await {
                     Ok((session, plan)) => {
                         *session_id = Some(session.id);
+                        let plan_id = plan.id;
                         review_plan_in_tui(runtime, app, plan).await?;
+                        maybe_restore_after_review(app, runtime, plan_id).await?;
                     }
                     Err(error) => {
+                        restore_plan_mode(app, runtime)?;
                         app.notice(error.message).map_err(XduduError::from)?;
                     }
                 }

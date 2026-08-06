@@ -27,6 +27,9 @@ const MAX_APPROVAL_RULES: usize = 128;
 pub enum ApprovalMode {
     Ask,
     Never,
+    /// Claude Code acceptEdits 式：自动接受工作区文件编辑，
+    /// 命令与网络访问仍按 ask 流程询问。
+    AcceptEdits,
     Always,
 }
 
@@ -35,6 +38,7 @@ impl ApprovalMode {
         match self {
             Self::Ask => "ask",
             Self::Never => "never",
+            Self::AcceptEdits => "accept-edits",
             Self::Always => "always",
         }
     }
@@ -47,9 +51,10 @@ impl std::str::FromStr for ApprovalMode {
         match value {
             "ask" => Ok(Self::Ask),
             "never" => Ok(Self::Never),
+            "accept-edits" => Ok(Self::AcceptEdits),
             "always" => Ok(Self::Always),
             _ => Err(XduduError::validation(format!(
-                "非法审批模式：{value}。可选值：ask、never、always。"
+                "非法审批模式：{value}。可选值：ask、never、accept-edits、always。"
             ))),
         }
     }
@@ -390,5 +395,24 @@ mod tests {
         });
         let record: ApprovalRecord = serde_json::from_value(value).unwrap();
         assert_eq!(record.scope, ApprovalScope::Once);
+    }
+
+    #[test]
+    fn accept_edits_模式自动接受编辑但命令仍需审批() {
+        // 纯枚举语义验证：accept-edits 严格位于 ask 与 always 之间。
+        let rank = |mode: ApprovalMode| match mode {
+            ApprovalMode::Never => 0,
+            ApprovalMode::Ask => 1,
+            ApprovalMode::AcceptEdits => 2,
+            ApprovalMode::Always => 3,
+        };
+        assert!(rank(ApprovalMode::Ask) < rank(ApprovalMode::AcceptEdits));
+        assert!(rank(ApprovalMode::AcceptEdits) < rank(ApprovalMode::Always));
+        assert_eq!(ApprovalMode::AcceptEdits.as_str(), "accept-edits");
+        assert_eq!(
+            "accept-edits".parse::<ApprovalMode>().unwrap(),
+            ApprovalMode::AcceptEdits
+        );
+        assert!("accept_edits".parse::<ApprovalMode>().is_err());
     }
 }

@@ -1,7 +1,7 @@
 # XDUDU 任务路线图
 
 > 当前技术基线：Rust-only v0.8.0 开发分支。
-> 状态更新时间：2026-08-04。
+> 状态更新时间：2026-08-10。
 
 ## 规划调整
 
@@ -27,6 +27,7 @@
 | M8 | MCP 与插件 | 已完成 |
 | M9 | 自定义指令、记忆与可选 RAG | 功能完成，待三平台验收 |
 | M10 | 1.0 发布、诊断与兼容性 | 功能完成，待 v1.0.0 发布 |
+| M11 | Agent 编排、Skills 与上下文能力 | 功能完成，本地验收通过，待三平台 CI |
 
 ## M1：Rust 核心迁移与收尾
 
@@ -160,6 +161,42 @@ M9 在 M5 长上下文数据完成后重新评审，避免过早引入向量数�
 - [x] M10-T05：遥测默认关闭（telemetry.enabled=false 配置占位），不发送任何数据；
 - [x] M10-T06：安装/升级/降级/卸载 E2E（scripts/install-e2e.sh）；
 - [x] M10-T07：冻结 1.0 CLI、配置和会话兼容约定（docs/COMPATIBILITY.md 第一章）；v1.0.0 发布待打 tag。
+
+## M11：Agent 编排、Skills 与上下文能力
+
+M11 四份设计文档（`M11_EXECUTION_DESIGN.md`、`M11_SKILLS_DESIGN.md`、
+`M11_PROVIDER_DESIGN.md`、`M11_CONTEXT_WEBMEM_DESIGN.md`）分四条线推进。
+其中 Provider 生态（openai-compatible、thinking 闭环、temperature 配置化）与
+停滞检测在 M11 前期已完成；本阶段补齐其余能力并全部通过验收。
+
+- [x] M11-P01：新增 `openai-compatible` Provider（复用 OpenAI wire 协议）与配置白名单扩展；
+- [x] M11-P02：DeepSeek `reasoning_content` 思考闭环（持久化与工具循环回传，公开输出不展示）；
+- [x] M11-P03：`temperature` / `max_output_tokens` / `reasoning` 配置化；
+- [x] M11-E01：停滞检测（重复失败 / 无进展窗口）与 auto/ask/off 恢复策略；
+- [x] M11-E02：子代理体系——`AgentProfile` 内置档案（build/plan/explore/general/reviewer）、
+  `task` 委派工具（隔离上下文、受限工具集、`SUBAGENT_INCOMPLETE`）、同批多 task 并行、
+  审计记录随父会话持久化、子代理不获得父会话没有的权限；
+- [x] M11-E03：只读工具并行执行（`side_effect == None` 批次内 `join_all`，副作用工具串行，
+  单进度通道按 call_id 分发）；`/agent` 命令与 `[agent.profiles]` 自定义档案
+  （项目档案仅只读）；
+- [x] M11-S01：Skills 技能系统——六级目录发现（.xdudu/.claude/.opencode 项目级与用户级）、
+  YAML frontmatter 校验、优先级去重、`skill` 工具按需加载注入当前轮 system；
+  `agent.skills` 三档（allow/ask/deny）；`/skills` 命令；`SkillLoaded` 事件；
+- [x] M11-S02：指令接通主循环 + `AGENTS.md` / `CLAUDE.md` / `.claude/CLAUDE.md` 仓库约定读取
+  （向上查找到 .git 根，128 KiB 上限，跳过 symlink）；`/instructions` 与 doctor 指令摘要；
+- [x] M11-S03：`terminal_exec` 三档前缀白名单（deny > allow > ask），默认 allow 内置规则，
+  项目配置只能追加 deny/ask；
+- [x] M11-C01：LLM 分级上下文压缩——<3× 预算确定性截断，≥3× `submit_context_summary`
+  结构化压缩（失败静默回退 + `CONTEXT_COMPACT_LLM_FALLBACK`）；`/compact` 强制触发；
+  token 估算改字符加权；
+- [x] M11-C02：记忆注入管线——FTS5 召回 → 查询词精排 → 去重 → Token 预算（默认 1500）
+  → ≤8 条注入，query 拼接最近助手文本；`memory.top_k` / `memory.injection_token_budget`；
+- [x] M11-C03：`web_read` 工具——分段拉取大型页面 + LLM 提炼（复用 web_fetch SSRF/DNS
+  边界，单次网络段与提炼请求数均有硬上限，提炼失败回退纯文本，返回
+  summary/keyPoints/chunksRead/nextStartRef）；
+- [x] M11-Q01：完成本地格式、Clippy、全工作区测试与 Release 构建门禁；修复 Windows
+  无独立 `echo` 可执行文件的问题，`pwd`/`echo`/`ls` 改为 Rust 内建实现；
+- [ ] M11-Q02：推送后确认 macOS、Linux、Windows GitHub Actions 全部通过。
 
 ## 1.0 之后再评估
 

@@ -31,8 +31,14 @@ XDUDU 是一个使用 Rust 实现的终端 AI 编程助手。它把自然语言�
 - stdio 与 Streamable HTTP MCP，外部工具统一进入权限、审批、超时、取消、脱敏和审计链；
 - 只声明 MCP Server 的隔离插件清单，以及 `mcp`、`plugin` 管理和诊断命令；
 - 密钥、Bearer Token、私钥和敏感结构字段的统一输出及会话脱敏；
-- 用户级与项目级自定义指令（`~/.config/xdudu/instructions/*.md` 与 `.xdudu/instructions/*.md`）注入系统提示词，项目指令视为不可信输入且不改变权限边界；
-- 可审查记忆：任务完成后模型生成脱敏建议，TUI 逐条确认后写入；`memory list/add/remove` 管理，SQLite FTS5 本地全文检索注入相关记忆，默认不自动写入；
+- 用户级与项目级自定义指令（`~/.config/xdudu/instructions/*.md` 与 `.xdudu/instructions/*.md`）与仓库约定（`AGENTS.md`、`CLAUDE.md`、`.claude/CLAUDE.md`）注入系统提示词，`/instructions` 与 doctor 输出加载摘要，项目指令视为不可信输入且不改变权限边界；
+- 可审查记忆：任务完成后模型生成脱敏建议，TUI 逐条确认后写入；`memory list/add/remove` 管理，SQLite FTS5 本地全文检索注入相关记忆，默认不自动写入；注入管线按查询词精排、去重并受 Token 预算约束；
+- Skills 技能系统：六级目录发现 `SKILL.md`（.xdudu/.claude/.opencode 项目级与用户级，兼容 Claude Code / opencode 生态），frontmatter 校验与优先级去重；`skill` 工具按需加载并注入当前轮系统提示词；`agent.skills` 三档（allow/ask/deny）；`/skills` 命令；
+- `terminal_exec` 三档前缀白名单：deny > allow > ask（默认内置 allow 覆盖 pwd/echo/ls、只读 git、cargo/npm/python/go 常见检查命令；项目配置只能追加 deny/ask）；
+- 子代理体系：`task` 工具把只读调研或独立子任务委派给隔离上下文（explore/general/reviewer/build 内置档案 + `[agent.profiles]` 自定义），同批可并行执行多个子代理；子代理不获得父会话没有的权限，审计记录随父会话持久化；`/agent` 命令；
+- 只读工具并行执行：同批无副作用工具 `join_all` 并发，副作用工具保持串行，共享进度通道按 call_id 分发；
+- LLM 分级上下文压缩：低于 3× 预算走确定性截断，达到 3× 预算触发 `submit_context_summary` 结构化压缩，失败静默回退；`/compact` 强制触发；Token 估算改字符加权；
+- `web_read` 工具：有界分段读取大型网页 + LLM 提炼（复用 web_fetch 的 SSRF/DNS 边界，单次响应最多 1 MiB、单次调用最多提炼 8 块，失败回退纯文本并返回续读锚点）；
 - macOS、Linux、Windows CI 与多平台 Release 归档工作流。
 
 旧 TypeScript 运行时及 npm 构建链已删除，项目只需要 Rust 工具链。
@@ -91,7 +97,7 @@ Anthropic 对应 `anthropic` 和 `ANTHROPIC_API_KEY`：
 真实交互终端中自动启用带 XDUDU 图标、状态栏、消息时间线和固定输入区的完整界面。管道、重定向、CI 和 `TERM=dumb` 会自动降级为无光标控制的顺序文本，用户无需选择渲染模式。
 输入支持左右移动、Home/End、Ctrl+A/E、Ctrl+U/K/W、上下浏览本会话历史、
 Ctrl+C 清空当前输入和空行 Ctrl+D 退出。历史仅保存在当前进程内，不会把输入写入额外的历史文件。
-交互命令包括 `/help`、`/new`、`/resume`、`/plan <目标>`、`/model [name]`、`/mcp`、`/plugins`、`/transcript`、`/copy`、`/export`、`/rename`、`/turns <n>` 和 `/exit`。交互界面支持 Shift+Enter/Ctrl+J 多行输入、Ctrl+R 历史检索、`/` 命令候选和 `@` 工作区文件候选。DeepSeek 当前提供 `deepseek-v4-flash` 和 `deepseek-v4-pro`。
+交互命令包括 `/help`、`/new`、`/resume`、`/plan <目标>`、`/model [name]`、`/mcp`、`/plugins`、`/instructions`、`/skills`、`/agent`、`/transcript`、`/copy`、`/export`、`/rename`、`/turns <n>`、`/compact` 和 `/exit`。交互界面支持 Shift+Enter/Ctrl+J 多行输入、Ctrl+R 历史检索、`/` 命令候选和 `@` 工作区文件候选。DeepSeek 当前提供 `deepseek-v4-flash` 和 `deepseek-v4-pro`。
 
 ## MCP 与插件
 
@@ -317,13 +323,14 @@ xdudu CLI
   └── doctor、auth、config
         ↓
 xdudu-core
-  ├── Config + SecretStore + ProviderFactory
-  ├── Agent Loop + AgentEvent + ToolProgress
-  ├── Provider：Anthropic / DeepSeek / Stream / Retry
+  ├── Config + SecretStore + ProviderFactory + CommandRules + AgentProfile
+  ├── Agent Loop + AgentEvent + ToolProgress + 停滞检测 + 只读并行
+  ├── Provider：Anthropic / DeepSeek / OpenAI-Compatible / Stream / Retry
   ├── PermissionMode + ApprovalGate + ToolRegistry
   ├── file_read / file_write / search_text / apply_patch
-  ├── git_status / git_diff / web_search / web_fetch / terminal_exec
-  ├── SqliteSessionStore + WorkspaceLock + Context Compression
+  ├── git_status / git_diff / web_search / web_fetch / web_read / terminal_exec
+  ├── skill / task（Skills 与子代理委派）
+  ├── SqliteSessionStore + WorkspaceLock + 分级 Context Compression
   ├── Plan + PlanStep + PlanRevision + PlanStore + PlanGenerator/Reviewer
   └── JsonChangeLedger + Undo
 ```
@@ -338,6 +345,10 @@ xdudu-core
 - [v0.5.0 会话恢复与上下文设计](docs/M5_SESSION_RECOVERY_DESIGN.md)
 - [v0.6.0 工具与网络安全设计](docs/M6_TOOLING_WEB_DESIGN.md)
 - [M7 Plan 基础设计](docs/M7_PLAN_FOUNDATION_DESIGN.md)
+- [M11 Agent 编排设计](docs/M11_EXECUTION_DESIGN.md)
+- [M11 Skills、指令与命令白名单设计](docs/M11_SKILLS_DESIGN.md)
+- [M11 Provider 生态与思考路径设计](docs/M11_PROVIDER_DESIGN.md)
+- [M11 上下文、记忆与 Web 阅读设计](docs/M11_CONTEXT_WEBMEM_DESIGN.md)
 - [产品需求](docs/PRD.md)
 - [任务路线图](docs/TASKS.md)
 - [Rust 迁移记录](docs/RUST_MIGRATION.md)

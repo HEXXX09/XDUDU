@@ -6,7 +6,13 @@ use crate::error::{XduduError, XduduResult};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderStreamEvent {
-    TextDelta { text: String },
+    TextDelta {
+        text: String,
+    },
+    /// 内部推理增量，仅用于 Provider 内部流转，不进入公开文本。
+    ReasoningDelta {
+        text: String,
+    },
 }
 
 #[async_trait]

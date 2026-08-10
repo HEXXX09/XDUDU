@@ -293,6 +293,7 @@ async fn execute_step(
                 system: step_system_prompt(&config.cwd, plan, &step),
                 temperature: 0.2,
                 max_output_tokens: 4096,
+                reasoning: false,
                 cancellation: config.cancellation.child_token(),
             })
             .await?;
@@ -660,6 +661,7 @@ mod tests {
             tool_calls: vec![call],
             usage: TokenUsage::default(),
             finish_reason: FinishReason::ToolCalls,
+            reasoning: None,
         }
     }
 

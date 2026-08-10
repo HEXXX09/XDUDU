@@ -17,6 +17,7 @@ use tokio::{
 
 use crate::{
     SideEffectKind,
+    config::CommandRules,
     permission::{PermissionLevel, PermissionMode},
 };
 
@@ -30,6 +31,40 @@ const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 
 pub struct TerminalExecTool;
 
+/// 命令三档档位：deny > allow > ask。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommandTier {
+    Deny,
+    Allow,
+    Ask,
+}
+
+/// 按「完整可执行名 + 首个参数」前缀匹配三档规则，匹配顺序 deny > allow > ask。
+pub(crate) fn classify_command(
+    command: &str,
+    args: &[String],
+    rules: &CommandRules,
+) -> CommandTier {
+    let first_arg = args.first().map(String::as_str).unwrap_or_default();
+    let rule_matches = |rule: &String| {
+        let mut parts = rule.split_whitespace();
+        if parts.next() != Some(command) {
+            return false;
+        }
+        match parts.next() {
+            None => true,
+            Some(expected) => expected == first_arg,
+        }
+    };
+    if rules.deny.iter().any(rule_matches) {
+        CommandTier::Deny
+    } else if rules.allow.iter().any(rule_matches) {
+        CommandTier::Allow
+    } else {
+        CommandTier::Ask
+    }
+}
+
 fn valid_command(command: &str) -> bool {
     !command.is_empty()
         && command.len() <= 128
@@ -40,10 +75,41 @@ fn valid_command(command: &str) -> bool {
 
 fn check_git_args(args: &[String]) -> Result<(), String> {
     let Some(subcommand) = args.first() else {
-        return Err("auto-safe 只允许 git status、diff、log 和 show。".into());
+        return Err(
+            "auto-safe 只允许只读 git 子命令：status、diff、log、show、branch、stash。".into(),
+        );
     };
-    if !["status", "diff", "log", "show"].contains(&subcommand.as_str()) {
-        return Err("auto-safe 只允许 git status、diff、log 和 show。".into());
+    match subcommand.as_str() {
+        "status" | "diff" | "log" | "show" => {}
+        "branch" => {
+            let read_only_flags = [
+                "-l",
+                "--list",
+                "-a",
+                "--all",
+                "-r",
+                "--remotes",
+                "-v",
+                "--verbose",
+            ];
+            if args
+                .iter()
+                .skip(1)
+                .any(|arg| !read_only_flags.contains(&arg.as_str()))
+            {
+                return Err("auto-safe 的 git branch 只允许只读列举参数（-l/-a/-r/-v）。".into());
+            }
+        }
+        "stash" => {
+            if args.len() > 1 && !matches!(args[1].as_str(), "list" | "show") {
+                return Err("auto-safe 的 git stash 只允许 list 与 show。".into());
+            }
+        }
+        _ => {
+            return Err(
+                "auto-safe 只允许只读 git 子命令：status、diff、log、show、branch、stash。".into(),
+            );
+        }
     }
     let forbidden = [
         "-C",
@@ -65,30 +131,157 @@ fn check_git_args(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-async fn check_auto_safe(
+/// auto-safe 命令分类：先应用三档规则（deny 立即拒绝），再对 allow 档附加
+/// 固定安全校验（ls 工作区隔离、git 只读参数）。返回档位供审批决策使用。
+async fn classify_auto_safe(
     command: &str,
     args: &[String],
     cwd: &Path,
     env: &HashMap<String, String>,
-) -> Result<(), String> {
+    rules: &CommandRules,
+) -> Result<CommandTier, String> {
     if !env.is_empty() {
         return Err("auto-safe 不允许覆盖环境变量。".into());
     }
+    let tier = classify_command(command, args, rules);
+    if tier == CommandTier::Deny {
+        return Err(format!("命令“{command}”命中 deny 规则，已拒绝。"));
+    }
     match command {
-        "pwd" if args.is_empty() => Ok(()),
-        "pwd" => Err("pwd 不接受参数。".into()),
-        "echo" => Ok(()),
         "ls" => {
+            let allowed_flags = ["-a", "-A", "--all", "-l", "-la", "-al"];
+            if let Some(flag) = args
+                .iter()
+                .find(|arg| arg.starts_with('-') && !allowed_flags.contains(&arg.as_str()))
+            {
+                return Err(format!("auto-safe 的 ls 不支持参数：{flag}"));
+            }
             for arg in args.iter().filter(|arg| !arg.starts_with('-')) {
                 resolve_existing(Path::new(arg), cwd)
                     .await
                     .map_err(|_| format!("ls 路径不在工作区内或不存在：{arg}"))?;
             }
-            Ok(())
         }
-        "git" => check_git_args(args),
-        _ => Err(format!("命令“{command}”不在 auto-safe 白名单中。")),
+        "git" => check_git_args(args)?,
+        _ => {}
     }
+    Ok(tier)
+}
+
+fn bounded_output(text: String) -> (String, bool) {
+    if text.len() <= MAX_OUTPUT_LENGTH {
+        return (text, false);
+    }
+    let mut end = MAX_OUTPUT_LENGTH;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (text[..end].to_owned(), true)
+}
+
+fn portable_success(
+    command: &str,
+    args: &[String],
+    cwd: &Path,
+    stdout: String,
+    context: &ToolContext,
+) -> ToolResult {
+    let (stdout, truncated) = bounded_output(stdout);
+    let output_summary = stdout
+        .lines()
+        .rev()
+        .take(20)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n");
+    ToolResult::success(
+        json!({
+            "exitCode":0,
+            "signal":null,
+            "stdout":stdout,
+            "stderr":"",
+            "outputSummary":output_summary,
+            "truncated":truncated
+        }),
+        context.started_at,
+        json!({"command":command,"args":args,"exitCode":0,"signal":null,"cwd":cwd}),
+    )
+}
+
+async fn portable_ls(args: &[String], cwd: &Path) -> Result<String, String> {
+    let show_hidden = args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "-a" | "-A" | "--all" | "-la" | "-al"));
+    let long = args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "-l" | "-la" | "-al"));
+    let requested = args
+        .iter()
+        .filter(|arg| !arg.starts_with('-'))
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let requested = if requested.is_empty() {
+        vec!["."]
+    } else {
+        requested
+    };
+    let multiple = requested.len() > 1;
+    let mut output = String::new();
+    for (index, requested_path) in requested.iter().enumerate() {
+        let path = resolve_existing(Path::new(requested_path), cwd)
+            .await
+            .map_err(|error| error.message)?;
+        if multiple {
+            if index > 0 {
+                output.push('\n');
+            }
+            output.push_str(requested_path);
+            output.push_str(":\n");
+        }
+        let metadata = tokio::fs::symlink_metadata(&path)
+            .await
+            .map_err(|error| format!("读取 {requested_path} 元数据失败：{error}"))?;
+        if !metadata.is_dir() {
+            output.push_str(requested_path);
+            output.push('\n');
+            continue;
+        }
+        let mut directory = tokio::fs::read_dir(&path)
+            .await
+            .map_err(|error| format!("读取目录 {requested_path} 失败：{error}"))?;
+        let mut entries = Vec::new();
+        while let Some(entry) = directory
+            .next_entry()
+            .await
+            .map_err(|error| format!("读取目录 {requested_path} 失败：{error}"))?
+        {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !show_hidden && name.starts_with('.') {
+                continue;
+            }
+            let metadata = entry
+                .metadata()
+                .await
+                .map_err(|error| format!("读取 {name} 元数据失败：{error}"))?;
+            entries.push((name, metadata.is_dir(), metadata.len()));
+        }
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        for (name, is_directory, size) in entries {
+            if long {
+                let kind = if is_directory { 'd' } else { '-' };
+                output.push_str(&format!("{kind} {size:>10} {name}"));
+            } else {
+                output.push_str(&name);
+            }
+            if is_directory {
+                output.push('/');
+            }
+            output.push('\n');
+        }
+    }
+    Ok(output)
 }
 
 fn parse_args(input: &Value) -> Vec<String> {
@@ -181,7 +374,7 @@ impl Tool for TerminalExecTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "terminal_exec".into(),
-            description: "运行单个可执行文件并返回 stdout、stderr 和退出码。所有参数必须放入 args；auto-safe 仅允许 pwd、echo、ls 和只读 git 子命令。".into(),
+            description: "运行单个可执行文件并返回 stdout、stderr 和退出码。所有参数必须放入 args；auto-safe 按三档策略执行：命中 allow 白名单直接运行，命中 ask 或未匹配的命令进入审批，命中 deny 的命令立即拒绝。".into(),
             input_schema: json!({
                 "type":"object",
                 "properties":{
@@ -200,10 +393,10 @@ impl Tool for TerminalExecTool {
         }
     }
 
-    /// auto-safe 白名单命令（pwd/echo/ls/只读 git）豁免审批，对齐 Claude Code：
-    /// 安全命令直接放行，危险命令才询问。full-access 下白名单同样豁免；
-    /// 白名单外命令仍需审批。auto-safe 下白名单外会在执行阶段以
-    /// `UNSAFE_COMMAND` 拒绝，故也不弹审批。
+    /// auto-safe 按三档规则决定是否进入审批：allow 直接放行，ask 进入审批，
+    /// deny 在执行阶段以 `UNSAFE_COMMAND` 拒绝故不弹审批；固定安全校验失败
+    /// （ls 越界、只读 git 之外）同样在执行阶段拒绝。full-access 下 deny
+    /// 仍生效，其余命令按既有逻辑（白名单豁免、其他需审批）。
     async fn needs_approval(&self, input: &Value, context: &ToolContext) -> bool {
         let Some(command) = input.get("command").and_then(Value::as_str) else {
             return true;
@@ -219,9 +412,22 @@ impl Tool for TerminalExecTool {
             // 路径非法时执行阶段会直接失败，无需先打扰用户审批。
             Err(_) => return false,
         };
-        match check_auto_safe(command, &args, &cwd, &env_overrides).await {
-            Ok(()) => false,
-            Err(_) => context.permission_mode == PermissionMode::FullAccess,
+        if context.permission_mode != PermissionMode::FullAccess {
+            match classify_auto_safe(command, &args, &cwd, &env_overrides, &context.command_rules)
+                .await
+            {
+                Ok(CommandTier::Allow) => false,
+                Ok(CommandTier::Ask) => true,
+                // deny 与固定安全校验失败都会在执行阶段拒绝，不弹审批。
+                Ok(CommandTier::Deny) | Err(_) => false,
+            }
+        } else {
+            match classify_command(command, &args, &context.command_rules) {
+                // deny 在执行阶段拒绝；allow 豁免审批；ask 需要审批。
+                CommandTier::Deny => false,
+                CommandTier::Allow => false,
+                CommandTier::Ask => true,
+            }
         }
     }
 
@@ -305,8 +511,20 @@ impl Tool for TerminalExecTool {
             }
         };
         let env_overrides = parse_env(&input);
+        // deny 规则在全部权限模式下生效。
+        if classify_command(command, &args, &context.command_rules) == CommandTier::Deny {
+            return ToolResult::failure(
+                "UNSAFE_COMMAND",
+                format!("命令“{command}”命中 deny 规则，已拒绝。"),
+                context.started_at,
+                json!({"command":command,"args":args,"permissionMode":context.permission_mode.as_str()}),
+            );
+        }
         if context.permission_mode != PermissionMode::FullAccess {
-            if let Err(reason) = check_auto_safe(command, &args, &cwd, &env_overrides).await {
+            if let Err(reason) =
+                classify_auto_safe(command, &args, &cwd, &env_overrides, &context.command_rules)
+                    .await
+            {
                 return ToolResult::failure(
                     "UNSAFE_COMMAND",
                     reason,
@@ -315,22 +533,47 @@ impl Tool for TerminalExecTool {
                 );
             }
         }
-        // `pwd` 在 Windows 上不是独立的可执行文件。直接返回已经过工作区边界
-        // 校验的目录，既保证跨平台行为一致，也避免为内建命令启动 shell。
-        if command == "pwd" && args.is_empty() {
-            let stdout = format!("{}\n", cwd.display());
-            return ToolResult::success(
-                json!({
-                    "exitCode":0,
-                    "signal":null,
-                    "stdout":stdout,
-                    "stderr":"",
-                    "outputSummary":cwd.display().to_string(),
-                    "truncated":false
-                }),
-                context.started_at,
-                json!({"command":command,"args":args,"exitCode":0,"signal":null,"cwd":cwd}),
-            );
+        // `pwd`、`echo` 与 `ls` 在不同平台可能只是 shell 内建命令。这里使用
+        // 受限 Rust 实现，保证三平台行为一致，同时继续坚持“不启动 shell”。
+        match command {
+            "pwd" if args.is_empty() => {
+                return portable_success(
+                    command,
+                    &args,
+                    &cwd,
+                    format!("{}\n", cwd.display()),
+                    &context,
+                );
+            }
+            "pwd" => {
+                return ToolResult::failure(
+                    "INVALID_TOOL_INPUT",
+                    "pwd 不接受参数。",
+                    context.started_at,
+                    json!({"command":command,"args":args}),
+                );
+            }
+            "echo" => {
+                return portable_success(
+                    command,
+                    &args,
+                    &cwd,
+                    format!("{}\n", args.join(" ")),
+                    &context,
+                );
+            }
+            "ls" => match portable_ls(&args, &cwd).await {
+                Ok(stdout) => return portable_success(command, &args, &cwd, stdout, &context),
+                Err(message) => {
+                    return ToolResult::failure(
+                        "INVALID_LS_PATH",
+                        message,
+                        context.started_at,
+                        json!({"command":command,"args":args}),
+                    );
+                }
+            },
+            _ => {}
         }
         let executable = if context.permission_mode == PermissionMode::FullAccess {
             PathBuf::from(command)
@@ -505,5 +748,57 @@ mod tests {
         assert!(check_git_args(&["status".into(), "--short".into()]).is_ok());
         assert!(check_git_args(&["commit".into()]).is_err());
         assert!(check_git_args(&["diff".into(), "--output=x".into()]).is_err());
+        assert!(check_git_args(&["branch".into(), "-l".into()]).is_ok());
+        assert!(check_git_args(&["branch".into(), "-d".into()]).is_err());
+        assert!(check_git_args(&["stash".into(), "list".into()]).is_ok());
+        assert!(check_git_args(&["stash".into(), "push".into()]).is_err());
+    }
+
+    #[test]
+    fn 三档规则按_deny_allow_ask_顺序匹配() {
+        let rules = CommandRules {
+            allow: ["cargo check".into(), "echo".into()].into_iter().collect(),
+            ask: ["cargo install".into()].into_iter().collect(),
+            deny: ["sudo".into(), "rm".into()].into_iter().collect(),
+        };
+        let args = |values: &[&str]| values.iter().map(|v| v.to_string()).collect::<Vec<_>>();
+
+        // deny 优先：sudo 即使不在 allow 也拒绝；rm 全名匹配拒绝。
+        assert_eq!(
+            classify_command("sudo", &args(&[]), &rules),
+            CommandTier::Deny
+        );
+        assert_eq!(
+            classify_command("rm", &args(&["-rf", "x"]), &rules),
+            CommandTier::Deny
+        );
+        // allow：完整可执行名 + 首个参数匹配。
+        assert_eq!(
+            classify_command("cargo", &args(&["check"]), &rules),
+            CommandTier::Allow
+        );
+        assert_eq!(
+            classify_command("echo", &args(&["hi"]), &rules),
+            CommandTier::Allow
+        );
+        // ask：未匹配 allow 但命中 ask 前缀。
+        assert_eq!(
+            classify_command("cargo", &args(&["install"]), &rules),
+            CommandTier::Ask
+        );
+        // 未匹配任何规则 → ask。
+        assert_eq!(
+            classify_command("cargo", &args(&["publish"]), &rules),
+            CommandTier::Ask
+        );
+        assert_eq!(
+            classify_command("python3", &args(&["-m", "pytest"]), &rules),
+            CommandTier::Ask
+        );
+        // 可执行名不同不匹配。
+        assert_eq!(
+            classify_command("git", &args(&["status"]), &rules),
+            CommandTier::Ask
+        );
     }
 }

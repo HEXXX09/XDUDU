@@ -8,8 +8,10 @@ mod git_diff;
 mod git_status;
 mod path_policy;
 mod search_text;
+mod skill;
 mod terminal_exec;
 mod web_fetch;
+mod web_read;
 mod web_search;
 
 use std::{
@@ -32,6 +34,7 @@ use crate::{
         ApprovalGate, ApprovalRecord, ApprovalRequest, DenyAllApprovalGate, SideEffectKind,
     },
     changes::{ChangeLedger, NoopChangeLedger},
+    config::CommandRules,
     error::{XduduError, XduduResult},
     permission::{PermissionLevel, PermissionMode},
     provider::ProviderToolDefinition,
@@ -43,11 +46,12 @@ pub use file_write::FileWriteTool;
 pub use git_diff::GitDiffTool;
 pub use git_status::GitStatusTool;
 pub use search_text::SearchTextTool;
+pub use skill::SkillTool;
 pub use terminal_exec::TerminalExecTool;
 pub use web_fetch::WebFetchTool;
 pub(crate) use web_fetch::pinned_client;
+pub use web_read::WebReadTool;
 pub use web_search::WebSearchTool;
-
 #[derive(Debug, Clone)]
 pub struct ToolDefinition {
     pub name: String,
@@ -78,18 +82,23 @@ pub struct ToolContext {
     pub started_at: DateTime<Utc>,
     pub change_ledger: Arc<dyn ChangeLedger>,
     pub progress: Option<mpsc::Sender<ToolProgressUpdate>>,
+    /// `terminal_exec` 三档命令规则（deny > allow > ask）。
+    pub command_rules: CommandRules,
 }
 
 impl ToolContext {
     pub fn report_progress(&self, update: ToolProgressUpdate) {
         if let Some(progress) = &self.progress {
-            let _ = progress.try_send(update);
+            let _ = progress.try_send(update.with_call_id(self.call_id.to_string()));
         }
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct ToolProgressUpdate {
+    /// 所属工具调用的 call_id；由 [`ToolContext::report_progress`] 填充，
+    /// 供共享进度通道按调用分发。
+    pub call_id: String,
     pub phase: String,
     pub completed: Option<u64>,
     pub total: Option<u64>,
@@ -100,6 +109,7 @@ pub struct ToolProgressUpdate {
 impl ToolProgressUpdate {
     pub fn phase(phase: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
+            call_id: String::new(),
             phase: phase.into(),
             completed: None,
             total: None,
@@ -115,12 +125,18 @@ impl ToolProgressUpdate {
         unit: impl Into<String>,
     ) -> Self {
         Self {
+            call_id: String::new(),
             phase: phase.into(),
             completed: Some(completed),
             total,
             unit: Some(unit.into()),
             message: None,
         }
+    }
+
+    pub fn with_call_id(mut self, call_id: impl Into<String>) -> Self {
+        self.call_id = call_id.into();
+        self
     }
 }
 
@@ -214,6 +230,8 @@ pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
     approval_gate: Arc<dyn ApprovalGate>,
     change_ledger: Arc<dyn ChangeLedger>,
+    /// `terminal_exec` 三档命令规则；默认内置 allow/deny 白名单。
+    command_rules: CommandRules,
 }
 
 impl Default for ToolRegistry {
@@ -222,6 +240,7 @@ impl Default for ToolRegistry {
             tools: HashMap::new(),
             approval_gate: Arc::new(DenyAllApprovalGate),
             change_ledger: Arc::new(NoopChangeLedger),
+            command_rules: CommandRules::default(),
         }
     }
 }
@@ -236,6 +255,7 @@ impl ToolRegistry {
             tools: HashMap::new(),
             approval_gate,
             change_ledger: Arc::new(NoopChangeLedger),
+            command_rules: CommandRules::default(),
         }
     }
 
@@ -247,7 +267,18 @@ impl ToolRegistry {
             tools: HashMap::new(),
             approval_gate,
             change_ledger,
+            command_rules: CommandRules::default(),
         }
+    }
+
+    /// 覆盖命令三档规则（来自分层配置；项目规则已在加载时合并）。
+    pub fn with_command_rules(mut self, rules: CommandRules) -> Self {
+        self.command_rules = rules;
+        self
+    }
+
+    pub fn set_command_rules(&mut self, rules: CommandRules) {
+        self.command_rules = rules;
     }
 
     pub fn register<T: Tool + 'static>(&mut self, tool: T) -> XduduResult<()> {
@@ -261,6 +292,11 @@ impl ToolRegistry {
 
     pub fn get(&self, name: &str) -> Option<&Arc<dyn Tool>> {
         self.tools.get(name)
+    }
+
+    /// 审批门引用（子代理等自定义执行路径需要走同一审批链）。
+    pub fn approval_gate(&self) -> Arc<dyn ApprovalGate> {
+        Arc::clone(&self.approval_gate)
     }
 
     pub fn definitions(&self) -> Vec<ToolDefinition> {
@@ -356,6 +392,7 @@ impl ToolRegistry {
             started_at,
             change_ledger: Arc::clone(&self.change_ledger),
             progress,
+            command_rules: self.command_rules.clone(),
         };
         match tokio::time::timeout(definition.default_timeout, tool.preflight(&input, &context))
             .await
@@ -373,8 +410,9 @@ impl ToolRegistry {
             }
         }
         let mut approval = None;
-        if definition.side_effect.requires_approval() && tool.needs_approval(&input, &context).await
-        {
+        // 默认实现等于 `side_effect.requires_approval()`；工具可覆盖以便在
+        // 无副作用操作上自定义审批策略（如 skill 的 agent.skills=ask）。
+        if tool.needs_approval(&input, &context).await {
             let request = ApprovalRequest {
                 id: Uuid::new_v4(),
                 session_id,

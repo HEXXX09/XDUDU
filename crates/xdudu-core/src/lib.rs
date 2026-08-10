@@ -24,7 +24,10 @@ pub mod prompt;
 pub mod provider;
 pub mod redaction;
 pub mod session;
+pub mod skills;
 pub mod sqlite_session;
+pub mod stall;
+pub mod subagent;
 pub mod tools;
 
 pub use agent::{AgentRunConfig, AgentRunResult, run_agent};
@@ -39,8 +42,8 @@ pub use changes::{
     NoopChangeLedger, UndoResult,
 };
 pub use config::{
-    AppConfig, ConfigOverrides, ConfigSource, ResolvedConfig, approval_rules_path, config_paths,
-    load_config, write_config_value,
+    AppConfig, ConfigOverrides, ConfigSource, ResolvedConfig, SkillMode, approval_rules_path,
+    config_paths, load_config, write_config_value,
 };
 pub use credentials::{
     KeyringSecretStore, SecretSource, SecretStore, SecretString, resolve_secret,
@@ -86,5 +89,11 @@ pub use session::{
     AgentLoopState, JsonSessionStore, Message, Session, SessionStatus, SessionStore,
     ToolCallRecord, ToolCallStatus,
 };
+pub use skills::{Skill, discover_skills, find_skill, user_skill_root};
 pub use sqlite_session::{SqliteSessionStore, WorkspaceLock};
-pub use tools::{ToolRegistry, register_builtins};
+pub use stall::{StallDetector, StallSignal, StalledRecoveryMode};
+pub use subagent::{
+    AgentProfile, ProfileMode, SubagentContext, SubagentOutcome, builtin_profiles, find_profile,
+    merge_profiles, run_subagent, task_tool_definition, validate_profile,
+};
+pub use tools::{SkillTool, ToolRegistry, WebReadTool, register_builtins};

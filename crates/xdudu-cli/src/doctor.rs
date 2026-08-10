@@ -82,6 +82,7 @@ pub async fn run_doctor(
     let provider = &resolved.config.provider.name;
     let environment_name = match provider.as_str() {
         "deepseek" => "DEEPSEEK_API_KEY",
+        "openai-compatible" => "OPENAI_API_KEY",
         _ => "ANTHROPIC_API_KEY",
     };
     let environment_secret = env::var_os(environment_name);
@@ -172,6 +173,39 @@ pub async fn run_doctor(
             "遥测保持默认关闭，XDUDU 不发送任何数据。".into()
         },
     });
+
+    {
+        let (files, warnings) = xdudu_core::load_instructions(cwd);
+        let summary = if files.is_empty() {
+            "未加载自定义指令。".to_owned()
+        } else {
+            let mut counts: std::collections::BTreeMap<&str, usize> =
+                std::collections::BTreeMap::new();
+            for file in &files {
+                *counts.entry(file.source.as_str()).or_default() += 1;
+            }
+            let parts = counts
+                .iter()
+                .map(|(source, count)| format!("{source}×{count}"))
+                .collect::<Vec<_>>()
+                .join("、");
+            format!("已加载 {} 份自定义指令（{parts}）。", files.len())
+        };
+        let message = if warnings.is_empty() {
+            summary
+        } else {
+            format!("{summary} 警告：{}", warnings.join("；"))
+        };
+        checks.push(DoctorCheck {
+            name: "instructions",
+            status: if warnings.is_empty() {
+                CheckStatus::Pass
+            } else {
+                CheckStatus::Warn
+            },
+            message,
+        });
+    }
 
     let ok = !checks
         .iter()

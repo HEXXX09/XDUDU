@@ -16,7 +16,7 @@ use std::{
     env,
     future::Future,
     io::{self, IsTerminal},
-    path::PathBuf,
+    path::{Path, PathBuf},
     pin::Pin,
     process::ExitCode,
     sync::Arc,
@@ -30,19 +30,20 @@ use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use xdudu_core::{
-    AgentLoopState, AgentRunConfig, AgentRunResult, AllowAllApprovalGate, ApprovalDecision,
-    ApprovalGate, ApprovalMode, ApprovalRequest, ApprovalRule, ApprovalScope, ConfigOverrides,
-    DefaultProviderFactory, DenyAllApprovalGate, EventSink, JsonApprovalRuleStore,
+    AgentLoopState, AgentProfile, AgentRunConfig, AgentRunResult, AllowAllApprovalGate,
+    ApprovalDecision, ApprovalGate, ApprovalMode, ApprovalRequest, ApprovalRule, ApprovalScope,
+    ConfigOverrides, DefaultProviderFactory, DenyAllApprovalGate, EventSink, JsonApprovalRuleStore,
     JsonChangeLedger, KeyringSecretStore, McpConfigFile, McpServerConfig, McpServerRuntime,
-    McpTransportKind, MemoryStore, MemorySuggestionConfig, PermissionMode, Plan,
+    McpTransportKind, MemoryRecord, MemoryStore, MemorySuggestionConfig, PermissionMode, Plan,
     PlanExecutorConfig, PlanGenerationConfig, PlanRevisionConfig, PlanStatus, PlanStore,
-    PluginManifest, Provider, ProviderFactory, ResolvedConfig, SecretSource, SecretStore,
-    SecretString, Session, SessionStatus, SessionStore, SideEffectKind, SqliteSessionStore,
-    ToolRegistry, WorkspaceLock, XduduError, approval_rules_path, approve_plan, config_paths,
-    generate_plan, load_config, load_mcp_config, load_plugin_manifests, mcp_config_path,
-    plugin_directory, redact_text, register_builtins, register_configured_mcp_tools, reject_plan,
-    resolve_secret, revise_plan, run_agent, run_plan, save_mcp_config, save_plugin_manifest,
-    submit_plan_for_review, write_config_value,
+    PluginManifest, ProfileMode, Provider, ProviderFactory, ResolvedConfig, SecretSource,
+    SecretStore, SecretString, Session, SessionStatus, SessionStore, SideEffectKind, Skill,
+    SkillMode, SkillTool, SqliteSessionStore, StalledRecoveryMode, ToolRegistry, WebReadTool,
+    WorkspaceLock, XduduError, approval_rules_path, approve_plan, config_paths, discover_skills,
+    generate_plan, load_config, load_instructions, load_mcp_config, load_plugin_manifests,
+    mcp_config_path, merge_profiles, plugin_directory, redact_text, register_builtins,
+    register_configured_mcp_tools, reject_plan, resolve_secret, revise_plan, run_agent, run_plan,
+    save_mcp_config, save_plugin_manifest, submit_plan_for_review, write_config_value,
 };
 
 use crate::approval_prompt::{ApprovalMenuChoice, format_approval_prompt, read_approval_menu};
@@ -58,6 +59,69 @@ use crate::ui::TerminalTheme;
 
 /// TUI 运行任务的 Future 类型：通过克隆捕获运行所需片段，不借用 Runtime。
 type RunFuture = Pin<Box<dyn Future<Output = Result<AgentRunResult, XduduError>> + Send>>;
+
+/// 生成自定义指令加载摘要（来源、数量与警告），供 `/instructions` 与 TUI 展示。
+fn instruction_summary(cwd: &Path) -> String {
+    let (files, warnings) = load_instructions(cwd);
+    if files.is_empty() && warnings.is_empty() {
+        return "未加载自定义指令。可通过 ~/.config/xdudu/instructions/、.xdudu/instructions/ 或仓库 AGENTS.md / CLAUDE.md 添加。".into();
+    }
+    let mut lines = Vec::new();
+    if files.is_empty() {
+        lines.push("未加载自定义指令。".to_owned());
+    } else {
+        for file in &files {
+            lines.push(format!(
+                "{} · {}（{} 字符）",
+                file.source.as_str(),
+                file.file_name,
+                file.content.chars().count()
+            ));
+        }
+    }
+    for warning in &warnings {
+        lines.push(format!("警告：{warning}"));
+    }
+    lines.join("\n")
+}
+
+/// 生成技能摘要：可用技能索引、加载策略与来源。
+fn skills_summary(runtime: &Runtime) -> String {
+    if runtime.skills_mode == SkillMode::Deny {
+        return "技能加载已被 agent.skills=deny 禁用。".into();
+    }
+    let mode = format!("加载策略：{}", runtime.skills_mode.as_str());
+    if runtime.skills.is_empty() {
+        return format!(
+            "{mode}\n未发现技能。可将 SKILL.md 放入 .xdudu/skills/、.claude/skills/ 或 ~/.config/xdudu/skills/ 等目录。"
+        );
+    }
+    let mut lines = vec![mode];
+    for skill in &runtime.skills {
+        lines.push(format!(
+            "- {}：{}（{}）",
+            skill.name, skill.description, skill.source_label
+        ));
+    }
+    lines.join("\n")
+}
+
+/// 生成 Agent 档案摘要：id、模式与定位（`task` 工具可委派的子代理）。
+fn agent_summary(runtime: &Runtime) -> String {
+    let mut lines = Vec::new();
+    for profile in &runtime.profiles {
+        let mode = match profile.mode {
+            ProfileMode::Primary => "primary",
+            ProfileMode::Subagent => "subagent",
+            ProfileMode::All => "all",
+        };
+        lines.push(format!(
+            "- {}（{mode}）：{}",
+            profile.id, profile.description
+        ));
+    }
+    lines.join("\n")
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "xdudu", version, about = "终端原生 AI 编程助手")]
@@ -115,6 +179,26 @@ struct Cli {
     /// 输出不含模型思维链、且经过脱敏的结构化运行时调试轨迹。
     #[arg(long, global = true)]
     debug_trace: bool,
+
+    /// 模型请求采样温度（覆盖配置）。
+    #[arg(long, global = true)]
+    temperature: Option<f32>,
+
+    /// 单次模型请求最大输出 Token（覆盖配置）。
+    #[arg(long, global = true)]
+    max_output_tokens: Option<u32>,
+
+    /// 启用内部思考闭环（覆盖配置）。
+    #[arg(long, global = true)]
+    reasoning: bool,
+
+    /// 停滞后的恢复策略：auto、ask 或 off（覆盖配置）。
+    #[arg(long, global = true)]
+    stalled_recovery: Option<String>,
+
+    /// 停滞恢复模式下允许的最大恢复尝试次数（覆盖配置）。
+    #[arg(long, global = true)]
+    stalled_max_recovery: Option<u32>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -348,6 +432,8 @@ struct Runtime {
     shared_permission: Arc<std::sync::Mutex<PermissionMode>>,
     /// /plan 生成期间锁定只读时保存的原权限模式，执行/取消时恢复。
     plan_restore_mode: Option<PermissionMode>,
+    /// 任务完成后是否弹出记忆建议（默认关闭）。
+    memory_suggest_enabled: bool,
     registry: ToolRegistry,
     store: Arc<SqliteSessionStore>,
     renderer: ConsoleRenderer,
@@ -357,6 +443,27 @@ struct Runtime {
     startup_notices: Vec<String>,
     /// TUI 会话共享输入路由；非 TUI 模式保持未激活。
     input_router: Arc<InputRouter>,
+    /// 模型请求采样温度。
+    temperature: f32,
+    /// 单次模型请求最大输出 Token。
+    max_output_tokens: u32,
+    /// 是否启用内部思考闭环。
+    reasoning: bool,
+    /// 停滞后的恢复策略。
+    stalled_recovery: StalledRecoveryMode,
+    /// 停滞恢复模式下允许的最大恢复尝试次数。
+    stalled_max_recovery: u32,
+    /// 可用技能索引（来自目录发现）。
+    skills: Vec<Skill>,
+    /// 技能加载策略（allow | ask | deny）。
+    skills_mode: SkillMode,
+    /// 记忆注入的最大条数与 Token 预算。
+    memory_top_k: usize,
+    memory_injection_budget: usize,
+    /// 强制压缩标志：`/compact` 置位，运行中的 Agent 在下一轮请求前压缩。
+    force_compact: Arc<std::sync::atomic::AtomicBool>,
+    /// Agent 档案（内置 + 自定义），供 `task` 委派子代理。
+    profiles: Vec<AgentProfile>,
 }
 
 fn overrides(cli: &Cli) -> ConfigOverrides {
@@ -372,6 +479,12 @@ fn overrides(cli: &Cli) -> ConfigOverrides {
         color: cli.no_color.then_some(false),
         debug_trace: cli.debug_trace.then_some(true),
         telemetry_enabled: None,
+        memory_suggest_enabled: None,
+        temperature: cli.temperature,
+        max_output_tokens: cli.max_output_tokens,
+        reasoning: cli.reasoning.then_some(true),
+        stalled_recovery: cli.stalled_recovery.clone(),
+        stalled_max_recovery: cli.stalled_max_recovery,
     }
 }
 
@@ -501,7 +614,7 @@ async fn create_runtime(
     change_ledger.recover_incomplete().await?;
     let store = KeyringSecretStore;
     let (secret, _) = resolve_secret(&resolved.config.provider.name, &store).await?;
-    let provider = DefaultProviderFactory.create(&resolved.config.provider, secret)?;
+    let provider = Arc::from(DefaultProviderFactory.create(&resolved.config.provider, secret)?);
     let approval_mode = resolved.config.agent.approval_mode()?;
     let color = resolved.config.output.color && io::stdout().is_terminal();
     let theme = TerminalTheme::new(color);
@@ -523,10 +636,30 @@ async fn create_runtime(
         )),
     };
     let mut registry = ToolRegistry::with_runtime(approval_gate, change_ledger);
+    registry.set_command_rules(resolved.config.agent.commands.clone());
+    let skills_mode = resolved.config.agent.skills_mode()?;
+    let (skills, skill_warnings) = discover_skills(&cwd);
+    if skills_mode != SkillMode::Deny {
+        registry.register(SkillTool::new(skills.clone(), skills_mode))?;
+    }
     register_builtins(&mut registry)?;
+    // web_read 提炼复用当前 Provider（独立请求、不进会话历史）。
+    registry.register(WebReadTool::new(
+        Some(Arc::clone(&provider)),
+        resolved.config.provider.model.clone(),
+        resolved.config.provider.temperature,
+        resolved.config.provider.max_output_tokens,
+        resolved.config.provider.reasoning,
+    ))?;
     let mcp = register_configured_mcp_tools(&mut registry).await?;
+    // 合并内置与自定义 Agent 档案（自定义不与内置同名）。
+    let (profiles, profile_conflicts) = merge_profiles(resolved.config.agent.profiles.clone());
+    let profile_warnings = profile_conflicts
+        .into_iter()
+        .map(|id| format!("自定义档案 {id} 与内置档案重名，已忽略。"))
+        .collect::<Vec<_>>();
     Ok(Runtime {
-        provider: Arc::from(provider),
+        provider,
         provider_display: provider_label(&resolved.config.provider.name),
         model: resolved.config.provider.model.clone(),
         max_turns: resolved.config.agent.max_turns,
@@ -536,6 +669,7 @@ async fn create_runtime(
             resolved.config.agent.permission_mode()?,
         )),
         plan_restore_mode: None,
+        memory_suggest_enabled: resolved.config.memory.suggest_enabled,
         registry,
         store: Arc::new(SqliteSessionStore::new(&cwd)?),
         renderer: ConsoleRenderer::new(
@@ -547,8 +681,24 @@ async fn create_runtime(
         stream: !resolved.config.output.no_stream,
         color,
         debug_trace: resolved.config.output.debug_trace,
-        startup_notices: mcp.failures,
+        startup_notices: mcp
+            .failures
+            .into_iter()
+            .chain(skill_warnings)
+            .chain(profile_warnings)
+            .collect(),
         input_router,
+        temperature: resolved.config.provider.temperature,
+        max_output_tokens: resolved.config.provider.max_output_tokens,
+        reasoning: resolved.config.provider.reasoning,
+        stalled_recovery: resolved.config.agent.stalled_recovery_mode()?,
+        stalled_max_recovery: resolved.config.agent.stalled_max_recovery,
+        skills,
+        skills_mode,
+        memory_top_k: resolved.config.memory.top_k,
+        memory_injection_budget: resolved.config.memory.injection_token_budget,
+        force_compact: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        profiles,
     })
 }
 
@@ -598,7 +748,7 @@ async fn execute_prompt_with_cancellation(
     event_sink: &dyn EventSink,
     cancellation: CancellationToken,
 ) -> Result<AgentRunResult, XduduError> {
-    let memories = relevant_memories(runtime, &prompt).await;
+    let memories = relevant_memories(runtime, &prompt, session_id).await;
     run_agent(AgentRunConfig {
         prompt,
         model: runtime.model.clone(),
@@ -613,17 +763,120 @@ async fn execute_prompt_with_cancellation(
         event_sink: Some(event_sink),
         stream: runtime.stream,
         memories,
+        temperature: runtime.temperature,
+        max_output_tokens: runtime.max_output_tokens,
+        reasoning: runtime.reasoning,
+        stalled_recovery: runtime.stalled_recovery,
+        stalled_max_recovery: runtime.stalled_max_recovery,
+        skills: runtime.skills.clone(),
+        force_compact: Arc::clone(&runtime.force_compact),
+        profiles: runtime.profiles.clone(),
     })
     .await
 }
 
-/// 用当前提示词检索相关记忆（最多 3 条）；检索失败时静默返回空，
-/// 不影响任务执行。
-async fn relevant_memories(runtime: &Runtime, query: &str) -> Vec<String> {
-    match runtime.store.search_memories(query, 3).await {
-        Ok(memories) => memories.into_iter().map(|memory| memory.content).collect(),
-        Err(_) => Vec::new(),
+/// 用当前提示词检索相关记忆：FTS5 召回 → 查询词命中精排 → 归一化去重 →
+/// Token 预算裁减 → 上限截断。检索失败时静默返回空，不影响任务执行。
+async fn relevant_memories(
+    runtime: &Runtime,
+    query: &str,
+    session_id: Option<Uuid>,
+) -> Vec<String> {
+    // 查询词拼接最近助手文本，提高召回质量。
+    let mut combined = query.to_owned();
+    if let Some(id) = session_id
+        && let Ok(Some(session)) = runtime.store.get(id).await
+        && let Some(recent) = session.messages.iter().rev().find(|message| {
+            message.role == xdudu_core::provider::MessageRole::Assistant
+                && !message.content.trim().is_empty()
+        })
+    {
+        combined.push('\n');
+        combined.push_str(recent.content.trim());
     }
+    let Ok(memories) = runtime
+        .store
+        .search_memories(&combined, MEMORY_FTS_RECALL)
+        .await
+    else {
+        return Vec::new();
+    };
+    let tokens = query_tokens(&combined);
+    let mut seen = std::collections::HashSet::new();
+    let mut selected = Vec::new();
+    let mut budget = runtime.memory_injection_budget;
+    for memory in rank_memories(memories, &tokens) {
+        let normalized = memory
+            .content
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !seen.insert(normalized) {
+            continue;
+        }
+        let cost = estimated_tokens(&memory.content);
+        if cost > budget {
+            continue;
+        }
+        let source = memory
+            .source_session_id
+            .map(|id| {
+                format!(
+                    "（来源会话 {}）",
+                    id.to_string().chars().take(8).collect::<String>()
+                )
+            })
+            .unwrap_or_default();
+        selected.push(format!("- {source}{}", memory.content.trim()));
+        budget -= cost;
+        if selected.len() >= runtime.memory_top_k {
+            break;
+        }
+    }
+    selected
+}
+
+/// FTS5 召回上限（远大于注入上限，供精排裁减）。
+const MEMORY_FTS_RECALL: usize = 16;
+
+/// 把查询拆成词元（空白分隔、长度 ≥ 2），用于命中计数精排。
+fn query_tokens(query: &str) -> Vec<String> {
+    query
+        .split(|character: char| !character.is_alphanumeric() && character != '_')
+        .filter(|token| token.chars().count() >= 2)
+        .map(str::to_owned)
+        .collect()
+}
+
+/// 相关性精排：命中查询词越多的记忆越靠前；并列时新记忆优先。
+fn rank_memories(memories: Vec<MemoryRecord>, tokens: &[String]) -> Vec<MemoryRecord> {
+    let mut scored = memories
+        .into_iter()
+        .map(|memory| {
+            let hits = tokens
+                .iter()
+                .filter(|token| memory.content.contains(token.as_str()))
+                .count();
+            (memory, hits)
+        })
+        .collect::<Vec<_>>();
+    scored.sort_by(|left, right| {
+        right
+            .1
+            .cmp(&left.1)
+            .then(right.0.updated_at.cmp(&left.0.updated_at))
+    });
+    scored.into_iter().map(|(memory, _)| memory).collect()
+}
+
+/// 字符加权 Token 估算：`ceil((ascii 字节 + 2×CJK 字符) / 3.5) + 8`。
+fn estimated_tokens(text: &str) -> usize {
+    let ascii_bytes = text.bytes().filter(|byte| byte.is_ascii()).count();
+    let cjk_chars = text
+        .chars()
+        .filter(|character| ('\u{4e00}'..='\u{9fff}').contains(character))
+        .count();
+    (((ascii_bytes + 2 * cjk_chars) as f64) / 3.5).ceil() as usize + 8
 }
 
 fn print_banner(runtime: &Runtime, interactive: bool) {
@@ -669,13 +922,18 @@ async fn tui_interactive_loop(
         .into_iter()
         .map(|definition| definition.name.to_owned())
         .collect();
+    let skills = runtime
+        .skills
+        .iter()
+        .map(|skill| skill.name.clone())
+        .collect();
     let context = TuiContext {
         provider: runtime.provider_display.clone(),
         model: runtime.model.clone(),
         cwd: runtime.cwd.clone(),
         permission: runtime.permission_mode.as_str().to_owned(),
         available_tools,
-        skills: Vec::new(),
+        skills,
         color: runtime.color,
         debug_trace: runtime.debug_trace,
     };
@@ -1066,7 +1324,15 @@ async fn start_tui_run(
     let stream = runtime.stream;
     let run_renderer = renderer.clone();
     let task_cancel = cancellation.clone();
-    let memories = relevant_memories(runtime, &prompt).await;
+    let temperature = runtime.temperature;
+    let max_output_tokens = runtime.max_output_tokens;
+    let reasoning = runtime.reasoning;
+    let stalled_recovery = runtime.stalled_recovery;
+    let stalled_max_recovery = runtime.stalled_max_recovery;
+    let skills = runtime.skills.clone();
+    let force_compact = Arc::clone(&runtime.force_compact);
+    let profiles = runtime.profiles.clone();
+    let memories = relevant_memories(runtime, &prompt, session_id).await;
     let future: RunFuture = Box::pin(async move {
         run_agent(AgentRunConfig {
             prompt,
@@ -1082,6 +1348,14 @@ async fn start_tui_run(
             event_sink: Some(&run_renderer),
             stream,
             memories,
+            temperature,
+            max_output_tokens,
+            reasoning,
+            stalled_recovery,
+            stalled_max_recovery,
+            skills,
+            force_compact,
+            profiles,
         })
         .await
     });
@@ -1194,6 +1468,10 @@ async fn suggest_memories_in_tui(
     runtime: &mut Runtime,
     session_id: Uuid,
 ) -> Result<(), XduduError> {
+    // 记忆建议默认挂起；恢复：xdudu config set memory.suggest_enabled true --user
+    if !runtime.memory_suggest_enabled {
+        return Ok(());
+    }
     let Some(session) = runtime.store.get(session_id).await? else {
         return Ok(());
     };
@@ -1341,6 +1619,25 @@ async fn handle_tui_command(
                     .join("\n")
             };
             app.notice(format!("插件：\n{summary}\n管理命令：xdudu plugin --help"))
+                .map_err(XduduError::from)?;
+        }
+        "/instructions" => {
+            app.notice(instruction_summary(&runtime.cwd))
+                .map_err(XduduError::from)?;
+        }
+        "/skills" => {
+            app.notice(skills_summary(runtime))
+                .map_err(XduduError::from)?;
+        }
+        "/agent" => {
+            app.notice(agent_summary(runtime))
+                .map_err(XduduError::from)?;
+        }
+        "/compact" => {
+            runtime
+                .force_compact
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            app.notice("已请求在下一轮请求前触发一次上下文压缩（LLM 不可用时回退确定性截断）。")
                 .map_err(XduduError::from)?;
         }
         "/resume" => {
@@ -2265,7 +2562,12 @@ async fn plain_interactive_loop(
                 continue;
             }
             "/compact" => {
-                println!("  XDUDU 会在上下文接近上限时自动压缩；手动压缩协议尚未开放。");
+                runtime
+                    .force_compact
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                println!(
+                    "  已请求在下一轮请求前触发一次上下文压缩（LLM 不可用时回退确定性截断）。"
+                );
                 continue;
             }
             "/mcp" => {
@@ -2305,6 +2607,24 @@ async fn plain_interactive_loop(
                             plugin.mcp_servers.len()
                         );
                     }
+                }
+                continue;
+            }
+            "/instructions" => {
+                for line in instruction_summary(&runtime.cwd).lines() {
+                    println!("  {line}");
+                }
+                continue;
+            }
+            "/skills" => {
+                for line in skills_summary(&runtime).lines() {
+                    println!("  {line}");
+                }
+                continue;
+            }
+            "/agent" => {
+                for line in agent_summary(&runtime).lines() {
+                    println!("  {line}");
                 }
                 continue;
             }
@@ -2736,7 +3056,10 @@ fn auth_provider(
     resolved: &ResolvedConfig,
 ) -> Result<String, XduduError> {
     let provider = explicit.unwrap_or_else(|| resolved.config.provider.name.clone());
-    if !matches!(provider.as_str(), "anthropic" | "deepseek") {
+    if !matches!(
+        provider.as_str(),
+        "anthropic" | "deepseek" | "openai-compatible"
+    ) {
         return Err(XduduError::validation(format!(
             "不支持的 Provider：{provider}"
         )));
@@ -3181,7 +3504,10 @@ async fn handle_session(command: SessionCommand, cwd: &std::path::Path) -> Resul
                 .get(id)
                 .await?
                 .ok_or_else(|| XduduError::validation(format!("找不到会话：{id}")))?;
-            println!("{}", serde_json::to_string_pretty(&session)?);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&session.public_snapshot())?
+            );
         }
         SessionCommand::Resume { .. } => {
             return Err(XduduError::validation(

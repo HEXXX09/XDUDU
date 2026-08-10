@@ -46,7 +46,7 @@ struct LineState {
     command_selection: usize,
 }
 
-const COMMANDS: [(&str, &str, bool); 18] = [
+const COMMANDS: [(&str, &str, bool); 21] = [
     ("/help", "显示帮助", false),
     ("/new", "开始新会话", false),
     ("/clear", "开始新会话", false),
@@ -54,6 +54,9 @@ const COMMANDS: [(&str, &str, bool); 18] = [
     ("/model", "选择当前模型", true),
     ("/mcp", "查看 MCP Server 与外部工具", false),
     ("/plugins", "查看声明式插件", false),
+    ("/instructions", "查看自定义指令加载情况", false),
+    ("/skills", "查看可用技能与加载策略", false),
+    ("/agent", "查看 Agent 档案与子代理", false),
     ("/plan", "生成或管理计划", true),
     ("/turns", "设置最大循环次数", true),
     ("/approval", "管理审批规则", true),

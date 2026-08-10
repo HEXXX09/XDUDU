@@ -3,29 +3,42 @@
 use std::{
     collections::BTreeSet,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use async_trait::async_trait;
-use chrono::Utc;
-use serde_json::Value;
+use chrono::{DateTime, Utc};
+use futures_util::future::join_all;
+use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
     error::{ErrorKind, XduduError, XduduResult},
     events::{AgentEvent, EventSink, emit},
+    instructions::{load_instructions, render_instructions},
     permission::PermissionMode,
     prompt::build_system_prompt,
     provider::{
         ContentBlock, FinishReason, MessageContent, MessageRole, Provider, ProviderMessage,
-        ProviderRequest, ProviderStreamEvent, ProviderStreamSink,
+        ProviderRequest, ProviderStreamEvent, ProviderStreamSink, ProviderToolDefinition, ToolCall,
     },
     session::{
         AgentLoopState, Message, Session, SessionStatus, SessionStore, ToolCallRecord,
         ToolCallStatus,
     },
-    tools::{ToolRegistry, ToolResult},
+    skills::{Skill, find_skill},
+    stall::{
+        NO_PROGRESS_WINDOW, SHORT_OUTPUT_CHARS, STALL_WINDOW, StallDetector, StallSignal,
+        StalledRecoveryMode,
+    },
+    subagent::{
+        AgentProfile, SubagentContext, SubagentOutcome, run_subagent, task_tool_definition,
+    },
+    tools::{ToolProgressUpdate, ToolRegistry, ToolResult},
 };
 
 const DEFAULT_CONTEXT_INPUT_BUDGET: usize = 24_000;
@@ -47,6 +60,22 @@ pub struct AgentRunConfig<'a> {
     pub stream: bool,
     /// 相关记忆片段（来自本地全文检索），注入系统提示词作为背景信息。
     pub memories: Vec<String>,
+    /// 模型请求采样温度。
+    pub temperature: f32,
+    /// 单次模型请求最大输出 Token。
+    pub max_output_tokens: u32,
+    /// 是否启用内部思考闭环。
+    pub reasoning: bool,
+    /// 停滞后的恢复策略。
+    pub stalled_recovery: StalledRecoveryMode,
+    /// 停滞恢复模式下允许的最大恢复尝试次数。
+    pub stalled_max_recovery: u32,
+    /// 可用技能索引（`skill` 工具加载后正文注入当前轮系统提示词）。
+    pub skills: Vec<Skill>,
+    /// 强制压缩标志：CLI `/compact` 置位后，下一轮请求前触发一次上下文压缩。
+    pub force_compact: Arc<AtomicBool>,
+    /// 可用 Agent 档案（内置 + 自定义；`task` 工具据此委派子代理）。
+    pub profiles: Vec<AgentProfile>,
 }
 
 struct AgentProviderSink<'a> {
@@ -59,6 +88,9 @@ impl ProviderStreamSink for AgentProviderSink<'_> {
         match event {
             ProviderStreamEvent::TextDelta { text } => {
                 emit(self.sink, AgentEvent::AssistantDelta { text }).await;
+            }
+            ProviderStreamEvent::ReasoningDelta { .. } => {
+                // 内部思考链不允许进入公开输出。
             }
         }
     }
@@ -130,9 +162,14 @@ fn provider_messages(session: &Session) -> Vec<ProviderMessage> {
                     return None;
                 }
                 let content = if message.role == MessageRole::Assistant
-                    && !message.tool_calls.is_empty()
+                    && (!message.tool_calls.is_empty() || message.reasoning.is_some())
                 {
                     let mut blocks = Vec::new();
+                    if let Some(reasoning) = &message.reasoning {
+                        blocks.push(ContentBlock::Thinking {
+                            text: reasoning.clone(),
+                        });
+                    }
                     if !message.content.is_empty() {
                         blocks.push(ContentBlock::Text {
                             text: message.content.clone(),
@@ -165,8 +202,14 @@ fn provider_messages(session: &Session) -> Vec<ProviderMessage> {
 }
 
 fn estimated_tokens(text: &str) -> usize {
-    // 对中英文混合代码采用偏保守估算，避免没有 Provider tokenizer 时低估。
-    text.chars().count().div_ceil(2).saturating_add(8)
+    // 字符加权估算：ASCII 字节按 1 计、CJK 字符按 2 计，除以 3.5 再向上取整，
+    // 对中英文混合内容比“字符数/2”更接近真实 tokenizer。
+    let ascii_bytes = text.bytes().filter(|byte| byte.is_ascii()).count();
+    let cjk_chars = text
+        .chars()
+        .filter(|character| ('\u{4e00}'..='\u{9fff}').contains(character))
+        .count();
+    (((ascii_bytes + 2 * cjk_chars) as f64) / 3.5).ceil() as usize + 8
 }
 
 fn message_tokens(message: &Message) -> usize {
@@ -218,7 +261,87 @@ fn summarize_messages(session: &Session, end: usize) -> String {
     truncated(&lines.join("\n"), SUMMARY_CHARACTER_LIMIT)
 }
 
-fn compact_context(session: &mut Session, system: &str, tools_json: &str) -> bool {
+/// 上下文压缩结果分类。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompactOutcome {
+    None,
+    Deterministic,
+    Llm,
+    LlmFallback,
+}
+
+/// 分级压缩所需参数。
+struct CompactContext<'a> {
+    session: &'a mut Session,
+    system: &'a str,
+    tools_json: &'a str,
+    provider: Option<&'a dyn Provider>,
+    model: &'a str,
+    temperature: f32,
+    max_output_tokens: u32,
+    reasoning: bool,
+    cancellation: CancellationToken,
+    force: bool,
+}
+
+/// 分级上下文压缩：低于 3× 预算或 LLM 不可用时走确定性截断；
+/// 达到 3× 预算时尝试 LLM 结构化压缩，任何失败静默回退确定性截断。
+async fn compact_context(ctx: CompactContext<'_>) -> CompactOutcome {
+    let CompactContext {
+        session,
+        system,
+        tools_json,
+        provider,
+        model,
+        temperature,
+        max_output_tokens,
+        reasoning,
+        cancellation,
+        force,
+    } = ctx;
+    let fixed_tokens = estimated_tokens(system)
+        .saturating_add(estimated_tokens(tools_json))
+        .saturating_add(1_500);
+    let current_tokens = provider_messages(session)
+        .iter()
+        .map(|message| estimated_tokens(&serde_json::to_string(message).unwrap_or_default()))
+        .sum::<usize>()
+        .saturating_add(fixed_tokens);
+    if !force && current_tokens <= DEFAULT_CONTEXT_INPUT_BUDGET {
+        return CompactOutcome::None;
+    }
+    // 达到 3× 预算且 LLM 可用时才尝试 LLM 压缩；无 Provider 时按确定性处理。
+    let excessive =
+        force || (provider.is_some() && current_tokens >= 3 * DEFAULT_CONTEXT_INPUT_BUDGET);
+    if excessive
+        && let Some(provider) = provider
+        && llm_compact_context(
+            session,
+            provider,
+            model,
+            temperature,
+            max_output_tokens,
+            reasoning,
+            cancellation,
+        )
+        .await
+        .unwrap_or(false)
+    {
+        return CompactOutcome::Llm;
+    }
+    if compact_context_deterministic(session, system, tools_json) {
+        if excessive {
+            CompactOutcome::LlmFallback
+        } else {
+            CompactOutcome::Deterministic
+        }
+    } else {
+        CompactOutcome::None
+    }
+}
+
+/// 确定性截断：把较早消息压缩为 `context_summary`（零成本、无失败路径）。
+fn compact_context_deterministic(session: &mut Session, system: &str, tools_json: &str) -> bool {
     let fixed_tokens = estimated_tokens(system)
         .saturating_add(estimated_tokens(tools_json))
         .saturating_add(1_500);
@@ -264,6 +387,147 @@ fn compact_context(session: &mut Session, system: &str, tools_json: &str) -> boo
     true
 }
 
+/// LLM 压缩输入的大小上限。
+const LLM_COMPACT_INPUT_LIMIT: usize = 64 * 1024;
+/// 压缩协议工具名。
+const SUBMIT_CONTEXT_SUMMARY_TOOL: &str = "submit_context_summary";
+
+fn submit_context_summary_definition() -> ProviderToolDefinition {
+    ProviderToolDefinition {
+        name: SUBMIT_CONTEXT_SUMMARY_TOOL.into(),
+        description:
+            "提交会话压缩摘要：summary 为总述，key_facts 为关键事实，open_items 为尚未完成事项。"
+                .into(),
+        input_schema: json!({
+            "type":"object",
+            "required":["summary","key_facts","open_items"],
+            "additionalProperties":false,
+            "properties":{
+                "summary":{"type":"string","minLength":1,"maxLength":8192},
+                "key_facts":{"type":"array","items":{"type":"string","minLength":1,"maxLength":512},"minItems":1,"maxItems":32},
+                "open_items":{"type":"array","items":{"type":"string","minLength":1,"maxLength":512},"minItems":1,"maxItems":32}
+            }
+        }),
+    }
+}
+
+/// 压缩协议 DTO：字段严格、未知字段拒绝。
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ContextSummaryDto {
+    summary: String,
+    #[serde(default)]
+    key_facts: Vec<String>,
+    #[serde(default)]
+    open_items: Vec<String>,
+}
+
+/// 结构化 LLM 压缩：对最近未压缩的完整消息发起独立请求，成功写入
+/// `context_summary` 并推进压缩点；协议不符或请求失败返回 `false`，
+/// 由调用方回退到确定性截断（绝不中断 Agent）。
+async fn llm_compact_context(
+    session: &mut Session,
+    provider: &dyn Provider,
+    model: &str,
+    temperature: f32,
+    max_output_tokens: u32,
+    reasoning: bool,
+    cancellation: CancellationToken,
+) -> XduduResult<bool> {
+    // 构建压缩输入：旧摘要 + 最近未压缩的完整消息，容量 ≤ 64 KiB。
+    let mut input = String::new();
+    if !session.context_summary.trim().is_empty() {
+        input.push_str("此前压缩摘要：\n");
+        input.push_str(session.context_summary.trim());
+        input.push_str("\n\n");
+    }
+    let mut included = 0usize;
+    for message in &session.messages[session.summarized_message_count.min(session.messages.len())..]
+    {
+        let role = match message.role {
+            MessageRole::System => "系统",
+            MessageRole::User => "用户",
+            MessageRole::Assistant => "助手",
+            MessageRole::Tool => "工具结果",
+        };
+        let rendered = if message.content.trim().is_empty() {
+            format!("[{role}]")
+        } else {
+            format!("[{role}] {}", message.content.trim())
+        };
+        if input.len().saturating_add(rendered.len()).saturating_add(1) > LLM_COMPACT_INPUT_LIMIT {
+            break;
+        }
+        input.push_str(&rendered);
+        input.push('\n');
+        included += 1;
+    }
+    if input.trim().is_empty() || included == 0 {
+        return Ok(false);
+    }
+    let request = ProviderRequest {
+        session_id: session.id.to_string(),
+        model: model.to_owned(),
+        messages: vec![ProviderMessage::text(MessageRole::User, input)],
+        tools: vec![submit_context_summary_definition()],
+        system: COMPACT_SYSTEM_PROMPT.to_owned(),
+        temperature,
+        max_output_tokens,
+        // 压缩请求隐藏思考：不请求、不回传推理内容。
+        reasoning,
+        cancellation,
+    };
+    let response = provider.chat(request).await?;
+    if response.finish_reason != FinishReason::ToolCalls {
+        return Ok(false);
+    }
+    let Some(call) = response
+        .tool_calls
+        .iter()
+        .find(|call| call.name == SUBMIT_CONTEXT_SUMMARY_TOOL)
+    else {
+        return Ok(false);
+    };
+    let dto: ContextSummaryDto = match serde_json::from_value(call.input.clone()) {
+        Ok(dto) => dto,
+        Err(_) => return Ok(false),
+    };
+    let summary = dto.summary.trim();
+    if summary.is_empty()
+        || summary.chars().count() > 8192
+        || dto.key_facts.len() > 32
+        || dto.open_items.len() > 32
+        || dto
+            .key_facts
+            .iter()
+            .chain(&dto.open_items)
+            .any(|item| item.trim().is_empty() || item.chars().count() > 512)
+    {
+        return Ok(false);
+    }
+    let mut rendered = format!("## 会话压缩摘要（LLM）\n{summary}");
+    if !dto.key_facts.is_empty() {
+        rendered.push_str("\n### 关键事实\n");
+        for fact in &dto.key_facts {
+            rendered.push_str(&format!("- {}\n", fact.trim()));
+        }
+    }
+    if !dto.open_items.is_empty() {
+        rendered.push_str("### 待办\n");
+        for item in &dto.open_items {
+            rendered.push_str(&format!("- {}\n", item.trim()));
+        }
+    }
+    session.context_summary = rendered;
+    session.summarized_message_count = session.messages.len();
+    Ok(true)
+}
+
+const COMPACT_SYSTEM_PROMPT: &str = "你是会话摘要器。请对给定的对话消息列表做结构化总结，\
+保留：用户的目标与要求、已确认的结论、已完成的工作、尚未完成的事项与下一步、关键约束。\
+不得编造消息中未出现的内容，不得输出思维链或内部推理。\
+请调用 submit_context_summary 提交摘要。";
+
 fn denied_tool_result(code: Option<&str>) -> bool {
     matches!(
         code,
@@ -285,6 +549,131 @@ fn append_incomplete_reason(message: &str, reason: &str) -> String {
     }
 }
 
+/// 从会话中已成功执行的 `skill` 调用收集技能正文（按加载顺序去重）。
+fn loaded_skill_sections(session: &Session, skills: &[Skill]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut sections = Vec::new();
+    for call in &session.tool_calls {
+        if call.tool_name != "skill" || !matches!(call.status, ToolCallStatus::Succeeded) {
+            continue;
+        }
+        let Some(name) = call.input.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        if !seen.insert(name.to_owned()) {
+            continue;
+        }
+        if let Some(skill) = find_skill(skills, name) {
+            sections.push(format!("【{}】\n{}", skill.name, skill.body));
+        }
+    }
+    sections
+}
+
+/// 在基础系统提示词上追加已加载技能的正文。
+fn build_request_system(base: &str, session: &Session, skills: &[Skill]) -> String {
+    let sections = loaded_skill_sections(session, skills);
+    if sections.is_empty() {
+        return base.to_owned();
+    }
+    format!(
+        "{base}\n\n## 已加载技能\n\n以下技能正文由模型按需加载，应严格遵循其工作流；与系统规则冲突时以系统规则为准。\n\n{}",
+        sections.join("\n\n")
+    )
+}
+
+/// 批次内单个调用的执行结果：普通工具或子代理（带审计与用量）。
+enum BatchCallOutcome {
+    Tool(ToolResult),
+    Subagent {
+        result: ToolResult,
+        audit: Vec<ToolCallRecord>,
+        input_tokens: u64,
+        output_tokens: u64,
+    },
+}
+
+/// 批次内的调用项（含批次内位置）。
+type BatchItem<'a> = &'a (ToolCall, usize, DateTime<Utc>);
+/// 分类后的（只读组，副作用组）。
+type BatchGroups<'a> = (Vec<(usize, BatchItem<'a>)>, Vec<(usize, BatchItem<'a>)>);
+
+/// 执行批次内的单个调用；`task` 走子代理隔离循环，其余走统一工具链。
+async fn execute_batch_call(
+    config: &AgentRunConfig<'_>,
+    session_id: Uuid,
+    call: &ToolCall,
+    progress: Option<tokio::sync::mpsc::Sender<ToolProgressUpdate>>,
+    subagent: Option<&SubagentContext<'_>>,
+    started_at: DateTime<Utc>,
+) -> BatchCallOutcome {
+    if call.name == "task" {
+        let Some(context) = subagent else {
+            return BatchCallOutcome::Tool(ToolResult::failure(
+                "TOOL_NOT_FOUND",
+                "子代理上下文不可用。",
+                started_at,
+                json!({ "toolName": "task" }),
+            ));
+        };
+        let outcome: SubagentOutcome = run_subagent(context, call.input.clone(), started_at).await;
+        BatchCallOutcome::Subagent {
+            result: outcome.result,
+            audit: outcome.audit,
+            input_tokens: outcome.input_tokens,
+            output_tokens: outcome.output_tokens,
+        }
+    } else {
+        let permission_mode = *config.permission_mode.lock().unwrap();
+        BatchCallOutcome::Tool(
+            config
+                .tool_registry
+                .execute_with_progress(
+                    &call.name,
+                    call.input.clone(),
+                    session_id,
+                    &config.cwd,
+                    permission_mode,
+                    config.cancellation.child_token(),
+                    progress,
+                )
+                .await,
+        )
+    }
+}
+
+/// 把共享进度通道中的一条更新转为 `ToolProgress` 事件（按 call_id 分发）。
+async fn emit_progress_event(
+    event_sink: Option<&dyn EventSink>,
+    call_names: &std::collections::HashMap<String, String>,
+    update: ToolProgressUpdate,
+) {
+    emit(
+        event_sink,
+        AgentEvent::ToolProgress {
+            call_id: update.call_id.clone(),
+            name: call_names.get(&update.call_id).cloned().unwrap_or_default(),
+            phase: update.phase,
+            completed: update.completed,
+            total: update.total,
+            unit: update.unit,
+            message: update.message,
+        },
+    )
+    .await;
+}
+
+/// 排空进度通道（非阻塞），用于并行批次结束后统一转发积压进度。
+async fn drain_progress(
+    event_sink: Option<&dyn EventSink>,
+    call_names: &std::collections::HashMap<String, String>,
+    progress_rx: &mut tokio::sync::mpsc::Receiver<ToolProgressUpdate>,
+) {
+    while let Ok(update) = progress_rx.try_recv() {
+        emit_progress_event(event_sink, call_names, update).await;
+    }
+}
+
 /// 执行一次 Agent 任务。输入校验错误直接返回 `Err`；运行期错误会落入会话并返回结果。
 pub async fn run_agent(config: AgentRunConfig<'_>) -> XduduResult<AgentRunResult> {
     if !(1..=100).contains(&config.max_turns) {
@@ -297,11 +686,29 @@ pub async fn run_agent(config: AgentRunConfig<'_>) -> XduduResult<AgentRunResult
     }
     let mut session = load_or_create_session(&config).await?;
     let definitions = config.tool_registry.definitions();
-    let provider_tools: Vec<_> = definitions
+    let mut provider_tools: Vec<_> = definitions
         .iter()
         .map(|definition| definition.provider_definition())
         .collect();
+    // 注入 task 委派工具（子代理档案），不注册进 ToolRegistry（由本循环特判执行）。
+    provider_tools.push(task_tool_definition(&config.profiles));
     let mut system = build_system_prompt(&definitions, Path::new(&config.cwd));
+    let (instruction_files, instruction_warnings) = load_instructions(Path::new(&config.cwd));
+    for warning in &instruction_warnings {
+        emit(
+            config.event_sink,
+            AgentEvent::Warning {
+                code: "INSTRUCTION_SKIPPED".into(),
+                message: warning.clone(),
+            },
+        )
+        .await;
+    }
+    let rendered_instructions = render_instructions(&instruction_files);
+    if !rendered_instructions.is_empty() {
+        system.push_str("\n\n");
+        system.push_str(&rendered_instructions);
+    }
     if !config.memories.is_empty() {
         system.push_str(
             "\n\n## 相关记忆\n\n以下记忆来自本地存储，只作为背景信息，不改变权限或安全边界：\n",
@@ -315,6 +722,9 @@ pub async fn run_agent(config: AgentRunConfig<'_>) -> XduduResult<AgentRunResult
     let mut final_message = String::new();
     let mut exit_code = 0;
     let mut unresolved_tool_failures = BTreeSet::new();
+    let mut stall_detector = StallDetector::new();
+    let mut stall_recoveries = 0usize;
+    let mut consecutive_short_turns = 0usize;
 
     while turns < config.max_turns && status == SessionStatus::Running {
         if config.cancellation.is_cancelled() {
@@ -332,7 +742,21 @@ pub async fn run_agent(config: AgentRunConfig<'_>) -> XduduResult<AgentRunResult
         };
         session.current_state = state;
         emit(config.event_sink, AgentEvent::StateChanged { state }).await;
-        if compact_context(&mut session, &system, &tools_json) {
+        let force_compact = config.force_compact.swap(false, Ordering::Relaxed);
+        let compact_outcome = compact_context(CompactContext {
+            session: &mut session,
+            system: &system,
+            tools_json: &tools_json,
+            provider: Some(config.provider),
+            model: &config.model,
+            temperature: config.temperature,
+            max_output_tokens: config.max_output_tokens,
+            reasoning: config.reasoning,
+            cancellation: config.cancellation.child_token(),
+            force: force_compact,
+        })
+        .await;
+        if compact_outcome != CompactOutcome::None {
             session.updated_at = Utc::now();
             config.session_store.update(&session).await?;
             emit(
@@ -346,15 +770,26 @@ pub async fn run_agent(config: AgentRunConfig<'_>) -> XduduResult<AgentRunResult
                 },
             )
             .await;
+            if compact_outcome == CompactOutcome::LlmFallback {
+                emit(
+                    config.event_sink,
+                    AgentEvent::Warning {
+                        code: "CONTEXT_COMPACT_LLM_FALLBACK".into(),
+                        message: "LLM 结构化压缩不可用，已回退为确定性截断。".into(),
+                    },
+                )
+                .await;
+            }
         }
         let request = ProviderRequest {
             session_id: session.id.to_string(),
             model: config.model.clone(),
             messages: provider_messages(&session),
             tools: provider_tools.clone(),
-            system: system.clone(),
-            temperature: 0.2,
-            max_output_tokens: 4096,
+            system: build_request_system(&system, &session, &config.skills),
+            temperature: config.temperature,
+            max_output_tokens: config.max_output_tokens,
+            reasoning: config.reasoning,
             cancellation: config.cancellation.child_token(),
         };
         emit(
@@ -451,6 +886,7 @@ pub async fn run_agent(config: AgentRunConfig<'_>) -> XduduResult<AgentRunResult
             id: Uuid::new_v4(),
             role: MessageRole::Assistant,
             content: assistant_text.clone(),
+            reasoning: response.reasoning.clone(),
             tool_calls: response.tool_calls.clone(),
             tool_call_id: None,
             sequence: session.messages.len(),
@@ -494,7 +930,7 @@ pub async fn run_agent(config: AgentRunConfig<'_>) -> XduduResult<AgentRunResult
                 } else {
                     status = SessionStatus::Completed;
                     state = AgentLoopState::Completed;
-                    final_message = assistant_text;
+                    final_message = assistant_text.clone();
                 }
             }
             FinishReason::Length => {
@@ -526,12 +962,24 @@ pub async fn run_agent(config: AgentRunConfig<'_>) -> XduduResult<AgentRunResult
                 config.session_store.update(&session).await?;
                 emit(config.event_sink, AgentEvent::StateChanged { state }).await;
                 let mut side_effect_denied_in_batch = false;
-                for call in response.tool_calls {
+                // 批次内共享进度通道：进度事件携带 call_id 分发，渲染层无感知。
+                let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel(64);
+                let call_names: std::collections::HashMap<String, String> = response
+                    .tool_calls
+                    .iter()
+                    .map(|call| (call.id.clone(), call.name.clone()))
+                    .collect();
+                // 1. 预处理：全部调用先写入 Pending 记录并提交（崩溃恢复边界：
+                //    结果未知的调用不会被自动重放）。
+                let mut batch: Vec<(ToolCall, usize, DateTime<Utc>)> = Vec::new();
+                let mut batch_aborted = false;
+                for call in &response.tool_calls {
                     if config.cancellation.is_cancelled() {
                         status = SessionStatus::Interrupted;
                         state = AgentLoopState::Interrupted;
                         final_message = "会话已被用户中断。".into();
                         exit_code = 1;
+                        batch_aborted = true;
                         break;
                     }
                     let started_at = Utc::now();
@@ -550,8 +998,6 @@ pub async fn run_agent(config: AgentRunConfig<'_>) -> XduduResult<AgentRunResult
                     });
                     session.current_state = AgentLoopState::Acting;
                     session.updated_at = Utc::now();
-                    // 工具执行前先提交 pending，崩溃恢复时不会把结果未知的
-                    // 副作用调用误认为尚未开始并自动重放。
                     config.session_store.update(&session).await?;
                     emit(
                         config.event_sink,
@@ -561,118 +1007,232 @@ pub async fn run_agent(config: AgentRunConfig<'_>) -> XduduResult<AgentRunResult
                         },
                     )
                     .await;
-                    let has_side_effect = config
-                        .tool_registry
-                        .get(&call.name)
-                        .is_some_and(|tool| tool.definition().side_effect.requires_approval());
-                    let result = if side_effect_denied_in_batch && has_side_effect {
-                        ToolResult::failure(
-                            "BATCH_SIDE_EFFECT_SKIPPED",
-                            format!(
-                                "同批较早的工具调用已被拒绝，为防止绕过审批，未执行工具“{}”。",
-                                call.name
-                            ),
-                            started_at,
-                            serde_json::json!({
-                                "toolName": call.name,
-                                "reason": "earlier-side-effect-denied",
-                            }),
-                        )
+                    batch.push((call.clone(), record_index, started_at));
+                }
+                if !batch_aborted {
+                    // 2. 分类：无副作用（side_effect == None）并行执行，
+                    //    有副作用工具保持串行，不改变账本单写者与审批顺序。
+                    //    `task` 视为无本地副作用，多个子代理可并行。
+                    // 2. 分类：无副作用（side_effect == None）并行执行，
+                    //    有副作用工具保持串行，不改变账本单写者与审批顺序。
+                    //    `task` 视为无本地副作用，多个子代理可并行。
+                    let (readonly, side_effect): BatchGroups<'_> =
+                        batch.iter().enumerate().partition(|(_, (call, _, _))| {
+                            config.tool_registry.get(&call.name).is_none_or(|tool| {
+                                !tool.definition().side_effect.requires_approval()
+                            })
+                        });
+                    // 子代理上下文：权限在批次启动时快照，隔离消息循环执行。
+                    let subagent_instructions = if rendered_instructions.is_empty() {
+                        Vec::new()
                     } else {
-                        // 每次工具调用前读取最新权限模式（运行中切换即时生效）。
-                        let permission_mode = *config.permission_mode.lock().unwrap();
-                        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel(64);
-                        let execution = config.tool_registry.execute_with_progress(
-                            &call.name,
-                            call.input.clone(),
-                            session.id,
-                            &config.cwd,
-                            permission_mode,
-                            config.cancellation.child_token(),
-                            Some(progress_tx),
-                        );
-                        tokio::pin!(execution);
-                        let mut progress_open = true;
+                        vec![rendered_instructions.clone()]
+                    };
+                    let subagent_ctx = SubagentContext {
+                        provider: config.provider,
+                        model: config.model.clone(),
+                        registry: config.tool_registry,
+                        cwd: &config.cwd,
+                        permission_mode: *config.permission_mode.lock().unwrap(),
+                        cancellation: config.cancellation.clone(),
+                        event_sink: config.event_sink,
+                        session_id: session.id,
+                        temperature: config.temperature,
+                        max_output_tokens: config.max_output_tokens,
+                        reasoning: config.reasoning,
+                        profiles: &config.profiles,
+                        instructions: subagent_instructions,
+                    };
+                    let mut results: Vec<Option<BatchCallOutcome>> =
+                        (0..batch.len()).map(|_| None).collect();
+                    // 3. 并行只读组：join_all 并发；任一失败不影响其他调用。
+                    if !readonly.is_empty() {
+                        let futures = readonly
+                            .iter()
+                            .map(|(_, (call, _, started_at))| {
+                                execute_batch_call(
+                                    &config,
+                                    session.id,
+                                    call,
+                                    Some(progress_tx.clone()),
+                                    Some(&subagent_ctx),
+                                    *started_at,
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        let mut joined = Box::pin(join_all(futures));
+                        let mut parallel_done = false;
                         loop {
                             tokio::select! {
-                                result = &mut execution => break result,
-                                update = progress_rx.recv(), if progress_open => {
-                                    let Some(update) = update else {
-                                        progress_open = false;
-                                        continue;
-                                    };
-                                    emit(
-                                        config.event_sink,
-                                        AgentEvent::ToolProgress {
-                                            call_id: call.id.clone(),
-                                            name: call.name.clone(),
-                                            phase: update.phase,
-                                            completed: update.completed,
-                                            total: update.total,
-                                            unit: update.unit,
-                                            message: update.message,
-                                        },
-                                    )
-                                    .await;
+                                completed = &mut joined, if !parallel_done => {
+                                    for ((batch_pos, _), outcome) in
+                                        readonly.iter().zip(completed)
+                                    {
+                                        results[*batch_pos] = Some(outcome);
+                                    }
+                                    parallel_done = true;
+                                }
+                                update = progress_rx.recv() => {
+                                    if let Some(update) = update {
+                                        emit_progress_event(config.event_sink, &call_names, update).await;
+                                    } else {
+                                        break;
+                                    }
                                 }
                             }
+                            if parallel_done {
+                                drain_progress(config.event_sink, &call_names, &mut progress_rx)
+                                    .await;
+                                break;
+                            }
                         }
-                    };
-                    emit(
-                        config.event_sink,
-                        AgentEvent::ToolFinished {
-                            call_id: call.id.clone(),
-                            name: call.name.clone(),
-                            result: result.clone(),
-                        },
-                    )
-                    .await;
-                    let error_code = result.error.as_ref().map(|error| error.code.as_str());
-                    let record_status = if result.success {
-                        ToolCallStatus::Succeeded
-                    } else if denied_tool_result(error_code) {
-                        ToolCallStatus::Denied
-                    } else {
-                        ToolCallStatus::Failed
-                    };
-                    if result.success {
-                        unresolved_tool_failures.remove(&call.name);
-                    } else {
-                        unresolved_tool_failures.insert(call.name.clone());
                     }
-                    if record_status == ToolCallStatus::Denied {
-                        side_effect_denied_in_batch = true;
+                    // 4. 串行副作用组：沿用 side_effect_denied_in_batch 语义。
+                    for (batch_pos, (call, _, started_at)) in &side_effect {
+                        if config.cancellation.is_cancelled() {
+                            status = SessionStatus::Interrupted;
+                            state = AgentLoopState::Interrupted;
+                            final_message = "会话已被用户中断。".into();
+                            exit_code = 1;
+                            break;
+                        }
+                        let has_side_effect = config
+                            .tool_registry
+                            .get(&call.name)
+                            .is_some_and(|tool| tool.definition().side_effect.requires_approval());
+                        let outcome = if side_effect_denied_in_batch && has_side_effect {
+                            BatchCallOutcome::Tool(ToolResult::failure(
+                                "BATCH_SIDE_EFFECT_SKIPPED",
+                                format!(
+                                    "同批较早的工具调用已被拒绝，为防止绕过审批，未执行工具“{}”。",
+                                    call.name
+                                ),
+                                Utc::now(),
+                                serde_json::json!({
+                                    "toolName": call.name,
+                                    "reason": "earlier-side-effect-denied",
+                                }),
+                            ))
+                        } else {
+                            let execution = execute_batch_call(
+                                &config,
+                                session.id,
+                                call,
+                                Some(progress_tx.clone()),
+                                Some(&subagent_ctx),
+                                *started_at,
+                            );
+                            tokio::pin!(execution);
+                            let mut progress_open = true;
+                            loop {
+                                tokio::select! {
+                                    result = &mut execution => break result,
+                                    update = progress_rx.recv(), if progress_open => {
+                                        let Some(update) = update else {
+                                            progress_open = false;
+                                            continue;
+                                        };
+                                        emit_progress_event(config.event_sink, &call_names, update).await;
+                                    }
+                                }
+                            }
+                        };
+                        if let BatchCallOutcome::Tool(result) = &outcome
+                            && denied_tool_result(
+                                result.error.as_ref().map(|error| error.code.as_str()),
+                            )
+                        {
+                            side_effect_denied_in_batch = true;
+                        }
+                        results[*batch_pos] = Some(outcome);
                     }
-                    let record = &mut session.tool_calls[record_index];
-                    record.output = result.output.clone();
-                    record.error = result.error.as_ref().map(|error| error.message.clone());
-                    record.status = record_status;
-                    record.duration_ms = Some(result.duration_ms);
-                    record.ended_at = Some(result.ended_at);
-                    record.approval = result.approval.as_deref().cloned();
-                    let content = if result.success {
-                        serde_json::to_string(&result.output.unwrap_or(Value::Null))?
-                    } else {
-                        format!(
-                            "Error [{}]: {}",
-                            result
-                                .error
-                                .as_ref()
-                                .map(|error| error.code.as_str())
-                                .unwrap_or("UNKNOWN_ERROR"),
-                            result
-                                .error
-                                .as_ref()
-                                .map(|error| error.message.as_str())
-                                .unwrap_or("未知错误")
+                    drop(progress_tx);
+                    drain_progress(config.event_sink, &call_names, &mut progress_rx).await;
+                    // 5. 按调用顺序汇总：更新记录、消息、失败集合与停滞检测；
+                    //    子代理审计记录与用量一并写入会话。
+                    for ((call, record_index, _), outcome) in batch.into_iter().zip(results) {
+                        let outcome = outcome.expect("批次内每个调用都有执行结果");
+                        let (result, extra_records, sub_input, sub_output) = match outcome {
+                            BatchCallOutcome::Tool(result) => (result, Vec::new(), 0, 0),
+                            BatchCallOutcome::Subagent {
+                                result,
+                                audit,
+                                input_tokens,
+                                output_tokens,
+                            } => (result, audit, input_tokens, output_tokens),
+                        };
+                        session.total_input_tokens =
+                            session.total_input_tokens.saturating_add(sub_input);
+                        session.total_output_tokens =
+                            session.total_output_tokens.saturating_add(sub_output);
+                        emit(
+                            config.event_sink,
+                            AgentEvent::ToolFinished {
+                                call_id: call.id.clone(),
+                                name: call.name.clone(),
+                                result: result.clone(),
+                            },
                         )
-                    };
-                    let mut message =
-                        new_message(MessageRole::Tool, content, session.messages.len());
-                    message.tool_call_id = Some(call.id);
-                    session.messages.push(message);
-                    session.updated_at = Utc::now();
-                    config.session_store.update(&session).await?;
+                        .await;
+                        let error_code = result.error.as_ref().map(|error| error.code.as_str());
+                        let record_status = if result.success {
+                            ToolCallStatus::Succeeded
+                        } else if denied_tool_result(error_code) {
+                            ToolCallStatus::Denied
+                        } else {
+                            ToolCallStatus::Failed
+                        };
+                        if result.success {
+                            unresolved_tool_failures.remove(&call.name);
+                        } else {
+                            unresolved_tool_failures.insert(call.name.clone());
+                        }
+                        let record = &mut session.tool_calls[record_index];
+                        record.output = result.output.clone();
+                        record.error = result.error.as_ref().map(|error| error.message.clone());
+                        record.status = record_status;
+                        record.duration_ms = Some(result.duration_ms);
+                        record.ended_at = Some(result.ended_at);
+                        record.approval = result.approval.as_deref().cloned();
+                        let content = if result.success {
+                            serde_json::to_string(&result.output.unwrap_or(Value::Null))?
+                        } else {
+                            format!(
+                                "Error [{}]: {}",
+                                result
+                                    .error
+                                    .as_ref()
+                                    .map(|error| error.code.as_str())
+                                    .unwrap_or("UNKNOWN_ERROR"),
+                                result
+                                    .error
+                                    .as_ref()
+                                    .map(|error| error.message.as_str())
+                                    .unwrap_or("未知错误")
+                            )
+                        };
+                        let mut message =
+                            new_message(MessageRole::Tool, content, session.messages.len());
+                        message.tool_call_id = Some(call.id);
+                        session.messages.push(message);
+                        // 子代理内部工具审计记录随父会话持久化（不写消息历史）。
+                        session.tool_calls.extend(extra_records);
+                        session.updated_at = Utc::now();
+                        config.session_store.update(&session).await?;
+                        stall_detector.push(session.tool_calls[record_index].clone());
+                        if result.success
+                            && call.name == "skill"
+                            && let Some(name) = call.input.get("name").and_then(Value::as_str)
+                        {
+                            emit(
+                                config.event_sink,
+                                AgentEvent::SkillLoaded {
+                                    name: name.to_owned(),
+                                },
+                            )
+                            .await;
+                        }
+                    }
                 }
                 if status == SessionStatus::Running {
                     state = AgentLoopState::Observing;
@@ -687,6 +1247,86 @@ pub async fn run_agent(config: AgentRunConfig<'_>) -> XduduResult<AgentRunResult
                 state = AgentLoopState::Error;
                 exit_code = ErrorKind::ProviderError.exit_code();
                 final_message = format!("Provider 以异常原因结束：{reason:?}");
+            }
+        }
+
+        // 停滞检测对 Running 与“Stop 后仍有未解决失败”的 Incomplete 都生效：
+        // 连续失败或无进展时注入恢复指令并继续，达到阈值才以 Incomplete 收尾。
+        if config.stalled_recovery != StalledRecoveryMode::Off
+            && matches!(status, SessionStatus::Running | SessionStatus::Incomplete)
+        {
+            if assistant_text.chars().count() < SHORT_OUTPUT_CHARS {
+                let had_success = session
+                    .tool_calls
+                    .iter()
+                    .rev()
+                    .take(STALL_WINDOW)
+                    .any(|call| matches!(call.status, ToolCallStatus::Succeeded));
+                if !had_success {
+                    consecutive_short_turns += 1;
+                } else {
+                    consecutive_short_turns = 0;
+                }
+            } else {
+                consecutive_short_turns = 0;
+            }
+            let signal = stall_detector
+                .consecutive_failures()
+                .or_else(|| {
+                    (consecutive_short_turns >= NO_PROGRESS_WINDOW).then(|| StallSignal {
+                        repeats: consecutive_short_turns,
+                        tool_names: Vec::new(),
+                        recovery: "连续多轮输出几乎没有进展且没有任何成功的工具调用。请停止空转：先明确说明下一步打算，选择对一个可观察的动作执行，或者直接向用户说明遇到的障碍。".to_owned(),
+                    })
+                });
+            if let Some(signal) = signal {
+                stall_recoveries = stall_recoveries.saturating_add(1);
+                emit(
+                    config.event_sink,
+                    AgentEvent::StalledRecovery {
+                        repeats: signal.repeats,
+                        tool_names: signal.tool_names.clone(),
+                        recovery: signal.recovery.clone(),
+                    },
+                )
+                .await;
+                let reached_max = stall_recoveries >= config.stalled_max_recovery as usize;
+                match config.stalled_recovery {
+                    StalledRecoveryMode::Auto if !reached_max => {
+                        // 从“Stop 后仍有未解决失败”的 Incomplete 恢复为 Running，
+                        // 注入恢复提示后继续循环尝试。检测窗口不清空：恢复后
+                        // 若仍连续失败，恢复尝试次数会继续累计直至阈值。
+                        if status == SessionStatus::Incomplete {
+                            status = SessionStatus::Running;
+                            state = AgentLoopState::Reflecting;
+                            session.current_state = state;
+                        }
+                        system.push_str(&format!(
+                            "\n\n## 停滞恢复提示\n请不要再这样做：{}\n",
+                            signal.recovery
+                        ));
+                        consecutive_short_turns = 0;
+                    }
+                    StalledRecoveryMode::Auto => {
+                        status = SessionStatus::Incomplete;
+                        state = AgentLoopState::Incomplete;
+                        exit_code = 1;
+                        final_message = format!(
+                            "检测到连续停滞，自动恢复 {} 次后仍无进展，已暂停任务。\n提示：{}",
+                            stall_recoveries, signal.recovery
+                        );
+                    }
+                    StalledRecoveryMode::Ask => {
+                        status = SessionStatus::Incomplete;
+                        state = AgentLoopState::Incomplete;
+                        exit_code = 1;
+                        final_message = format!(
+                            "检测到停滞，已暂停并请求用户指示。\n提示：{}",
+                            signal.recovery
+                        );
+                    }
+                    StalledRecoveryMode::Off => {}
+                }
             }
         }
     }
@@ -736,6 +1376,10 @@ mod tests {
     };
 
     use super::*;
+    use crate::SideEffectKind;
+    use crate::permission::PermissionLevel;
+    use crate::tools::{Tool, ToolContext, ToolDefinition, ToolResult};
+    use std::time::Duration;
 
     struct MockProvider {
         responses: Mutex<VecDeque<ProviderResponse>>,
@@ -793,6 +1437,7 @@ mod tests {
                 ..Default::default()
             },
             finish_reason: FinishReason::Stop,
+            reasoning: None,
         }
     }
 
@@ -814,6 +1459,7 @@ mod tests {
             tool_calls: calls,
             usage: TokenUsage::default(),
             finish_reason: FinishReason::ToolCalls,
+            reasoning: None,
         }
     }
 
@@ -837,6 +1483,14 @@ mod tests {
             event_sink: None,
             stream: false,
             memories: Vec::new(),
+            temperature: 0.2,
+            max_output_tokens: 4096,
+            reasoning: false,
+            stalled_recovery: StalledRecoveryMode::Auto,
+            stalled_max_recovery: 3,
+            skills: Vec::new(),
+            force_compact: Arc::new(AtomicBool::new(false)),
+            profiles: crate::subagent::builtin_profiles(),
         }
     }
 
@@ -890,6 +1544,7 @@ mod tests {
                     tool_calls: vec![call],
                     usage: TokenUsage::default(),
                     finish_reason: FinishReason::ToolCalls,
+                    reasoning: None,
                 },
                 text_response("读取完成"),
             ])),
@@ -1084,6 +1739,7 @@ mod tests {
                 tool_calls: vec![call],
                 usage: TokenUsage::default(),
                 finish_reason: FinishReason::Stop,
+                reasoning: None,
             }])),
             systems: Mutex::new(Vec::new()),
         };
@@ -1115,6 +1771,7 @@ mod tests {
                     tool_calls: vec![call],
                     usage: TokenUsage::default(),
                     finish_reason: FinishReason::ToolCalls,
+                    reasoning: None,
                 }
             })
             .collect();
@@ -1198,6 +1855,14 @@ mod tests {
                 event_sink: Some(sink_task.as_ref()),
                 stream: false,
                 memories: Vec::new(),
+                temperature: 0.2,
+                max_output_tokens: 4096,
+                reasoning: false,
+                stalled_recovery: StalledRecoveryMode::Auto,
+                stalled_max_recovery: 3,
+                skills: Vec::new(),
+                force_compact: Arc::new(AtomicBool::new(false)),
+                profiles: crate::subagent::builtin_profiles(),
             };
             run_agent(cfg).await.unwrap()
         });
@@ -1255,8 +1920,8 @@ mod tests {
         assert!(systems[0].contains("不改变权限或安全边界"));
     }
 
-    #[test]
-    fn 长会话压缩后保留原始记录计划和最近消息() {
+    #[tokio::test]
+    async fn 长会话压缩后保留原始记录计划和最近消息() {
         let dir = tempdir().unwrap();
         let now = Utc::now();
         let mut session = Session {
@@ -1291,7 +1956,20 @@ mod tests {
             completed_at: None,
         };
         let original_count = session.messages.len();
-        assert!(compact_context(&mut session, "系统约束", "[]"));
+        let outcome = compact_context(CompactContext {
+            session: &mut session,
+            system: "系统约束",
+            tools_json: "[]",
+            provider: None,
+            model: "test",
+            temperature: 0.2,
+            max_output_tokens: 4096,
+            reasoning: false,
+            cancellation: CancellationToken::new(),
+            force: false,
+        })
+        .await;
+        assert!(matches!(outcome, CompactOutcome::Deterministic));
         assert_eq!(session.messages.len(), original_count);
         assert!(session.summarized_message_count > 0);
         assert!(session.context_summary.contains("必须保留的计划"));
@@ -1303,5 +1981,324 @@ mod tests {
                 .text_content()
                 .contains("消息 99")
         );
+    }
+
+    #[tokio::test]
+    async fn 达到三倍预算时触发_llm_压缩并写入结构化摘要() {
+        let dir = tempdir().unwrap();
+        let now = Utc::now();
+        let mut session = Session {
+            id: Uuid::new_v4(),
+            title: "超长会话".into(),
+            cwd: dir.path().to_path_buf(),
+            status: SessionStatus::Running,
+            current_state: AgentLoopState::Planning,
+            plan: json!({"goal":"保留计划"}),
+            provider_name: "mock".into(),
+            model: "test".into(),
+            messages: (0..300)
+                .map(|index| {
+                    new_message(
+                        if index % 2 == 0 {
+                            MessageRole::User
+                        } else {
+                            MessageRole::Assistant
+                        },
+                        format!("消息 {index} {}", "上下文内容".repeat(300)),
+                        index,
+                    )
+                })
+                .collect(),
+            tool_calls: Vec::new(),
+            context_summary: String::new(),
+            summarized_message_count: 0,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            created_at: now,
+            updated_at: now,
+            completed_at: None,
+        };
+        let provider = MockProvider {
+            responses: Mutex::new(VecDeque::from([tool_response(vec![ToolCall {
+                id: "summary-1".into(),
+                name: SUBMIT_CONTEXT_SUMMARY_TOOL.into(),
+                input: json!({
+                    "summary": "用户要求压缩上下文，已完成大部分工作。",
+                    "key_facts": ["工作区为临时目录", "计划目标已记录"],
+                    "open_items": ["补充测试"]
+                }),
+            }])])),
+            systems: Mutex::new(Vec::new()),
+        };
+        let outcome = compact_context(CompactContext {
+            session: &mut session,
+            system: "系统约束",
+            tools_json: "[]",
+            provider: Some(&provider),
+            model: "test",
+            temperature: 0.2,
+            max_output_tokens: 4096,
+            reasoning: false,
+            cancellation: CancellationToken::new(),
+            force: false,
+        })
+        .await;
+        assert_eq!(outcome, CompactOutcome::Llm);
+        assert!(session.context_summary.contains("## 会话压缩摘要（LLM）"));
+        assert!(session.context_summary.contains("关键事实"));
+        assert!(session.context_summary.contains("补充测试"));
+        assert_eq!(session.summarized_message_count, session.messages.len());
+    }
+
+    #[tokio::test]
+    async fn llm_压缩协议失败时回退确定性截断() {
+        let dir = tempdir().unwrap();
+        let now = Utc::now();
+        let mut session = Session {
+            id: Uuid::new_v4(),
+            title: "超长会话".into(),
+            cwd: dir.path().to_path_buf(),
+            status: SessionStatus::Running,
+            current_state: AgentLoopState::Planning,
+            plan: json!({"goal":"必须保留的计划"}),
+            provider_name: "mock".into(),
+            model: "test".into(),
+            messages: (0..300)
+                .map(|index| {
+                    new_message(
+                        if index % 2 == 0 {
+                            MessageRole::User
+                        } else {
+                            MessageRole::Assistant
+                        },
+                        format!("消息 {index} {}", "上下文内容".repeat(300)),
+                        index,
+                    )
+                })
+                .collect(),
+            tool_calls: Vec::new(),
+            context_summary: String::new(),
+            summarized_message_count: 0,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            created_at: now,
+            updated_at: now,
+            completed_at: None,
+        };
+        // Provider 返回普通文本（finish_reason=Stop）：协议不符 → 回退。
+        let provider = MockProvider {
+            responses: Mutex::new(VecDeque::from([text_response("我不压缩")])),
+            systems: Mutex::new(Vec::new()),
+        };
+        let outcome = compact_context(CompactContext {
+            session: &mut session,
+            system: "系统约束",
+            tools_json: "[]",
+            provider: Some(&provider),
+            model: "test",
+            temperature: 0.2,
+            max_output_tokens: 4096,
+            reasoning: false,
+            cancellation: CancellationToken::new(),
+            force: false,
+        })
+        .await;
+        assert_eq!(outcome, CompactOutcome::LlmFallback);
+        assert!(session.context_summary.contains("必须保留的计划"));
+        assert!(session.summarized_message_count > 0);
+        assert!(session.summarized_message_count < session.messages.len());
+    }
+
+    #[test]
+    fn 内部推理随助手消息回传但不进入公开文本() {
+        let dir = tempdir().unwrap();
+        let now = Utc::now();
+        let session = Session {
+            id: Uuid::new_v4(),
+            title: "推理闭环".into(),
+            cwd: dir.path().to_path_buf(),
+            status: SessionStatus::Running,
+            current_state: AgentLoopState::Reflecting,
+            plan: json!({}),
+            provider_name: "deepseek".into(),
+            model: "deepseek-v4-pro".into(),
+            messages: vec![
+                new_message(MessageRole::User, "第一轮", 0),
+                Message {
+                    id: Uuid::new_v4(),
+                    role: MessageRole::Assistant,
+                    content: "公开结论".into(),
+                    reasoning: Some("模型内部推理草稿".into()),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                    sequence: 1,
+                    created_at: now,
+                },
+            ],
+            tool_calls: Vec::new(),
+            context_summary: String::new(),
+            summarized_message_count: 0,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            created_at: now,
+            updated_at: now,
+            completed_at: None,
+        };
+        let messages = provider_messages(&session);
+        let assistant = &messages[1];
+        assert_eq!(assistant.text_content(), "公开结论");
+        assert!(!assistant.text_content().contains("内部推理草稿"));
+        let MessageContent::Blocks(blocks) = &assistant.content else {
+            panic!("推理消息应转换为块")
+        };
+        assert!(matches!(
+            blocks.first(),
+            Some(ContentBlock::Thinking { text }) if text == "模型内部推理草稿"
+        ));
+    }
+
+    #[async_trait]
+    impl Tool for AlwaysFailTool {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: "always_fail".into(),
+                description: "总是失败的测试工具".into(),
+                input_schema: json!({ "type": "object" }),
+                permission_level: PermissionLevel::ReadOnly,
+                side_effect: SideEffectKind::None,
+                default_timeout: Duration::from_secs(5),
+            }
+        }
+        fn validate(&self, _input: &Value) -> Result<(), Vec<String>> {
+            Ok(())
+        }
+        async fn execute(&self, _input: Value, context: ToolContext) -> ToolResult {
+            ToolResult::failure(
+                "STALL_TEST_FAILURE",
+                "总是失败",
+                context.started_at,
+                json!({}),
+            )
+        }
+    }
+
+    struct AlwaysFailTool;
+
+    fn config_with_stall<'a>(
+        dir: &Path,
+        provider: &'a dyn Provider,
+        registry: &'a ToolRegistry,
+        store: &'a dyn SessionStore,
+        stalled_max_recovery: u32,
+    ) -> AgentRunConfig<'a> {
+        AgentRunConfig {
+            prompt: "测试任务".into(),
+            model: "test".into(),
+            max_turns: 10,
+            cwd: dir.to_path_buf(),
+            provider,
+            tool_registry: registry,
+            session_store: store,
+            permission_mode: Arc::new(std::sync::Mutex::new(PermissionMode::AutoSafe)),
+            cancellation: CancellationToken::new(),
+            session_id: None,
+            event_sink: None,
+            stream: false,
+            memories: Vec::new(),
+            temperature: 0.2,
+            max_output_tokens: 4096,
+            reasoning: false,
+            stalled_recovery: StalledRecoveryMode::Auto,
+            stalled_max_recovery,
+            skills: Vec::new(),
+            force_compact: Arc::new(AtomicBool::new(false)),
+            profiles: crate::subagent::builtin_profiles(),
+        }
+    }
+
+    #[tokio::test]
+    async fn 连续重复失败触发恢复提示并在达上限后停止() {
+        let dir = tempdir().unwrap();
+        let mut registry = ToolRegistry::new();
+        register_builtins(&mut registry).unwrap();
+        registry.register(AlwaysFailTool).unwrap();
+        let provider = MockProvider {
+            responses: Mutex::new(VecDeque::from([
+                tool_response(vec![ToolCall {
+                    id: "fail-1".into(),
+                    name: "always_fail".into(),
+                    input: json!({}),
+                }]),
+                tool_response(vec![ToolCall {
+                    id: "fail-2".into(),
+                    name: "always_fail".into(),
+                    input: json!({}),
+                }]),
+                tool_response(vec![ToolCall {
+                    id: "fail-3".into(),
+                    name: "always_fail".into(),
+                    input: json!({}),
+                }]),
+                tool_response(vec![ToolCall {
+                    id: "fail-4".into(),
+                    name: "always_fail".into(),
+                    input: json!({}),
+                }]),
+                tool_response(vec![ToolCall {
+                    id: "fail-5".into(),
+                    name: "always_fail".into(),
+                    input: json!({}),
+                }]),
+            ])),
+            systems: Mutex::new(Vec::new()),
+        };
+        let store = JsonSessionStore::new(dir.path());
+        let result = run_agent(config_with_stall(
+            dir.path(),
+            &provider,
+            &registry,
+            &store,
+            2,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(result.status, SessionStatus::Incomplete);
+        assert!(result.final_message.contains("停滞"));
+        let systems = provider.systems.lock().unwrap();
+        assert!(systems.iter().any(|s| s.contains("停滞恢复提示")));
+    }
+
+    #[tokio::test]
+    async fn 短输出但有成功工具调用时不触发无进展停滞() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "hello").unwrap();
+        let mut registry = ToolRegistry::new();
+        register_builtins(&mut registry).unwrap();
+        let provider = MockProvider {
+            responses: Mutex::new(VecDeque::from([
+                tool_response(vec![ToolCall {
+                    id: "call-read".into(),
+                    name: "file_read".into(),
+                    input: json!({ "path": "a.txt" }),
+                }]),
+                text_response("好"),
+                text_response("好"),
+                text_response("好"),
+                text_response("完成"),
+            ])),
+            systems: Mutex::new(Vec::new()),
+        };
+        let store = JsonSessionStore::new(dir.path());
+        let result = run_agent(config_with_stall(
+            dir.path(),
+            &provider,
+            &registry,
+            &store,
+            1,
+        ))
+        .await
+        .unwrap();
+        // 窗口内有成功工具调用时，短输出不会累计为无进展停滞。
+        assert_eq!(result.status, SessionStatus::Completed);
     }
 }

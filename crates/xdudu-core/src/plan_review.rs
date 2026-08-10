@@ -132,6 +132,7 @@ pub async fn revise_plan(config: PlanRevisionConfig<'_>) -> XduduResult<PlanRevi
         system: build_revision_prompt(&config.cwd),
         temperature: 0.2,
         max_output_tokens: MAX_PLAN_TOKENS,
+        reasoning: false,
         cancellation: config.cancellation,
     };
     let response = config.provider.chat(request).await?;
@@ -432,6 +433,7 @@ mod tests {
                 ..TokenUsage::default()
             },
             finish_reason: FinishReason::ToolCalls,
+            reasoning: None,
         }
     }
 
@@ -501,6 +503,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 usage: TokenUsage::default(),
                 finish_reason: FinishReason::Stop,
+                reasoning: None,
             })),
             request: Mutex::new(None),
         };

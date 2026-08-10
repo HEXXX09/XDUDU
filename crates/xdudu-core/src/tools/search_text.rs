@@ -108,6 +108,7 @@ fn run_search(
     options: SearchOptions,
     cancellation: tokio_util::sync::CancellationToken,
     progress: Option<tokio::sync::mpsc::Sender<ToolProgressUpdate>>,
+    call_id: String,
 ) -> Result<Value, String> {
     let regex = build_regex(&options.query, &options.mode, options.case_sensitive)?;
     let include_set = build_globset(&options.includes)?;
@@ -175,12 +176,15 @@ fn run_search(
         scanned_bytes += metadata.len();
         if scanned_files % 1000 == 0 || last_progress.elapsed() >= Duration::from_millis(250) {
             if let Some(progress) = &progress {
-                let _ = progress.try_send(ToolProgressUpdate::counted(
-                    "scanning",
-                    scanned_files,
-                    Some(MAX_SCANNED_FILES),
-                    "files",
-                ));
+                let _ = progress.try_send(
+                    ToolProgressUpdate::counted(
+                        "scanning",
+                        scanned_files,
+                        Some(MAX_SCANNED_FILES),
+                        "files",
+                    )
+                    .with_call_id(&call_id),
+                );
             }
             last_progress = Instant::now();
         }
@@ -413,8 +417,9 @@ impl Tool for SearchTextTool {
         };
         let cancellation = context.cancellation.clone();
         let progress = context.progress.clone();
+        let call_id = context.call_id.to_string();
         match tokio::task::spawn_blocking(move || {
-            run_search(root, workspace, options, cancellation, progress)
+            run_search(root, workspace, options, cancellation, progress, call_id)
         })
         .await
         {

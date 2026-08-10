@@ -161,6 +161,7 @@ pub async fn suggest_memories(
         system: build_suggestion_prompt(&config.cwd),
         temperature: 0.2,
         max_output_tokens: 2048,
+        reasoning: false,
         cancellation: config.cancellation,
     };
     let response = config.provider.chat(request).await?;
@@ -269,6 +270,7 @@ mod tests {
             }],
             usage: TokenUsage::default(),
             finish_reason: FinishReason::ToolCalls,
+            reasoning: None,
         }
     }
 
@@ -313,6 +315,7 @@ mod tests {
                     tool_calls: vec![],
                     usage: TokenUsage::default(),
                     finish_reason: FinishReason::Stop,
+                    reasoning: None,
                 },
                 suggestion_response(json!({"suggestions": []})),
             ])),

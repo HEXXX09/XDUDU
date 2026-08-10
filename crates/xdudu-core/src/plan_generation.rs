@@ -81,6 +81,7 @@ pub async fn generate_plan(config: PlanGenerationConfig<'_>) -> XduduResult<Plan
         system: build_planning_prompt(&config.cwd),
         temperature: 0.2,
         max_output_tokens: MAX_PLAN_TOKENS,
+        reasoning: false,
         cancellation: config.cancellation,
     };
     let response = config.provider.chat(request).await?;
@@ -441,6 +442,7 @@ mod tests {
                 ..TokenUsage::default()
             },
             finish_reason: FinishReason::ToolCalls,
+            reasoning: None,
         }
     }
 
@@ -520,6 +522,7 @@ mod tests {
                 tool_calls: vec![],
                 usage: TokenUsage::default(),
                 finish_reason: FinishReason::Stop,
+                reasoning: None,
             })),
             request: Mutex::new(None),
         };

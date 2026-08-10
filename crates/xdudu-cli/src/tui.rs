@@ -107,7 +107,7 @@ struct SlashCommand {
     requires_argument: bool,
 }
 
-const SLASH_COMMANDS: [SlashCommand; 15] = [
+const SLASH_COMMANDS: [SlashCommand; 18] = [
     SlashCommand {
         name: "/help",
         usage: "/help",
@@ -184,6 +184,24 @@ const SLASH_COMMANDS: [SlashCommand; 15] = [
         name: "/plugins",
         usage: "/plugins",
         description: "查看声明式插件",
+        requires_argument: false,
+    },
+    SlashCommand {
+        name: "/instructions",
+        usage: "/instructions",
+        description: "查看自定义指令加载情况",
+        requires_argument: false,
+    },
+    SlashCommand {
+        name: "/skills",
+        usage: "/skills",
+        description: "查看可用技能与加载策略",
+        requires_argument: false,
+    },
+    SlashCommand {
+        name: "/agent",
+        usage: "/agent",
+        description: "查看 Agent 档案与子代理",
         requires_argument: false,
     },
     SlashCommand {
@@ -1523,6 +1541,13 @@ impl EventSink for TuiRenderer {
                     commits.push((Role::Warning, line));
                 }
                 AgentEvent::DebugTrace { .. } => {}
+                AgentEvent::StalledRecovery { recovery, .. } => {
+                    state.status = "检测到停滞，尝试恢复".into();
+                    let line =
+                        redact_text(&format!("⚠ 检测到停滞（{}），任务尝试自动恢复。", recovery));
+                    push_block(&mut state, Role::Warning, line.clone());
+                    commits.push((Role::Warning, line));
+                }
                 AgentEvent::PlanStarted { .. } => state.status = "执行计划".into(),
                 AgentEvent::PlanStepStarted { title, attempt, .. } => {
                     state.status = format!("步骤 {title} · 第 {attempt} 次");
@@ -1555,6 +1580,30 @@ impl EventSink for TuiRenderer {
                     commits.push((Role::Warning, line));
                 }
                 AgentEvent::PlanCompleted { .. } => state.status = "计划完成".into(),
+                AgentEvent::SkillLoaded { name } => {
+                    let line = format!("技能已加载：{name}");
+                    push_block(&mut state, Role::System, line.clone());
+                    commits.push((Role::System, line));
+                }
+                AgentEvent::SubagentStarted { agent_id, prompt } => {
+                    let line = format!("子代理 {agent_id} 已启动：{}", redact_text(&prompt));
+                    push_block(&mut state, Role::System, line.clone());
+                    commits.push((Role::System, line));
+                }
+                AgentEvent::SubagentFinished { agent_id, result } => {
+                    let line = if result.success {
+                        format!("子代理 {agent_id} 完成")
+                    } else {
+                        let message = result
+                            .error
+                            .as_ref()
+                            .map(|error| error.message.clone())
+                            .unwrap_or_default();
+                        format!("子代理 {agent_id} 未完成：{}", redact_text(&message))
+                    };
+                    push_block(&mut state, Role::Tool, line.clone());
+                    commits.push((Role::Tool, line));
+                }
             }
             if self.router.focus() == InputFocus::Composer {
                 for (role, done) in take_ready_segments(&mut state) {

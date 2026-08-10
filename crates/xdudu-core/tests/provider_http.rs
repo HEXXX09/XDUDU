@@ -120,6 +120,7 @@ impl ProviderStreamSink for TextSink {
     async fn emit(&self, event: ProviderStreamEvent) {
         match event {
             ProviderStreamEvent::TextDelta { text } => self.0.lock().unwrap().push_str(&text),
+            ProviderStreamEvent::ReasoningDelta { .. } => {}
         }
     }
 }
@@ -137,6 +138,7 @@ fn request() -> ProviderRequest {
         system: "系统提示".into(),
         temperature: 0.2,
         max_output_tokens: 128,
+        reasoning: false,
         cancellation: CancellationToken::new(),
     }
 }

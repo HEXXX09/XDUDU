@@ -142,6 +142,7 @@ fn env_name(provider: &str) -> XduduResult<&'static str> {
     match provider {
         "anthropic" => Ok("ANTHROPIC_API_KEY"),
         "deepseek" => Ok("DEEPSEEK_API_KEY"),
+        "openai-compatible" => Ok("OPENAI_API_KEY"),
         _ => Err(XduduError::new(
             ErrorKind::ConfigError,
             format!("不支持的 Provider：{provider}"),

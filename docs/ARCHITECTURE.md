@@ -19,8 +19,8 @@ Cargo workspace
 │   ├── input_editor.rs  普通行式界面的安全输入编辑
 │   └── doctor.rs        安装、配置、凭据和工作区诊断
 └── crates/xdudu-core
-    ├── agent.rs         Agent 主循环和事件发送
-    ├── config.rs        分层配置、来源追踪和 TOML 写入
+    ├── agent.rs         Agent 主循环、事件发送、停滞检测与批次并行调度
+    ├── config.rs        分层配置、来源追踪、TOML 写入与命令规则
     ├── credentials.rs   SecretStore、系统凭据和秘密类型
     ├── events.rs        AgentEvent 与 EventSink
     ├── approval.rs      副作用分类、审批请求和审批网关
@@ -31,15 +31,20 @@ Cargo workspace
     │   ├── factory.rs   配置与凭据到 Provider 实例
     │   ├── anthropic.rs Anthropic 协议和 SSE
     │   ├── deepseek.rs  DeepSeek 协议和 SSE
+    │   ├── openai_wire.rs  OpenAI wire 协议复用层
+    │   ├── openai_compatible.rs OpenAI-compatible Provider
     │   ├── stream.rs    流事件、Sink 和 SSE 解码
     │   └── retry.rs     安全重试、退避和请求节流
     ├── permission.rs    显式权限矩阵
     ├── mcp.rs           stdio/Streamable HTTP MCP、生命周期与工具适配
     ├── plugin.rs        声明式插件清单、加载与校验
-    ├── instructions.rs   用户/项目级指令加载与提示词注入
+    ├── instructions.rs  用户/项目级指令与仓库约定加载、提示词注入
+    ├── skills.rs        Skills 发现、frontmatter 校验与优先级去重
+    ├── subagent.rs      AgentProfile 档案与 task 子代理隔离循环
+    ├── stall.rs         停滞检测与恢复策略
     ├── memories.rs       可审查记忆存储与 FTS5 检索
     ├── memory_suggestion.rs 会话结束记忆建议协议
-    ├── tools/           注册中心、九个内置工具及路径策略
+    ├── tools/           注册中心、内置工具（含 skill/web_read）及路径策略
     ├── session.rs       会话领域模型与兼容 JSON 读取
     ├── sqlite_session.rs SQLite、迁移、恢复与工作区锁
     ├── prompt.rs        中文系统提示词
@@ -169,7 +174,13 @@ PermissionMode 显式允许矩阵
 | `auto-safe` | 工作区文件读写和受限安全命令 |
 | `full-access` | 所有工具级别、受审批网络访问及任意本地可执行文件 |
 
-文件策略会解析真实工作区和符号链接，阻止越界。命令始终通过 `tokio::process::Command` 的程序名和参数数组执行，不调用 shell；`auto-safe` 只允许受限的 `pwd`、`echo`、`ls` 和只读 Git 子命令；超时或取消会终止子进程，stdout 和 stderr 均有保留上限。
+文件策略会解析真实工作区和符号链接，阻止越界。命令不调用 shell；`pwd`、`echo`、`ls`
+由 Rust 内建实现以保持三平台一致，其余命令始终通过 `tokio::process::Command` 的程序名和
+参数数组执行。`terminal_exec` 在 `auto-safe` 下按三档前缀白名单决策：deny（默认
+`sudo`/`mkfs`/`rm`）立即拒绝，allow（默认内建命令、只读 Git 子命令及
+`cargo`/`npm`/`python3`/`go` 常见检查命令）直接执行，未匹配命令进入审批门（ask 档）；
+项目配置只能追加 deny 与 ask，不能追加 allow。超时或取消会终止子进程，stdout 和 stderr
+均有保留上限。
 
 审批模式为 `ask`、`never`、`always`。工作区写入、进程执行和网络访问都进入同一审批链。`ask` 在交互 TTY 中提供单次、当前会话和永久三种批准作用域；规则按工具名与副作用类型精确匹配。永久规则保存在用户配置目录，项目配置不能创建或扩大规则。非交互与 JSON 模式只使用已有永久规则，否则默认拒绝。项目配置只能收紧权限与审批，不能设置 Provider Base URL，避免仓库配置把凭据导向其他端点。
 
@@ -179,7 +190,10 @@ PermissionMode 显式允许矩阵
 
 `web_fetch` 的每一跳 URL 都必须是无认证信息的 HTTPS；DNS 返回的全部地址都要通过公网检查，并使用已经验证的地址固定连接，TLS SNI 与证书校验仍使用原域名。系统 DNS 结果全部落入 `198.18.0.0/15` Fake-IP 网段时，使用固定公网地址的 HTTPS DoH 获取真实记录，结果仍执行同一公网校验。网络客户端不转发代理凭据、Cookie、认证、自定义 Header 或请求体，也不自动重试。
 
-会话、终端文本、JSON 事件、工具输入输出和顶层错误在持久化或展示前经过同一脱敏函数。文件变更前镜像只存于 `.xdudu/changes/json`，Unix 权限设为 `0600`，不进入模型上下文。
+会话、终端文本、JSON 事件、工具输入输出和顶层错误在持久化或展示前经过同一脱敏函数。
+Provider 内部 reasoning 只为工具闭环保存在脱敏后的会话记录中，`session show`、TUI、导出和
+调试轨迹均不返回原始正文。文件变更前镜像只存于 `.xdudu/changes/json`，Unix 权限设为
+`0600`，不进入模型上下文。
 
 ## 10. 会话、变更账本与终态
 
@@ -207,3 +221,8 @@ Cargo 是唯一构建入口。CI 在 Linux、macOS 和 Windows 执行格式、Cl
 ## 12. 后续演进
 
 Provider 扩展按当前决定暂缓，DeepSeek 保持主路径。M6 功能与 macOS、Linux、Windows CI 验收已完成。M7 已完成会话恢复、Plan Schema v3、SQLite Schema v4、结构化生成、整份审批/修订、串行 DAG 执行和恢复。M8 已完成 stdio 与 Streamable HTTP MCP 客户端、声明式插件清单、动态工具注册与统一权限/审批/脱敏链，并通过 stdio/HTTP 恶意输入、越权、超时、取消与审批链 E2E 及三平台 CI 验收。M9 已完成用户级/项目级指令注入、可审查记忆（任务完成建议→TUI 逐条确认→SQLite FTS5 存储与检索→上下文注入），默认不自动写入，未引入向量 RAG。`submit_plan` 创建 Draft，`revise_plan` 生成完整新 revision，`complete_step` 以逐项证据确认当前步骤；执行期通过 `revision + execution_version + status` 原子检查点避免并发覆盖。Plan 不保存隐藏推理，也不替代单次请求内部的 ReAct；批准 Plan 不放行任何工具副作用，崩溃后也不会自动重放结果未知的工具。
+
+M11 功能开发和本地门禁已完成，等待远端三平台 CI：OpenAI-compatible Provider 与思考闭环；
+停滞检测；`task` 子代理委派（隔离上下文、运行时受限工具集、同批并行、审计持久化）；只读
+工具批次并行；Skills 技能系统；仓库指令；跨平台命令白名单；LLM 分级上下文压缩；记忆注入
+管线；以及具备响应体和提炼次数硬上限的 `web_read`。三平台通过前不把 M11 标记为发布完成。

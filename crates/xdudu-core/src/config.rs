@@ -14,6 +14,8 @@ use crate::{
     approval::ApprovalMode,
     error::{ErrorKind, XduduError, XduduResult},
     permission::PermissionMode,
+    stall::StalledRecoveryMode,
+    subagent::{AgentProfile, ProfileMode, validate_profile},
 };
 
 const DEFAULT_ANTHROPIC_MODEL: &str = "claude-sonnet-4-5-20250929";
@@ -41,7 +43,7 @@ impl ConfigSource {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderConfig {
     pub name: String,
@@ -51,6 +53,12 @@ pub struct ProviderConfig {
     pub max_attempts: u32,
     pub retry_base_ms: u64,
     pub min_request_interval_ms: u64,
+    /// 模型请求采样温度，默认 0.2。
+    pub temperature: f32,
+    /// 单次模型请求最大输出 Token，默认 4096。
+    pub max_output_tokens: u32,
+    /// 是否启用内部思考闭环（推理内容持久化并回传，不进入公开输出）。
+    pub reasoning: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -59,8 +67,92 @@ pub struct AgentConfig {
     pub max_turns: u32,
     pub permission: String,
     pub approval: String,
+    /// 停滞后的恢复策略：auto | ask | off。
+    pub stalled_recovery: String,
+    /// auto 模式下允许附加恢复提示继续的最大次数。
+    pub stalled_max_recovery: u32,
+    /// `terminal_exec` 三档前缀规则：deny > allow > ask。
+    pub commands: CommandRules,
+    /// 技能加载策略：allow | ask | deny（默认 allow）。
+    pub skills: String,
+    /// 自定义 Agent 档案（不含内置；最终由调用方与内置档案合并）。
+    pub profiles: Vec<AgentProfile>,
 }
 
+/// `terminal_exec` 命令三档策略的前缀规则表。
+///
+/// 每条规则为「可执行名」或「可执行名 + 首个参数」（如 `cargo check`）。
+/// 匹配顺序固定为 deny > allow > ask：命中 deny 立即拒绝；命中 allow
+/// 直接执行；其余进入审批门。项目配置只能追加 deny 与 ask，不能追加
+/// allow（项目不可信原则）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandRules {
+    pub allow: Vec<String>,
+    pub ask: Vec<String>,
+    pub deny: Vec<String>,
+}
+
+impl CommandRules {
+    /// auto-safe 内置默认 allow 白名单（对齐主流编码 Agent 体验）。
+    fn default_allow() -> Vec<String> {
+        [
+            "pwd",
+            "echo",
+            "ls",
+            "git status",
+            "git log",
+            "git diff",
+            "git show",
+            "git branch",
+            "git stash",
+            "cargo check",
+            "cargo build",
+            "cargo test",
+            "cargo fmt",
+            "cargo clippy",
+            "npm run",
+            "npm test",
+            "npm run lint",
+            "python3 -m pytest",
+            "python3 -m unittest",
+            "make -n",
+            "gofmt -l",
+            "go test",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+    }
+}
+
+impl Default for CommandRules {
+    fn default() -> Self {
+        Self {
+            allow: Self::default_allow(),
+            ask: Vec::new(),
+            deny: ["sudo", "mkfs", "rm"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        }
+    }
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            max_turns: 25,
+            permission: "auto-safe".into(),
+            approval: "ask".into(),
+            stalled_recovery: "auto".into(),
+            stalled_max_recovery: 3,
+            commands: CommandRules::default(),
+            skills: "allow".into(),
+            profiles: Vec::new(),
+        }
+    }
+}
 impl AgentConfig {
     pub fn permission_mode(&self) -> XduduResult<PermissionMode> {
         self.permission.parse()
@@ -68,6 +160,41 @@ impl AgentConfig {
 
     pub fn approval_mode(&self) -> XduduResult<ApprovalMode> {
         self.approval.parse()
+    }
+
+    pub fn stalled_recovery_mode(&self) -> XduduResult<StalledRecoveryMode> {
+        self.stalled_recovery.parse()
+    }
+
+    /// 技能加载策略：allow | ask | deny。
+    pub fn skills_mode(&self) -> XduduResult<SkillMode> {
+        match self.skills.as_str() {
+            "allow" => Ok(SkillMode::Allow),
+            "ask" => Ok(SkillMode::Ask),
+            "deny" => Ok(SkillMode::Deny),
+            _ => Err(config_error("agent.skills 只能是 allow、ask 或 deny。")),
+        }
+    }
+}
+
+/// 技能加载策略。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkillMode {
+    /// 直接加载。
+    Allow,
+    /// 加载前进入审批门。
+    Ask,
+    /// 索引不暴露，加载被拒绝。
+    Deny,
+}
+
+impl SkillMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Ask => "ask",
+            Self::Deny => "deny",
+        }
     }
 }
 
@@ -80,13 +207,25 @@ pub struct OutputConfig {
     pub debug_trace: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppConfig {
     pub provider: ProviderConfig,
     pub agent: AgentConfig,
     pub output: OutputConfig,
     pub telemetry: TelemetryConfig,
+    pub memory: MemoryConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryConfig {
+    /// 任务完成后是否弹出记忆建议并请求确认；默认关闭（挂起）。
+    pub suggest_enabled: bool,
+    /// 记忆注入的最大条数（召回后排序去重，默认 8）。
+    pub top_k: usize,
+    /// 记忆注入的 Token 预算（默认 1500）。
+    pub injection_token_budget: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -124,6 +263,12 @@ pub struct ConfigOverrides {
     pub color: Option<bool>,
     pub debug_trace: Option<bool>,
     pub telemetry_enabled: Option<bool>,
+    pub memory_suggest_enabled: Option<bool>,
+    pub temperature: Option<f32>,
+    pub max_output_tokens: Option<u32>,
+    pub reasoning: Option<bool>,
+    pub stalled_recovery: Option<String>,
+    pub stalled_max_recovery: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -136,6 +281,15 @@ struct FileConfig {
     output: FileOutput,
     #[serde(default)]
     telemetry: FileTelemetry,
+    #[serde(default)]
+    memory: FileMemory,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+struct FileMemory {
+    suggest_enabled: Option<bool>,
+    top_k: Option<usize>,
+    injection_token_budget: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -152,6 +306,9 @@ struct FileProvider {
     max_attempts: Option<u32>,
     retry_base_ms: Option<u64>,
     min_request_interval_ms: Option<u64>,
+    temperature: Option<f32>,
+    max_output_tokens: Option<u32>,
+    reasoning: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -159,6 +316,67 @@ struct FileAgent {
     max_turns: Option<u32>,
     permission: Option<String>,
     approval: Option<String>,
+    stalled_recovery: Option<String>,
+    stalled_max_recovery: Option<u32>,
+    commands: Option<FileCommandRules>,
+    skills: Option<String>,
+    profiles: Option<std::collections::BTreeMap<String, FileProfile>>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+struct FileProfile {
+    description: Option<String>,
+    mode: Option<String>,
+    model: Option<String>,
+    permission: Option<String>,
+    allowed_tools: Option<Vec<String>>,
+    max_turns: Option<u32>,
+    system_extra: Option<String>,
+}
+
+impl FileProfile {
+    fn into_profile(self, id: String) -> XduduResult<AgentProfile> {
+        let mode = match self.mode.as_deref().unwrap_or("subagent") {
+            "primary" => ProfileMode::Primary,
+            "subagent" => ProfileMode::Subagent,
+            "all" => ProfileMode::All,
+            other => {
+                return Err(config_error(format!(
+                    "档案 {id} 的 mode“{other}”无效：primary、subagent 或 all。"
+                )));
+            }
+        };
+        let permission = match self.permission.as_deref().unwrap_or("read-only") {
+            "read-only" => PermissionMode::ReadOnly,
+            "auto-safe" => PermissionMode::AutoSafe,
+            "full-access" => PermissionMode::FullAccess,
+            other => {
+                return Err(config_error(format!(
+                    "档案 {id} 的 permission“{other}”无效：read-only、auto-safe 或 full-access。"
+                )));
+            }
+        };
+        let max_turns = self.max_turns.unwrap_or(8);
+        let profile = AgentProfile {
+            id,
+            description: self.description.unwrap_or_default(),
+            mode,
+            model: self.model,
+            permission,
+            allowed_tools: self.allowed_tools,
+            max_turns,
+            system_extra: self.system_extra,
+        };
+        validate_profile(&profile)?;
+        Ok(profile)
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+struct FileCommandRules {
+    allow: Option<Vec<String>>,
+    ask: Option<Vec<String>>,
+    deny: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -171,6 +389,36 @@ struct FileOutput {
 
 fn config_error(message: impl Into<String>) -> XduduError {
     XduduError::new(ErrorKind::ConfigError, message)
+}
+
+/// 命令规则格式校验：「可执行名」加 0..=3 个参数。前缀匹配语义：
+/// 匹配时只比较可执行名与首个参数，多余参数用于描述更具体的命令。
+fn valid_command_rule(rule: &str) -> bool {
+    let mut parts = rule.split_whitespace();
+    let Some(executable) = parts.next() else {
+        return false;
+    };
+    let executable_valid = !executable.is_empty()
+        && executable.len() <= 128
+        && executable
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._+-".contains(&byte));
+    if !executable_valid {
+        return false;
+    }
+    let mut count = 0;
+    for argument in parts {
+        count += 1;
+        let argument_valid = !argument.is_empty()
+            && argument.len() <= 64
+            && argument
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._-+/".contains(&byte));
+        if count > 3 || !argument_valid {
+            return false;
+        }
+    }
+    true
 }
 
 fn user_config_path() -> XduduResult<PathBuf> {
@@ -275,7 +523,7 @@ fn apply_file(
     file: &FileConfig,
     source: ConfigSource,
     sources: &mut BTreeMap<String, ConfigSource>,
-) {
+) -> XduduResult<()> {
     set(
         &mut config.provider.name,
         &file.provider.name,
@@ -326,6 +574,27 @@ fn apply_file(
         sources,
     );
     set(
+        &mut config.provider.temperature,
+        &file.provider.temperature,
+        "provider.temperature",
+        source,
+        sources,
+    );
+    set(
+        &mut config.provider.max_output_tokens,
+        &file.provider.max_output_tokens,
+        "provider.max_output_tokens",
+        source,
+        sources,
+    );
+    set(
+        &mut config.provider.reasoning,
+        &file.provider.reasoning,
+        "provider.reasoning",
+        source,
+        sources,
+    );
+    set(
         &mut config.agent.max_turns,
         &file.agent.max_turns,
         "agent.max_turns",
@@ -346,6 +615,54 @@ fn apply_file(
         source,
         sources,
     );
+    set(
+        &mut config.agent.stalled_recovery,
+        &file.agent.stalled_recovery,
+        "agent.stalled_recovery",
+        source,
+        sources,
+    );
+    set(
+        &mut config.agent.stalled_max_recovery,
+        &file.agent.stalled_max_recovery,
+        "agent.stalled_max_recovery",
+        source,
+        sources,
+    );
+    set(
+        &mut config.agent.skills,
+        &file.agent.skills,
+        "agent.skills",
+        source,
+        sources,
+    );
+    if let Some(commands) = &file.agent.commands {
+        // 项目配置只能追加 ask/deny（validate_project_trust 已拒绝项目 allow）；
+        // 其余来源整表覆盖。
+        if source == ConfigSource::Project {
+            if let Some(ask) = &commands.ask {
+                config.agent.commands.ask.extend(ask.iter().cloned());
+                sources.insert("agent.commands.ask".into(), source);
+            }
+            if let Some(deny) = &commands.deny {
+                config.agent.commands.deny.extend(deny.iter().cloned());
+                sources.insert("agent.commands.deny".into(), source);
+            }
+        } else {
+            if let Some(allow) = &commands.allow {
+                config.agent.commands.allow.clone_from(allow);
+                sources.insert("agent.commands.allow".into(), source);
+            }
+            if let Some(ask) = &commands.ask {
+                config.agent.commands.ask.clone_from(ask);
+                sources.insert("agent.commands.ask".into(), source);
+            }
+            if let Some(deny) = &commands.deny {
+                config.agent.commands.deny.clone_from(deny);
+                sources.insert("agent.commands.deny".into(), source);
+            }
+        }
+    }
     set(
         &mut config.output.json,
         &file.output.json,
@@ -381,6 +698,40 @@ fn apply_file(
         source,
         sources,
     );
+    set(
+        &mut config.memory.suggest_enabled,
+        &file.memory.suggest_enabled,
+        "memory.suggest_enabled",
+        source,
+        sources,
+    );
+    set(
+        &mut config.memory.top_k,
+        &file.memory.top_k,
+        "memory.top_k",
+        source,
+        sources,
+    );
+    set(
+        &mut config.memory.injection_token_budget,
+        &file.memory.injection_token_budget,
+        "memory.injection_token_budget",
+        source,
+        sources,
+    );
+    if let Some(profiles) = &file.agent.profiles {
+        let mut converted = Vec::new();
+        for (id, file_profile) in profiles {
+            converted.push(file_profile.clone().into_profile(id.clone())?);
+        }
+        if source == ConfigSource::Project {
+            config.agent.profiles.extend(converted);
+        } else {
+            config.agent.profiles = converted;
+        }
+        sources.insert("agent.profiles".into(), source);
+    }
+    Ok(())
 }
 
 fn validate_project_trust(
@@ -428,6 +779,39 @@ fn validate_project_trust(
             )));
         }
     }
+    if let Some(commands) = &project.agent.commands
+        && commands
+            .allow
+            .as_ref()
+            .is_some_and(|allow| !allow.is_empty())
+    {
+        return Err(config_error(format!(
+            "项目配置 {} 不能设置 agent.commands.allow；项目只能追加 deny 与 ask 规则。",
+            path.display()
+        )));
+    }
+    if let Some(skills) = &project.agent.skills
+        && skills != "deny"
+    {
+        return Err(config_error(format!(
+            "项目配置 {} 只能把 agent.skills 收紧为 deny。",
+            path.display()
+        )));
+    }
+    if let Some(profiles) = &project.agent.profiles {
+        for (id, profile) in profiles {
+            if profile
+                .permission
+                .as_deref()
+                .is_some_and(|value| value != "read-only")
+            {
+                return Err(config_error(format!(
+                    "项目配置 {} 的档案 {id} 只能使用只读权限（permission = \"read-only\"）。",
+                    path.display()
+                )));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -458,12 +842,24 @@ fn env_file(provider: &str) -> FileConfig {
                 "XYCLI_MIN_REQUEST_INTERVAL_MS",
             )
             .and_then(|value| value.parse().ok()),
+            temperature: value("XDUDU_TEMPERATURE", "XYCLI_TEMPERATURE")
+                .and_then(|value| value.parse().ok()),
+            max_output_tokens: value("XDUDU_MAX_OUTPUT_TOKENS", "XYCLI_MAX_OUTPUT_TOKENS")
+                .and_then(|value| value.parse().ok()),
+            reasoning: value("XDUDU_REASONING", "XYCLI_REASONING")
+                .and_then(|value| value.parse().ok()),
         },
         agent: FileAgent {
             max_turns: value("XDUDU_MAX_TURNS", "XYCLI_MAX_TURNS")
                 .and_then(|value| value.parse().ok()),
             permission: value("XDUDU_PERMISSION", "XYCLI_PERMISSION"),
             approval: value("XDUDU_APPROVAL", "XYCLI_APPROVAL"),
+            stalled_recovery: value("XDUDU_STALLED_RECOVERY", "XYCLI_STALLED_RECOVERY"),
+            stalled_max_recovery: value("XDUDU_STALLED_MAX_RECOVERY", "XYCLI_STALLED_MAX_RECOVERY")
+                .and_then(|value| value.parse().ok()),
+            commands: None,
+            skills: value("XDUDU_SKILLS", "XYCLI_SKILLS"),
+            profiles: None,
         },
         output: FileOutput {
             json: value("XDUDU_JSON", "XYCLI_JSON").and_then(|value| value.parse().ok()),
@@ -477,14 +873,31 @@ fn env_file(provider: &str) -> FileConfig {
             enabled: value("XDUDU_TELEMETRY_ENABLED", "XYCLI_TELEMETRY_ENABLED")
                 .and_then(|value| value.parse().ok()),
         },
+        memory: FileMemory {
+            suggest_enabled: value(
+                "XDUDU_MEMORY_SUGGEST_ENABLED",
+                "XYCLI_MEMORY_SUGGEST_ENABLED",
+            )
+            .and_then(|value| value.parse().ok()),
+            top_k: value("XDUDU_MEMORY_TOP_K", "XYCLI_MEMORY_TOP_K")
+                .and_then(|value| value.parse().ok()),
+            injection_token_budget: value(
+                "XDUDU_MEMORY_INJECTION_BUDGET",
+                "XYCLI_MEMORY_INJECTION_BUDGET",
+            )
+            .and_then(|value| value.parse().ok()),
+        },
     }
 }
 
 fn validate(config: &mut AppConfig, model_was_explicit: bool) -> XduduResult<()> {
     config.provider.name = config.provider.name.to_ascii_lowercase();
-    if !matches!(config.provider.name.as_str(), "anthropic" | "deepseek") {
+    if !matches!(
+        config.provider.name.as_str(),
+        "anthropic" | "deepseek" | "openai-compatible"
+    ) {
         return Err(config_error(format!(
-            "不支持的 Provider：{}。可选值：anthropic、deepseek。",
+            "不支持的 Provider：{}。可选值：anthropic、deepseek、openai-compatible。",
             config.provider.name
         )));
     }
@@ -507,6 +920,16 @@ fn validate(config: &mut AppConfig, model_was_explicit: bool) -> XduduResult<()>
     if !(1..=10).contains(&config.provider.max_attempts) {
         return Err(config_error("provider.max_attempts 必须是 1 到 10。"));
     }
+    if !(config.provider.temperature.is_finite()
+        && (0.0..=2.0).contains(&config.provider.temperature))
+    {
+        return Err(config_error("provider.temperature 必须是 0.0 到 2.0。"));
+    }
+    if !(1..=32_768).contains(&config.provider.max_output_tokens) {
+        return Err(config_error(
+            "provider.max_output_tokens 必须是 1 到 32768。",
+        ));
+    }
     if !(10..=30_000).contains(&config.provider.retry_base_ms) {
         return Err(config_error("provider.retry_base_ms 必须是 10 到 30000。"));
     }
@@ -517,6 +940,35 @@ fn validate(config: &mut AppConfig, model_was_explicit: bool) -> XduduResult<()>
     }
     config.agent.permission.parse::<PermissionMode>()?;
     config.agent.approval.parse::<ApprovalMode>()?;
+    config
+        .agent
+        .stalled_recovery
+        .parse::<StalledRecoveryMode>()?;
+    if !(1..=10).contains(&config.agent.stalled_max_recovery) {
+        return Err(config_error("agent.stalled_max_recovery 必须是 1 到 10。"));
+    }
+    for (tier, rules) in [
+        ("allow", &config.agent.commands.allow),
+        ("ask", &config.agent.commands.ask),
+        ("deny", &config.agent.commands.deny),
+    ] {
+        for rule in rules {
+            if !valid_command_rule(rule) {
+                return Err(config_error(format!(
+                    "agent.commands.{tier} 规则“{rule}”无效：必须是「可执行名」或「可执行名 + 单个参数」，且不能包含路径、空格或 shell 元字符。"
+                )));
+            }
+        }
+    }
+    config.agent.skills_mode()?;
+    if !(1..=32).contains(&config.memory.top_k) {
+        return Err(config_error("memory.top_k 必须是 1 到 32。"));
+    }
+    if !(128..=8192).contains(&config.memory.injection_token_budget) {
+        return Err(config_error(
+            "memory.injection_token_budget 必须是 128 到 8192。",
+        ));
+    }
     if let Some(base_url) = &config.provider.base_url
         && !(base_url.starts_with("https://")
             || base_url.starts_with("http://127.0.0.1")
@@ -566,12 +1018,11 @@ fn load_config_from_paths(
             max_attempts: 3,
             retry_base_ms: 500,
             min_request_interval_ms: 0,
+            temperature: 0.2,
+            max_output_tokens: 4096,
+            reasoning: false,
         },
-        agent: AgentConfig {
-            max_turns: 25,
-            permission: "auto-safe".into(),
-            approval: "ask".into(),
-        },
+        agent: AgentConfig::default(),
         output: OutputConfig {
             json: false,
             no_stream: false,
@@ -579,6 +1030,11 @@ fn load_config_from_paths(
             debug_trace: false,
         },
         telemetry: TelemetryConfig { enabled: false },
+        memory: MemoryConfig {
+            suggest_enabled: false,
+            top_k: 8,
+            injection_token_budget: 1500,
+        },
     };
     let mut sources = [
         ("provider.name", ConfigSource::Default),
@@ -588,25 +1044,38 @@ fn load_config_from_paths(
         ("provider.max_attempts", ConfigSource::Default),
         ("provider.retry_base_ms", ConfigSource::Default),
         ("provider.min_request_interval_ms", ConfigSource::Default),
+        ("provider.temperature", ConfigSource::Default),
+        ("provider.max_output_tokens", ConfigSource::Default),
+        ("provider.reasoning", ConfigSource::Default),
         ("agent.max_turns", ConfigSource::Default),
         ("agent.permission", ConfigSource::Default),
         ("agent.approval", ConfigSource::Default),
+        ("agent.stalled_recovery", ConfigSource::Default),
+        ("agent.stalled_max_recovery", ConfigSource::Default),
+        ("agent.commands.allow", ConfigSource::Default),
+        ("agent.commands.ask", ConfigSource::Default),
+        ("agent.commands.deny", ConfigSource::Default),
+        ("agent.skills", ConfigSource::Default),
+        ("agent.profiles", ConfigSource::Default),
         ("output.json", ConfigSource::Default),
         ("output.no_stream", ConfigSource::Default),
         ("output.color", ConfigSource::Default),
         ("output.debug_trace", ConfigSource::Default),
         ("telemetry.enabled", ConfigSource::Default),
+        ("memory.suggest_enabled", ConfigSource::Default),
+        ("memory.top_k", ConfigSource::Default),
+        ("memory.injection_token_budget", ConfigSource::Default),
     ]
     .into_iter()
     .map(|(key, source)| (key.to_owned(), source))
     .collect::<BTreeMap<_, _>>();
 
     if let Some(file) = read_file(&user_path)? {
-        apply_file(&mut config, &file, ConfigSource::User, &mut sources);
+        apply_file(&mut config, &file, ConfigSource::User, &mut sources)?;
     }
     if let Some(file) = read_file(&project_path)? {
         validate_project_trust(&config, &file, &project_path)?;
-        apply_file(&mut config, &file, ConfigSource::Project, &mut sources);
+        apply_file(&mut config, &file, ConfigSource::Project, &mut sources)?;
     }
     let environment = fixed_environment.unwrap_or_else(|| env_file(&config.provider.name));
     apply_file(
@@ -614,7 +1083,7 @@ fn load_config_from_paths(
         &environment,
         ConfigSource::Environment,
         &mut sources,
-    );
+    )?;
     let model_was_explicit = overrides.model.is_some()
         || environment.provider.model.is_some()
         || sources.get("provider.model") != Some(&ConfigSource::Default);
@@ -627,11 +1096,19 @@ fn load_config_from_paths(
             max_attempts: None,
             retry_base_ms: None,
             min_request_interval_ms: None,
+            temperature: overrides.temperature,
+            max_output_tokens: overrides.max_output_tokens,
+            reasoning: overrides.reasoning,
         },
         agent: FileAgent {
             max_turns: overrides.max_turns,
             permission: overrides.permission,
             approval: overrides.approval,
+            stalled_recovery: overrides.stalled_recovery,
+            stalled_max_recovery: overrides.stalled_max_recovery,
+            commands: None,
+            skills: None,
+            profiles: None,
         },
         output: FileOutput {
             json: overrides.json,
@@ -642,8 +1119,13 @@ fn load_config_from_paths(
         telemetry: FileTelemetry {
             enabled: overrides.telemetry_enabled,
         },
+        memory: FileMemory {
+            suggest_enabled: overrides.memory_suggest_enabled,
+            top_k: None,
+            injection_token_budget: None,
+        },
     };
-    apply_file(&mut config, &cli, ConfigSource::Cli, &mut sources);
+    apply_file(&mut config, &cli, ConfigSource::Cli, &mut sources)?;
     validate(&mut config, model_was_explicit)?;
     Ok(ResolvedConfig {
         config,
@@ -706,21 +1188,35 @@ pub fn write_config_value(
                 | "provider.max_attempts"
                 | "provider.retry_base_ms"
                 | "provider.min_request_interval_ms"
+                | "provider.temperature"
+                | "provider.max_output_tokens"
+                | "provider.reasoning"
                 | "agent.max_turns"
                 | "agent.permission"
                 | "agent.approval"
+                | "agent.stalled_recovery"
+                | "agent.stalled_max_recovery"
+                | "agent.skills"
                 | "output.json"
                 | "output.no_stream"
                 | "output.color"
                 | "output.debug_trace"
                 | "telemetry.enabled"
+                | "memory.suggest_enabled"
+                | "memory.top_k"
+                | "memory.injection_token_budget"
         )
     {
         return Err(config_error(format!("不支持的配置项：{key}")));
     }
+    if !user && key == "agent.skills" && raw_value != "deny" {
+        return Err(config_error("项目配置只能把 agent.skills 收紧为 deny。"));
+    }
     match key {
-        "provider.name" if !matches!(raw_value, "anthropic" | "deepseek") => {
-            return Err(config_error("provider.name 只能是 anthropic 或 deepseek。"));
+        "provider.name" if !matches!(raw_value, "anthropic" | "deepseek" | "openai-compatible") => {
+            return Err(config_error(
+                "provider.name 只能是 anthropic、deepseek 或 openai-compatible。",
+            ));
         }
         "provider.model" if raw_value.trim().is_empty() => {
             return Err(config_error("provider.model 不能为空。"));
@@ -740,6 +1236,9 @@ pub fn write_config_value(
         "agent.approval" => {
             raw_value.parse::<ApprovalMode>()?;
         }
+        "agent.skills" if !matches!(raw_value, "allow" | "ask" | "deny") => {
+            return Err(config_error("agent.skills 只能是 allow、ask 或 deny。"));
+        }
         _ => {}
     }
     let parsed = if matches!(
@@ -748,7 +1247,11 @@ pub fn write_config_value(
             | "provider.max_attempts"
             | "provider.retry_base_ms"
             | "provider.min_request_interval_ms"
+            | "provider.max_output_tokens"
             | "agent.max_turns"
+            | "agent.stalled_max_recovery"
+            | "memory.top_k"
+            | "memory.injection_token_budget"
     ) {
         let number = raw_value
             .parse::<i64>()
@@ -759,13 +1262,34 @@ pub fn write_config_value(
             "provider.max_attempts" => (1..=10).contains(&number),
             "provider.retry_base_ms" => (10..=30_000).contains(&number),
             "provider.min_request_interval_ms" => (0..=60_000).contains(&number),
+            "provider.max_output_tokens" => (1..=32_768).contains(&number),
+            "agent.stalled_max_recovery" => (1..=10).contains(&number),
+            "memory.top_k" => (1..=32).contains(&number),
+            "memory.injection_token_budget" => (128..=8192).contains(&number),
             _ => false,
         };
         if !valid {
             return Err(config_error(format!("{key} 超出允许范围。")));
         }
         Value::Integer(number)
-    } else if key.starts_with("output.") || key == "telemetry.enabled" {
+    } else if key == "provider.temperature" {
+        let number = raw_value
+            .parse::<f64>()
+            .map_err(|_| config_error(format!("{key} 必须是数字。")))?;
+        if !number.is_finite() || !(0.0..=2.0).contains(&number) {
+            return Err(config_error(format!("{key} 必须在 0.0 到 2.0 之间。")));
+        }
+        Value::Float(number)
+    } else if key == "provider.reasoning" {
+        Value::Boolean(
+            raw_value
+                .parse()
+                .map_err(|_| config_error(format!("{key} 必须是 true 或 false。")))?,
+        )
+    } else if key.starts_with("output.")
+        || key == "telemetry.enabled"
+        || key == "memory.suggest_enabled"
+    {
         Value::Boolean(
             raw_value
                 .parse()
@@ -884,6 +1408,75 @@ mod tests {
         let resolved = load_config(root.path(), ConfigOverrides::default()).unwrap();
         assert!(resolved.config.output.debug_trace);
         assert!(write_config_value(root.path(), false, "api_key", "secret").is_err());
+    }
+
+    #[test]
+    fn 项目配置不能追加命令allow但可追加ask与deny() {
+        let root = tempdir().unwrap();
+        let project = root.path().join(".xdudu/config.toml");
+        fs::create_dir_all(root.path().join(".xdudu")).unwrap();
+        let load = || {
+            load_config_from_paths(
+                root.path(),
+                root.path().join("missing-user.toml"),
+                project.clone(),
+                ConfigOverrides::default(),
+                Some(FileConfig::default()),
+            )
+        };
+
+        fs::write(&project, "[agent.commands]\nallow=['cargo run']\n").unwrap();
+        assert!(load().is_err());
+
+        fs::write(
+            &project,
+            "[agent.commands]\nask=['cargo run']\ndeny=['dd']\n",
+        )
+        .unwrap();
+        let resolved = load().unwrap();
+        assert!(
+            resolved
+                .config
+                .agent
+                .commands
+                .ask
+                .contains(&"cargo run".to_owned())
+        );
+        assert!(
+            resolved
+                .config
+                .agent
+                .commands
+                .deny
+                .contains(&"dd".to_owned())
+        );
+        // 默认 deny 保留。
+        assert!(
+            resolved
+                .config
+                .agent
+                .commands
+                .deny
+                .contains(&"sudo".to_owned())
+        );
+    }
+
+    #[test]
+    fn 非法命令规则被拒绝() {
+        let root = tempdir().unwrap();
+        fs::create_dir_all(root.path().join(".xdudu")).unwrap();
+        fs::write(
+            root.path().join(".xdudu/config.toml"),
+            "[agent.commands]\nallow=['cargo run --release']\n",
+        )
+        .unwrap();
+        assert!(load_config(root.path(), ConfigOverrides::default()).is_err());
+        fs::write(
+            root.path().join(".xdudu/config.toml"),
+            "[agent.commands]\nallow=['/bin/ls']\n",
+        )
+        .unwrap();
+        assert!(load_config(root.path(), ConfigOverrides::default()).is_err());
     }
 
     #[test]

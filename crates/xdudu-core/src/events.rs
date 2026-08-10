@@ -77,6 +77,26 @@ pub enum AgentEvent {
     PlanCompleted {
         plan_id: Uuid,
     },
+    /// 检测到主循环停滞：重复失败或无进展。
+    StalledRecovery {
+        repeats: usize,
+        tool_names: Vec<String>,
+        recovery: String,
+    },
+    /// 技能加载成功（索引与正文注入当前轮系统提示词）。
+    SkillLoaded {
+        name: String,
+    },
+    /// 子代理开始执行（隔离上下文，不写父会话历史）。
+    SubagentStarted {
+        agent_id: String,
+        prompt: String,
+    },
+    /// 子代理执行结束（结果转为普通 ToolResult）。
+    SubagentFinished {
+        agent_id: String,
+        result: ToolResult,
+    },
 }
 
 impl AgentEvent {
@@ -199,6 +219,33 @@ impl AgentEvent {
             Self::PlanCompleted { plan_id } => {
                 ("plan_completed", "计划完成", json!({"planId": plan_id}))
             }
+            Self::StalledRecovery {
+                repeats,
+                tool_names,
+                ..
+            } => (
+                "stalled_recovery",
+                "检测到停滞并注入恢复指令",
+                json!({
+                    "repeats": repeats,
+                    "toolNames": tool_names,
+                }),
+            ),
+            Self::SkillLoaded { name } => ("skill_loaded", "技能加载成功", json!({"name": name})),
+            Self::SubagentStarted { agent_id, prompt } => (
+                "subagent_started",
+                "子代理开始执行",
+                json!({"agentId": agent_id, "promptChars": prompt.chars().count()}),
+            ),
+            Self::SubagentFinished { agent_id, result } => (
+                "subagent_finished",
+                "子代理执行结束",
+                json!({
+                    "agentId": agent_id,
+                    "success": result.success,
+                    "errorCode": result.error.as_ref().map(|error| error.code.as_str()),
+                }),
+            ),
         };
         Some(json!({
             "type": "debug_trace",

@@ -126,6 +126,7 @@ impl AnthropicProvider {
             tool_calls,
             usage,
             finish_reason,
+            reasoning: None,
         })
     }
 }
@@ -374,6 +375,7 @@ impl Provider for AnthropicProvider {
             tool_calls,
             usage,
             finish_reason,
+            reasoning: None,
         })
     }
 }

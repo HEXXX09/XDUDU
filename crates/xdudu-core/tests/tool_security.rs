@@ -5,7 +5,8 @@ use tempfile::tempdir;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use xdudu_core::{
-    AllowAllApprovalGate, JsonChangeLedger, PermissionMode, ToolRegistry, register_builtins,
+    AllowAllApprovalGate, JsonChangeLedger, PermissionMode, ToolRegistry, WebReadTool,
+    register_builtins,
 };
 
 async fn execute(
@@ -31,6 +32,24 @@ fn registry() -> ToolRegistry {
     let mut registry = ToolRegistry::with_approval_gate(Arc::new(AllowAllApprovalGate));
     register_builtins(&mut registry).unwrap();
     registry
+}
+
+#[tokio::test]
+async fn web_read_拒绝回环地址且不会发起请求() {
+    let dir = tempdir().unwrap();
+    let mut registry = ToolRegistry::with_approval_gate(Arc::new(AllowAllApprovalGate));
+    registry
+        .register(WebReadTool::new(None, "test-model".into(), 0.0, 128, false))
+        .unwrap();
+    let result = execute(
+        &registry,
+        "web_read",
+        json!({"url":"https://127.0.0.1/private","goal":"读取内容"}),
+        dir.path(),
+        PermissionMode::FullAccess,
+    )
+    .await;
+    assert_eq!(result.error.unwrap().code, "WEB_BLOCKED");
 }
 
 #[tokio::test]
@@ -82,7 +101,67 @@ async fn auto_safe_白名单命令豁免审批() {
 }
 
 #[tokio::test]
-async fn auto_safe_非白名单不经审批直接拒绝() {
+async fn portable_内建命令不依赖系统shell() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("visible.txt"), "visible").unwrap();
+    fs::write(dir.path().join(".hidden.txt"), "hidden").unwrap();
+    let mut registry = ToolRegistry::new();
+    register_builtins(&mut registry).unwrap();
+
+    let echo = execute(
+        &registry,
+        "terminal_exec",
+        json!({"command":"echo","args":["hello","XDUDU"]}),
+        dir.path(),
+        PermissionMode::AutoSafe,
+    )
+    .await;
+    assert!(echo.success);
+    assert_eq!(echo.output.as_ref().unwrap()["stdout"], "hello XDUDU\n");
+
+    let listing = execute(
+        &registry,
+        "terminal_exec",
+        json!({"command":"ls"}),
+        dir.path(),
+        PermissionMode::AutoSafe,
+    )
+    .await;
+    assert!(listing.success);
+    let stdout = listing.output.as_ref().unwrap()["stdout"].as_str().unwrap();
+    assert!(stdout.contains("visible.txt"));
+    assert!(!stdout.contains(".hidden.txt"));
+
+    let listing_all = execute(
+        &registry,
+        "terminal_exec",
+        json!({"command":"ls","args":["-a"]}),
+        dir.path(),
+        PermissionMode::AutoSafe,
+    )
+    .await;
+    assert!(listing_all.success);
+    assert!(
+        listing_all.output.as_ref().unwrap()["stdout"]
+            .as_str()
+            .unwrap()
+            .contains(".hidden.txt")
+    );
+
+    let unsupported = execute(
+        &registry,
+        "terminal_exec",
+        json!({"command":"ls","args":["--color=always"]}),
+        dir.path(),
+        PermissionMode::AutoSafe,
+    )
+    .await;
+    assert_eq!(unsupported.error.unwrap().code, "UNSAFE_COMMAND");
+    assert!(unsupported.approval.is_none());
+}
+
+#[tokio::test]
+async fn auto_safe_非白名单命令进入审批门() {
     let dir = tempdir().unwrap();
     let mut registry = ToolRegistry::new();
     register_builtins(&mut registry).unwrap();
@@ -94,7 +173,25 @@ async fn auto_safe_非白名单不经审批直接拒绝() {
         PermissionMode::AutoSafe,
     )
     .await;
-    // 应在执行阶段 UNSAFE_COMMAND，而不是先弹审批再被 DenyAll 拒。
+    // 三档策略下未匹配命令属于 ask 档：进入审批门；DenyAll 默认拒绝。
+    assert_eq!(result.error.unwrap().code, "APPROVAL_DENIED");
+    assert!(result.approval.is_some());
+}
+
+#[tokio::test]
+async fn auto_safe_命中deny规则立即拒绝() {
+    let dir = tempdir().unwrap();
+    let mut registry = ToolRegistry::new();
+    register_builtins(&mut registry).unwrap();
+    let result = execute(
+        &registry,
+        "terminal_exec",
+        json!({"command": "sudo", "args": ["apt", "update"]}),
+        dir.path(),
+        PermissionMode::AutoSafe,
+    )
+    .await;
+    // deny 档：在执行阶段拒绝，不弹审批。
     assert_eq!(result.error.unwrap().code, "UNSAFE_COMMAND");
     assert!(result.approval.is_none());
 }
@@ -342,15 +439,19 @@ async fn auto_safe_允许_pwd_并拒绝任意命令() {
         fs::canonicalize(dir.path()).unwrap()
     );
 
+    let mut deny_registry = ToolRegistry::new();
+    register_builtins(&mut deny_registry).unwrap();
     let node = execute(
-        &registry,
+        &deny_registry,
         "terminal_exec",
         json!({"command":"node","args":["--version"]}),
         dir.path(),
         PermissionMode::AutoSafe,
     )
     .await;
-    assert_eq!(node.error.unwrap().code, "UNSAFE_COMMAND");
+    // 未匹配命令为 ask 档，DenyAll 审批拒绝（不依赖外部可执行文件）。
+    assert_eq!(node.error.unwrap().code, "APPROVAL_DENIED");
+    assert!(node.approval.is_some());
 }
 
 #[tokio::test]

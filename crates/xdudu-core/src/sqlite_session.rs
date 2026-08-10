@@ -162,6 +162,7 @@ impl SqliteSessionStore {
         migrate_plan_schema_v3(&mut connection)?;
         migrate_plan_schema_v4(&mut connection)?;
         migrate_memory_schema_v5(&mut connection)?;
+        migrate_reasoning_schema_v6(&mut connection)?;
         self.import_json_sessions(&mut connection, cwd)?;
         self.recover_interrupted_sessions(&mut connection)?;
         Ok(())
@@ -301,6 +302,7 @@ impl SqliteSessionStore {
                         role: MessageRole::Tool,
                         content: "Error: 上次进程在工具完成前退出，执行结果未知，不会自动重试。"
                             .into(),
+                        reasoning: None,
                         tool_calls: Vec::new(),
                         tool_call_id: Some(call_id),
                         sequence: session.messages.len(),
@@ -509,6 +511,33 @@ fn migrate_memory_schema_v5(connection: &mut Connection) -> XduduResult<()> {
             ",
         )
         .map_err(|error| XduduError::tool(format!("初始化记忆表失败：{error}")))?;
+    Ok(())
+}
+
+/// Schema v6：内部推理（reasoning）字段。
+///
+/// 无需新增表或列：`sessions.session_json` 内嵌 `Message` 序列化增加
+/// `reasoning` 字段（`#[serde(default, skip_serializing_if)]`），旧 JSON 与
+/// 旧会话可无缝读取。迁移仅记录版本号。
+fn migrate_reasoning_schema_v6(connection: &mut Connection) -> XduduResult<()> {
+    let applied = connection
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version = 6",
+            [],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|error| XduduError::tool(format!("检查推理迁移状态失败：{error}")))?
+        .is_some();
+    if applied {
+        return Ok(());
+    }
+    connection
+        .execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (6, CURRENT_TIMESTAMP)",
+            [],
+        )
+        .map_err(|error| XduduError::tool(format!("记录推理 Schema v6 迁移失败：{error}")))?;
     Ok(())
 }
 
@@ -1637,6 +1666,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sqlite_v6_推理字段迁移仅记录版本且旧会话可读() {
+        let dir = tempdir().unwrap();
+        let (session, plan) = {
+            let store = SqliteSessionStore::new(dir.path()).unwrap();
+            let session = sample_session(dir.path());
+            store.create(&session).await.unwrap();
+            let plan = sample_plan(session.id);
+            store.create_plan(&plan).await.unwrap();
+            (session, plan)
+        };
+        {
+            let connection = Connection::open(dir.path().join(DATABASE_PATH)).unwrap();
+            connection
+                .execute("DELETE FROM schema_migrations WHERE version = 6", [])
+                .unwrap();
+        }
+        {
+            // 重新打开触发 v6 迁移；无表结构变化，会话 JSON 可继续读取。
+            let store = SqliteSessionStore::new(dir.path()).unwrap();
+            let loaded = store.get(session.id).await.unwrap().unwrap();
+            assert_eq!(loaded.id, session.id);
+            assert_eq!(store.get_plan(plan.id).await.unwrap().unwrap().id, plan.id);
+            let connection = Connection::open(dir.path().join(DATABASE_PATH)).unwrap();
+            let applied: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM schema_migrations WHERE version = 6",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(applied, 1);
+        }
+    }
+
+    #[tokio::test]
     async fn sqlite_v2_计划自动升级并回填_revision_1() {
         let dir = tempdir().unwrap();
         let (session, plan) = {
@@ -1765,6 +1829,7 @@ mod tests {
             id: Uuid::new_v4(),
             role: MessageRole::User,
             content: "secret sk-abcdefghijklmnopqrstuvwxyz".into(),
+            reasoning: None,
             tool_calls: Vec::new(),
             tool_call_id: None,
             sequence: 0,

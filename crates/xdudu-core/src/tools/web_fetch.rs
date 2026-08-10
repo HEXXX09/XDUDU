@@ -243,7 +243,7 @@ pub(crate) async fn pinned_client(url: &Url, timeout: Duration) -> Result<Client
         .map_err(|error| format!("创建 HTTPS 客户端失败：{error}"))
 }
 
-fn content_kind(content_type: &str) -> Option<&'static str> {
+pub(crate) fn content_kind(content_type: &str) -> Option<&'static str> {
     let mime = content_type
         .split(';')
         .next()
@@ -268,7 +268,7 @@ fn strip_element(mut html: String, tag: &str) -> String {
         .unwrap_or_else(|_| std::mem::take(&mut html))
 }
 
-fn html_text(bytes: &[u8]) -> (Option<String>, String) {
+pub(crate) fn html_text(bytes: &[u8]) -> (Option<String>, String) {
     let mut source = String::from_utf8_lossy(bytes).into_owned();
     for tag in ["script", "style", "noscript", "svg"] {
         source = strip_element(source, tag);

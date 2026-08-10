@@ -55,6 +55,10 @@ pub struct Message {
     pub id: Uuid,
     pub role: MessageRole,
     pub content: String,
+    /// 内部推理内容（仅思考路径启用时填充）。从不进入公开输出，
+    /// 仅用于本会话内回传给 Provider 以维持思考闭环。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCall>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -69,6 +73,7 @@ impl Message {
             id: Uuid::new_v4(),
             role,
             content: content.into(),
+            reasoning: None,
             tool_calls: Vec::new(),
             tool_call_id: None,
             sequence,
@@ -173,6 +178,16 @@ impl Session {
     pub fn touch(&mut self) {
         self.updated_at = Utc::now();
     }
+
+    /// 返回可公开展示的会话副本。内部推理只用于 Provider 工具闭环，
+    /// 不进入 session show、导出或其他面向用户的结构化输出。
+    pub fn public_snapshot(&self) -> Self {
+        let mut public = self.clone();
+        for message in &mut public.messages {
+            message.reasoning = None;
+        }
+        public
+    }
 }
 
 pub(crate) fn sanitized_session(session: &Session) -> Session {
@@ -181,6 +196,7 @@ pub(crate) fn sanitized_session(session: &Session) -> Session {
     sanitized.context_summary = redact_text(&sanitized.context_summary);
     for message in &mut sanitized.messages {
         message.content = redact_text(&message.content);
+        message.reasoning = message.reasoning.as_deref().map(redact_text);
         for call in &mut message.tool_calls {
             call.input = redact_value(&call.input);
         }
@@ -384,6 +400,7 @@ mod tests {
             id: Uuid::new_v4(),
             role: MessageRole::User,
             content: "请使用 sk-abcdefghijklmnopqrstuvwxyz".into(),
+            reasoning: Some("内部也出现 sk-abcdefghijklmnopqrstuvwxyz".into()),
             tool_calls: Vec::new(),
             tool_call_id: None,
             sequence: 0,
@@ -395,6 +412,32 @@ mod tests {
             .unwrap();
         assert!(!raw.contains("sk-abcdefghijklmnopqrstuvwxyz"));
         assert!(raw.contains("[已脱敏]"));
+    }
+
+    #[test]
+    fn 公开会话快照移除内部推理() {
+        let dir = tempdir().unwrap();
+        let mut session = sample_session(dir.path());
+        session.messages.push(Message {
+            id: Uuid::new_v4(),
+            role: MessageRole::Assistant,
+            content: "公开结论".into(),
+            reasoning: Some("不得公开的内部推理".into()),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            sequence: 1,
+            created_at: Utc::now(),
+        });
+        let public = session.public_snapshot();
+        let encoded = serde_json::to_string(&public).unwrap();
+        assert!(encoded.contains("公开结论"));
+        assert!(!encoded.contains("不得公开的内部推理"));
+        assert!(
+            public
+                .messages
+                .iter()
+                .all(|message| message.reasoning.is_none())
+        );
     }
 
     #[tokio::test]

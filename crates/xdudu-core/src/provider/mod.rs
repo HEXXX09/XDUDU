@@ -3,6 +3,8 @@
 mod anthropic;
 mod deepseek;
 mod factory;
+mod openai_compatible;
+mod openai_wire;
 mod retry;
 mod stream;
 
@@ -19,6 +21,7 @@ use crate::error::{ErrorKind, XduduError, XduduResult};
 pub use anthropic::AnthropicProvider;
 pub use deepseek::DeepSeekProvider;
 pub use factory::{DefaultProviderFactory, ProviderFactory};
+pub use openai_compatible::OpenAiCompatibleProvider;
 pub use retry::RetryingProvider;
 pub use stream::{ProviderStreamEvent, ProviderStreamSink};
 
@@ -35,6 +38,9 @@ pub enum MessageRole {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
     Text {
+        text: String,
+    },
+    Thinking {
         text: String,
     },
     ToolUse {
@@ -123,6 +129,8 @@ pub struct ProviderRequest {
     pub system: String,
     pub temperature: f32,
     pub max_output_tokens: u32,
+    /// 是否启用内部思考闭环（reasoning_content 解析、持久化与回传）。
+    pub reasoning: bool,
     pub cancellation: CancellationToken,
 }
 
@@ -141,6 +149,16 @@ pub struct ProviderResponse {
     pub tool_calls: Vec<ToolCall>,
     pub usage: TokenUsage,
     pub finish_reason: FinishReason,
+    /// 内部推理内容（仅思考路径启用时填充），不进入公开文本。
+    pub reasoning: Option<String>,
+}
+
+impl ProviderResponse {
+    /// 兼容构造：无内部推理。
+    pub fn with_reasoning(mut self, reasoning: Option<String>) -> Self {
+        self.reasoning = reasoning;
+        self
+    }
 }
 
 #[async_trait]

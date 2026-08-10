@@ -1,23 +1,18 @@
 //! DeepSeek 的 OpenAI Chat Completions 兼容适配器。
+//!
+//! 复用 [`super::openai_wire::OpenAiWire`] 的实现；与通用 `openai-compatible`
+//! 的差异仅是 DeepSeek V4 系列在思考关闭时需显式发送 `thinking.disabled`。
 
-use std::{collections::BTreeMap, env, time::Duration};
+use std::{env, time::Duration};
 
 use async_trait::async_trait;
-use futures_util::StreamExt;
-use reqwest::Client;
-use serde_json::{Value, json};
 
-use super::{
-    ContentBlock, FinishReason, MessageContent, MessageRole, Provider, ProviderMessage,
-    ProviderRequest, ProviderResponse, ProviderStreamEvent, ProviderStreamSink, TokenUsage,
-    ToolCall, http_client, parse_http_response,
-};
+use super::{Provider, ProviderRequest, ProviderStreamSink, openai_wire::OpenAiWire};
 use crate::error::{XduduError, XduduResult};
 
+/// DeepSeek 的 OpenAI Chat Completions 兼容适配器。
 pub struct DeepSeekProvider {
-    api_key: String,
-    base_url: String,
-    client: Client,
+    wire: OpenAiWire,
 }
 
 impl DeepSeekProvider {
@@ -40,173 +35,23 @@ impl DeepSeekProvider {
         timeout: Duration,
     ) -> XduduResult<Self> {
         Ok(Self {
-            api_key: api_key.into(),
-            base_url: base_url.into().trim_end_matches('/').to_owned(),
-            client: http_client(timeout)?,
+            wire: OpenAiWire::new(api_key, base_url, timeout, "DeepSeek")?,
         })
     }
 
-    fn openai_messages(request: &ProviderRequest) -> XduduResult<Vec<Value>> {
-        let mut output = vec![json!({ "role": "system", "content": request.system })];
-        for message in &request.messages {
-            match &message.content {
-                MessageContent::Text(content) => output.push(json!({
-                    "role": message.role,
-                    "content": content,
-                })),
-                MessageContent::Blocks(blocks) => {
-                    let mut text = String::new();
-                    let mut tool_calls = Vec::new();
-                    let mut tool_results = Vec::new();
-                    for block in blocks {
-                        match block {
-                            ContentBlock::Text { text: block_text } => text.push_str(block_text),
-                            ContentBlock::ToolUse { id, name, input } => tool_calls.push(json!({
-                                "id": id,
-                                "type": "function",
-                                "function": { "name": name, "arguments": serde_json::to_string(input)? }
-                            })),
-                            ContentBlock::ToolResult {
-                                tool_use_id,
-                                content,
-                                ..
-                            } => {
-                                tool_results.push(json!({
-                                    "role": "tool",
-                                    "tool_call_id": tool_use_id,
-                                    "content": content,
-                                }));
-                            }
-                        }
-                    }
-                    if !tool_calls.is_empty() {
-                        output.push(json!({
-                            "role": "assistant",
-                            "content": if text.is_empty() { Value::Null } else { Value::String(text) },
-                            "tool_calls": tool_calls,
-                        }));
-                    } else if !tool_results.is_empty() {
-                        output.extend(tool_results);
-                    } else {
-                        output.push(json!({ "role": message.role, "content": text }));
-                    }
-                }
-            }
-        }
-        Ok(output)
+    #[cfg(test)]
+    fn openai_messages(request: &ProviderRequest) -> XduduResult<Vec<serde_json::Value>> {
+        OpenAiWire::openai_messages(request)
     }
 
-    fn request_body(request: &ProviderRequest) -> XduduResult<Value> {
-        let tools = request
-            .tools
-            .iter()
-            .map(|tool| {
-                json!({
-                    "type": "function",
-                    "function": {
-                        "name": tool.name,
-                        "description": tool.description,
-                        "parameters": tool.input_schema,
-                    }
-                })
-            })
-            .collect::<Vec<_>>();
-        let mut body = json!({
-            "model": request.model,
-            "messages": Self::openai_messages(request)?,
-            "tools": tools,
-            "temperature": request.temperature,
-            "max_tokens": request.max_output_tokens,
-        });
-        if matches!(
-            request.model.as_str(),
-            "deepseek-v4-flash" | "deepseek-v4-pro"
-        ) {
-            // V4 默认启用思考模式。XDUDU 当前公开边界不保存原始思维链，
-            // 因此明确关闭思考，避免工具调用后因无法回传 reasoning_content 而失败。
-            body["thinking"] = json!({ "type": "disabled" });
-        }
-        Ok(body)
+    #[cfg(test)]
+    fn request_body(request: &ProviderRequest) -> XduduResult<serde_json::Value> {
+        OpenAiWire::request_body(request)
     }
 
-    fn parse_response(value: Value) -> XduduResult<ProviderResponse> {
-        let choice = value
-            .pointer("/choices/0")
-            .ok_or_else(|| XduduError::provider("DeepSeek 响应缺少 choices[0]。", false))?;
-        let message = choice
-            .get("message")
-            .ok_or_else(|| XduduError::provider("DeepSeek 响应缺少 message。", false))?;
-        let mut blocks = Vec::new();
-        if let Some(content) = message.get("content").and_then(Value::as_str)
-            && !content.is_empty()
-        {
-            blocks.push(ContentBlock::Text {
-                text: content.to_owned(),
-            });
-        }
-        let mut tool_calls = Vec::new();
-        for call in message
-            .get("tool_calls")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            let id = call
-                .get("id")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned();
-            let name = call
-                .pointer("/function/name")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned();
-            let arguments = call
-                .pointer("/function/arguments")
-                .and_then(Value::as_str)
-                .unwrap_or("{}");
-            let input: Value = serde_json::from_str(arguments).map_err(|error| {
-                XduduError::provider(format!("DeepSeek 工具参数不是有效 JSON：{error}"), false)
-            })?;
-            blocks.push(ContentBlock::ToolUse {
-                id: id.clone(),
-                name: name.clone(),
-                input: input.clone(),
-            });
-            tool_calls.push(ToolCall { id, name, input });
-        }
-        let finish_reason = match choice.get("finish_reason").and_then(Value::as_str) {
-            Some("tool_calls") => FinishReason::ToolCalls,
-            Some("length") => FinishReason::Length,
-            Some("content_filter") => FinishReason::ContentFilter,
-            Some("stop") | None => FinishReason::Stop,
-            _ => FinishReason::Error,
-        };
-        let usage = TokenUsage {
-            input_tokens: value
-                .pointer("/usage/prompt_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-            output_tokens: value
-                .pointer("/usage/completion_tokens")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-            ..TokenUsage::default()
-        };
-        let content = if blocks.is_empty() {
-            MessageContent::Text(String::new())
-        } else {
-            MessageContent::Blocks(blocks)
-        };
-        Ok(ProviderResponse {
-            message: ProviderMessage {
-                role: MessageRole::Assistant,
-                content,
-            },
-            tool_calls,
-            usage,
-            finish_reason,
-        })
+    #[cfg(test)]
+    fn parse_response(value: serde_json::Value) -> XduduResult<super::ProviderResponse> {
+        OpenAiWire::parse_response(value, "DeepSeek")
     }
 }
 
@@ -216,187 +61,26 @@ impl Provider for DeepSeekProvider {
         "deepseek"
     }
 
-    async fn chat(&self, request: ProviderRequest) -> XduduResult<ProviderResponse> {
-        let body = Self::request_body(&request)?;
-        let send = self
-            .client
-            .post(format!("{}/chat/completions", self.base_url))
-            .bearer_auth(&self.api_key)
-            .json(&body)
-            .send();
-        let response = tokio::select! {
-            _ = request.cancellation.cancelled() => return Err(XduduError::provider("DeepSeek 请求已中断。", false)),
-            response = send => response.map_err(|error| XduduError::provider(format!("DeepSeek 请求失败：{error}"), error.is_timeout() || error.is_connect()))?,
-        };
-        Self::parse_response(parse_http_response(response, "DeepSeek").await?)
+    async fn chat(&self, request: ProviderRequest) -> XduduResult<super::ProviderResponse> {
+        self.wire.chat(request).await
     }
 
     async fn stream_chat(
         &self,
         request: ProviderRequest,
         sink: &dyn ProviderStreamSink,
-    ) -> XduduResult<ProviderResponse> {
-        let mut body = Self::request_body(&request)?;
-        body["stream"] = Value::Bool(true);
-        body["stream_options"] = json!({ "include_usage": true });
-        let send = self
-            .client
-            .post(format!("{}/chat/completions", self.base_url))
-            .bearer_auth(&self.api_key)
-            .json(&body)
-            .send();
-        let response = tokio::select! {
-            _ = request.cancellation.cancelled() => return Err(XduduError::provider("DeepSeek 请求已中断。", false)),
-            response = send => response.map_err(|error| XduduError::provider(format!("DeepSeek 请求失败：{error}"), error.is_timeout() || error.is_connect()))?,
-        };
-        if !response.status().is_success() {
-            return Err(parse_http_response(response, "DeepSeek").await.unwrap_err());
-        }
-
-        #[derive(Debug, Default)]
-        struct ToolAccumulator {
-            id: String,
-            name: String,
-            arguments: String,
-        }
-
-        let mut decoder = super::stream::SseDecoder::default();
-        let mut chunks = response.bytes_stream();
-        let mut text = String::new();
-        let mut tools = BTreeMap::<usize, ToolAccumulator>::new();
-        let mut usage = TokenUsage::default();
-        let mut finish_reason = FinishReason::Stop;
-        let mut saw_done = false;
-        let mut emitted = false;
-
-        while let Some(chunk) = tokio::select! {
-            _ = request.cancellation.cancelled() => return Err(XduduError::provider("DeepSeek 流已中断。", false)),
-            chunk = chunks.next() => chunk,
-        } {
-            let chunk = chunk.map_err(|error| {
-                XduduError::provider(format!("读取 DeepSeek 流失败：{error}"), !emitted)
-            })?;
-            for data in decoder.push(&chunk)? {
-                if data == "[DONE]" {
-                    saw_done = true;
-                    continue;
-                }
-                let value: Value = serde_json::from_str(&data).map_err(|error| {
-                    XduduError::provider(format!("DeepSeek 流事件不是有效 JSON：{error}"), false)
-                })?;
-                if let Some(input_tokens) = value
-                    .pointer("/usage/prompt_tokens")
-                    .and_then(Value::as_u64)
-                {
-                    usage.input_tokens = input_tokens;
-                }
-                if let Some(output_tokens) = value
-                    .pointer("/usage/completion_tokens")
-                    .and_then(Value::as_u64)
-                {
-                    usage.output_tokens = output_tokens;
-                }
-                let Some(choice) = value.pointer("/choices/0") else {
-                    continue;
-                };
-                if let Some(delta) = choice.pointer("/delta/content").and_then(Value::as_str) {
-                    if !delta.is_empty() {
-                        emitted = true;
-                        text.push_str(delta);
-                        sink.emit(ProviderStreamEvent::TextDelta {
-                            text: delta.to_owned(),
-                        })
-                        .await;
-                    }
-                }
-                for call in choice
-                    .pointer("/delta/tool_calls")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                {
-                    let index = call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
-                    let accumulator = tools.entry(index).or_default();
-                    if let Some(id) = call.get("id").and_then(Value::as_str)
-                        && accumulator.id.is_empty()
-                    {
-                        accumulator.id.push_str(id);
-                    }
-                    if let Some(name) = call.pointer("/function/name").and_then(Value::as_str) {
-                        accumulator.name.push_str(name);
-                    }
-                    if let Some(arguments) =
-                        call.pointer("/function/arguments").and_then(Value::as_str)
-                    {
-                        accumulator.arguments.push_str(arguments);
-                    }
-                }
-                if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
-                    finish_reason = match reason {
-                        "tool_calls" => FinishReason::ToolCalls,
-                        "length" => FinishReason::Length,
-                        "content_filter" => FinishReason::ContentFilter,
-                        "stop" => FinishReason::Stop,
-                        _ => FinishReason::Error,
-                    };
-                }
-            }
-        }
-        for data in decoder.finish()? {
-            if data == "[DONE]" {
-                saw_done = true;
-            }
-        }
-        if !saw_done {
-            return Err(XduduError::provider(
-                "DeepSeek 流在 [DONE] 前结束。",
-                !emitted,
-            ));
-        }
-
-        let mut blocks = Vec::new();
-        if !text.is_empty() {
-            blocks.push(ContentBlock::Text { text });
-        }
-        let mut tool_calls = Vec::new();
-        for tool in tools.into_values() {
-            let input: Value = serde_json::from_str(if tool.arguments.is_empty() {
-                "{}"
-            } else {
-                &tool.arguments
-            })
-            .map_err(|error| {
-                XduduError::provider(
-                    format!("DeepSeek 流式工具参数不是有效 JSON：{error}"),
-                    false,
-                )
-            })?;
-            blocks.push(ContentBlock::ToolUse {
-                id: tool.id.clone(),
-                name: tool.name.clone(),
-                input: input.clone(),
-            });
-            tool_calls.push(ToolCall {
-                id: tool.id,
-                name: tool.name,
-                input,
-            });
-        }
-        Ok(ProviderResponse {
-            message: ProviderMessage {
-                role: MessageRole::Assistant,
-                content: MessageContent::Blocks(blocks),
-            },
-            tool_calls,
-            usage,
-            finish_reason,
-        })
+    ) -> XduduResult<super::ProviderResponse> {
+        self.wire.stream_chat(request, sink).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::{
+        ContentBlock, FinishReason, MessageContent, MessageRole, ProviderMessage,
+    };
+    use serde_json::json;
     use tokio_util::sync::CancellationToken;
 
     #[test]
@@ -431,6 +115,10 @@ mod tests {
         .unwrap();
         assert_eq!(response.message.text_content(), "这是最终结论");
         assert!(!response.message.text_content().contains("原始推理"));
+        assert_eq!(
+            response.reasoning.as_deref(),
+            Some("这里是不能公开的原始推理")
+        );
     }
 
     #[test]
@@ -450,6 +138,7 @@ mod tests {
             system: "system".into(),
             temperature: 0.2,
             max_output_tokens: 100,
+            reasoning: false,
             cancellation: CancellationToken::new(),
         };
         let messages = DeepSeekProvider::openai_messages(&request).unwrap();
@@ -458,7 +147,7 @@ mod tests {
     }
 
     #[test]
-    fn v4_请求显式关闭思考以兼容工具循环() {
+    fn v4_请求默认关闭思考以兼容工具循环() {
         let request = ProviderRequest {
             session_id: "s".into(),
             model: "deepseek-v4-pro".into(),
@@ -467,9 +156,30 @@ mod tests {
             system: "system".into(),
             temperature: 0.2,
             max_output_tokens: 100,
+            reasoning: false,
             cancellation: CancellationToken::new(),
         };
         let body = DeepSeekProvider::request_body(&request).unwrap();
         assert_eq!(body["thinking"]["type"], "disabled");
+    }
+
+    #[test]
+    fn v4_思考开启时不发送thinking_disabled() {
+        let request = ProviderRequest {
+            session_id: "s".into(),
+            model: "deepseek-v4-pro".into(),
+            messages: vec![],
+            tools: vec![],
+            system: "system".into(),
+            temperature: 0.2,
+            max_output_tokens: 100,
+            reasoning: true,
+            cancellation: CancellationToken::new(),
+        };
+        let body = DeepSeekProvider::request_body(&request).unwrap();
+        assert!(
+            body.get("thinking").is_none(),
+            "思考开启时不应发送 thinking disabled"
+        );
     }
 }

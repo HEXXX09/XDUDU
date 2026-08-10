@@ -166,6 +166,7 @@ mod tests {
             system: String::new(),
             temperature: 0.0,
             max_output_tokens: 1,
+            reasoning: false,
             cancellation: tokio_util::sync::CancellationToken::new(),
         }
     }
@@ -176,6 +177,7 @@ mod tests {
             tool_calls: vec![],
             usage: TokenUsage::default(),
             finish_reason: FinishReason::Stop,
+            reasoning: None,
         }
     }
 

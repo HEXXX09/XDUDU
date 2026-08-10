@@ -97,6 +97,35 @@ pub enum AgentEvent {
         agent_id: String,
         result: ToolResult,
     },
+    /// 子代理任务图完成预检并开始调度。
+    SubagentGraphStarted {
+        graph_id: Uuid,
+        total: usize,
+        max_concurrency: usize,
+    },
+    /// 图节点依赖已满足并开始执行。
+    SubagentGraphNodeStarted {
+        graph_id: Uuid,
+        node_id: String,
+        agent_id: String,
+    },
+    /// 图节点进入终态；不携带节点正文或工具结果。
+    SubagentGraphNodeFinished {
+        graph_id: Uuid,
+        node_id: String,
+        agent_id: String,
+        status: String,
+        duration_ms: u64,
+    },
+    /// 整张任务图结束。
+    SubagentGraphFinished {
+        graph_id: Uuid,
+        success: bool,
+        succeeded: usize,
+        failed: usize,
+        blocked: usize,
+        cancelled: usize,
+    },
 }
 
 impl AgentEvent {
@@ -246,6 +275,68 @@ impl AgentEvent {
                     "errorCode": result.error.as_ref().map(|error| error.code.as_str()),
                 }),
             ),
+            Self::SubagentGraphStarted {
+                graph_id,
+                total,
+                max_concurrency,
+            } => (
+                "subagent_graph_started",
+                "子代理任务图开始调度",
+                json!({
+                    "graphId": graph_id,
+                    "total": total,
+                    "maxConcurrency": max_concurrency,
+                }),
+            ),
+            Self::SubagentGraphNodeStarted {
+                graph_id,
+                node_id,
+                agent_id,
+            } => (
+                "subagent_graph_node_started",
+                "子代理任务图节点开始",
+                json!({
+                    "graphId": graph_id,
+                    "nodeId": node_id,
+                    "agentId": agent_id,
+                }),
+            ),
+            Self::SubagentGraphNodeFinished {
+                graph_id,
+                node_id,
+                agent_id,
+                status,
+                duration_ms,
+            } => (
+                "subagent_graph_node_finished",
+                "子代理任务图节点结束",
+                json!({
+                    "graphId": graph_id,
+                    "nodeId": node_id,
+                    "agentId": agent_id,
+                    "status": status,
+                    "durationMs": duration_ms,
+                }),
+            ),
+            Self::SubagentGraphFinished {
+                graph_id,
+                success,
+                succeeded,
+                failed,
+                blocked,
+                cancelled,
+            } => (
+                "subagent_graph_finished",
+                "子代理任务图结束",
+                json!({
+                    "graphId": graph_id,
+                    "success": success,
+                    "succeeded": succeeded,
+                    "failed": failed,
+                    "blocked": blocked,
+                    "cancelled": cancelled,
+                }),
+            ),
         };
         Some(json!({
             "type": "debug_trace",
@@ -306,6 +397,22 @@ mod tests {
         assert_eq!(value["call_id"], "call-1");
         assert_eq!(value["completed"], 1000);
         assert_eq!(value["unit"], "files");
+    }
+
+    #[test]
+    fn 子代理任务图事件不携带提示词或节点结果() {
+        let value = serde_json::to_value(AgentEvent::SubagentGraphNodeFinished {
+            graph_id: Uuid::nil(),
+            node_id: "inspect".into(),
+            agent_id: "explore".into(),
+            status: "succeeded".into(),
+            duration_ms: 42,
+        })
+        .unwrap();
+        assert_eq!(value["type"], "subagent_graph_node_finished");
+        assert_eq!(value["node_id"], "inspect");
+        assert!(value.get("prompt").is_none());
+        assert!(value.get("result").is_none());
     }
 
     #[test]

@@ -41,9 +41,10 @@ Cargo workspace
     ├── instructions.rs  用户/项目级指令与仓库约定加载、提示词注入
     ├── skills.rs        Skills 发现、frontmatter 校验与优先级去重
     ├── subagent.rs      AgentProfile 档案与 task 子代理隔离循环
+    ├── subagent_graph.rs 子代理 DAG 校验、依赖调度、失败传播与受控并发
     ├── stall.rs         停滞检测与恢复策略
     ├── memories.rs       可审查记忆存储与 FTS5 检索
-    ├── memory_suggestion.rs 会话结束记忆建议协议
+    ├── memory_suggestion.rs 两阶段记忆：会话提炼 + MEMORY.md 全局整理协议
     ├── tools/           注册中心、内置工具（含 skill/web_read）及路径策略
     ├── session.rs       会话领域模型与兼容 JSON 读取
     ├── sqlite_session.rs SQLite、迁移、恢复与工作区锁
@@ -84,6 +85,11 @@ Agent + ToolRegistry + SessionStore + EventSink
 9. 文件写入先保存 `Prepared` 事务，再进入 `Applying` 和原子提交，成功后标记 `Applied`；
 10. 持久化和渲染前统一脱敏，状态由 `Observing` 进入下一轮 `Reflecting`；
 11. 正常结束、达到轮次、输出截断、未解决工具失败、中断和错误保存为明确终态。
+
+复杂但可拆分的调研任务可以由模型调用 `task_graph`：Agent 先完整校验节点、档案和 DAG，
+再按依赖解锁节点。显式只读档案的独立节点最多并行 4 个；可能产生副作用的节点独占执行，
+且内部每个工具仍经过 ToolRegistry。依赖结果经过字符预算裁剪后作为不可信背景传给下游。
+节点失败会阻塞所有依赖后继，独立分支由 `continue-independent` 或 `fail-fast` 决定是否继续。
 
 单次任务采用隐藏推理的 ReAct 运行方式：
 
@@ -220,9 +226,10 @@ Cargo 是唯一构建入口。CI 在 Linux、macOS 和 Windows 执行格式、Cl
 
 ## 12. 后续演进
 
-Provider 扩展按当前决定暂缓，DeepSeek 保持主路径。M6 功能与 macOS、Linux、Windows CI 验收已完成。M7 已完成会话恢复、Plan Schema v3、SQLite Schema v4、结构化生成、整份审批/修订、串行 DAG 执行和恢复。M8 已完成 stdio 与 Streamable HTTP MCP 客户端、声明式插件清单、动态工具注册与统一权限/审批/脱敏链，并通过 stdio/HTTP 恶意输入、越权、超时、取消与审批链 E2E 及三平台 CI 验收。M9 已完成用户级/项目级指令注入、可审查记忆（任务完成建议→TUI 逐条确认→SQLite FTS5 存储与检索→上下文注入），默认不自动写入，未引入向量 RAG。`submit_plan` 创建 Draft，`revise_plan` 生成完整新 revision，`complete_step` 以逐项证据确认当前步骤；执行期通过 `revision + execution_version + status` 原子检查点避免并发覆盖。Plan 不保存隐藏推理，也不替代单次请求内部的 ReAct；批准 Plan 不放行任何工具副作用，崩溃后也不会自动重放结果未知的工具。
+Provider 扩展按当前决定暂缓，DeepSeek 保持主路径。M6 功能与 macOS、Linux、Windows CI 验收已完成。M7 已完成会话恢复、Plan Schema v3、SQLite Schema v4、结构化生成、整份审批/修订、串行 DAG 执行和恢复。M8 已完成 stdio 与 Streamable HTTP MCP 客户端、声明式插件清单、动态工具注册与统一权限/审批/脱敏链，并通过 stdio/HTTP 恶意输入、越权、超时、取消与审批链 E2E 及三平台 CI 验收。M9 已完成用户级/项目级指令注入与两阶段长期记忆：SQLite 保存带来源的原始提炼记录，后台整理器生成 `.xdudu/memories/MEMORY.md`，运行时只注入有界汇总；用户通过 `/memory` 和 memory list/edit/path 审查文件，未引入向量 RAG。`submit_plan` 创建 Draft，`revise_plan` 生成完整新 revision，`complete_step` 以逐项证据确认当前步骤；执行期通过 `revision + execution_version + status` 原子检查点避免并发覆盖。Plan 不保存隐藏推理，也不替代单次请求内部的 ReAct；批准 Plan 不放行任何工具副作用，崩溃后也不会自动重放结果未知的工具。
 
 M11 功能开发和本地门禁已完成，等待远端三平台 CI：OpenAI-compatible Provider 与思考闭环；
 停滞检测；`task` 子代理委派（隔离上下文、运行时受限工具集、同批并行、审计持久化）；只读
-工具批次并行；Skills 技能系统；仓库指令；跨平台命令白名单；LLM 分级上下文压缩；记忆注入
-管线；以及具备响应体和提炼次数硬上限的 `web_read`。三平台通过前不把 M11 标记为发布完成。
+工具批次并行；具备 DAG、依赖结果传递、失败传播和保守副作用串行的 `task_graph`；Skills
+技能系统；仓库指令；跨平台命令白名单；LLM 分级上下文压缩；记忆注入管线；以及具备
+响应体和提炼次数硬上限的 `web_read`。三平台通过前不把 M11 标记为发布完成。

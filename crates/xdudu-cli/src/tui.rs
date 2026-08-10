@@ -107,7 +107,7 @@ struct SlashCommand {
     requires_argument: bool,
 }
 
-const SLASH_COMMANDS: [SlashCommand; 18] = [
+const SLASH_COMMANDS: [SlashCommand; 19] = [
     SlashCommand {
         name: "/help",
         usage: "/help",
@@ -205,6 +205,12 @@ const SLASH_COMMANDS: [SlashCommand; 18] = [
         requires_argument: false,
     },
     SlashCommand {
+        name: "/memory",
+        usage: "/memory",
+        description: "查看和管理长期记忆",
+        requires_argument: false,
+    },
+    SlashCommand {
         name: "/turns",
         usage: "/turns <n>",
         description: "设置最大循环次数",
@@ -233,6 +239,8 @@ struct TuiState {
     content_end_row: u16,
     /// 上一次绘制的底部活动区起始行，用于完整清除尺寸变化后的残影。
     dynamic_top: u16,
+    /// 启动页尚未被会话内容提交时保持为 true；窗口变化时可安全重新居中。
+    intro_active: bool,
     transcript: VecDeque<TranscriptBlock>,
     streaming: String,
     /// 当前轮是否收到过流式增量；用于区分非流式最终消息和已提交的流式回答。
@@ -260,7 +268,6 @@ struct TuiState {
     session_picker: Option<SessionPicker>,
     plan_review: Option<PlanReviewView>,
     model_picker: Option<ModelPicker>,
-    memory_suggest: Option<MemorySuggestView>,
     debug_trace: bool,
 }
 
@@ -311,14 +318,6 @@ struct PlanReviewView {
     selected: usize,
     scroll: usize,
     mode: PlanDialogMode,
-}
-
-#[derive(Debug)]
-struct MemorySuggestView {
-    suggestions: Vec<xdudu_core::MemorySuggestion>,
-    selected: usize,
-    accepted: Vec<bool>,
-    scroll: usize,
 }
 
 #[derive(Clone)]
@@ -404,6 +403,7 @@ impl TuiApp {
             printed_lines: 0,
             content_end_row: 0,
             dynamic_top: 0,
+            intro_active: true,
             transcript: VecDeque::new(),
             streaming: String::new(),
             assistant_received_delta: false,
@@ -426,7 +426,6 @@ impl TuiApp {
             session_picker: None,
             plan_review: None,
             model_picker: None,
-            memory_suggest: None,
             debug_trace: context.debug_trace,
         };
         let app = Self {
@@ -683,94 +682,6 @@ impl TuiApp {
         Ok(selected)
     }
 
-    /// 展示记忆建议，返回用户批准的子集；Esc/Ctrl+C 全部拒绝。
-    pub(crate) async fn review_memories(
-        &self,
-        suggestions: Vec<xdudu_core::MemorySuggestion>,
-    ) -> io::Result<Vec<xdudu_core::MemorySuggestion>> {
-        if suggestions.is_empty() {
-            return Ok(Vec::new());
-        }
-        self.router.set_focus(InputFocus::Picker);
-        {
-            let mut state = self.renderer.state.lock().unwrap();
-            state.input_active = false;
-            state.memory_suggest = Some(MemorySuggestView {
-                accepted: vec![false; suggestions.len()],
-                suggestions,
-                selected: 0,
-                scroll: 0,
-            });
-        }
-        self.renderer.draw_picker()?;
-
-        loop {
-            let Some(event) = self.router.next_for(InputFocus::Picker).await else {
-                continue;
-            };
-            match event {
-                Event::Key(key)
-                    if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
-                {
-                    let mut state = self.renderer.state.lock().unwrap();
-                    let Some(view) = state.memory_suggest.as_mut() else {
-                        break;
-                    };
-                    match key.code {
-                        KeyCode::Up | KeyCode::Char('k') => {
-                            view.selected = if view.selected == 0 {
-                                view.suggestions.len() - 1
-                            } else {
-                                view.selected - 1
-                            };
-                        }
-                        KeyCode::Down | KeyCode::Char('j') => {
-                            view.selected = (view.selected + 1) % view.suggestions.len();
-                        }
-                        KeyCode::PageUp => view.scroll = view.scroll.saturating_sub(5),
-                        KeyCode::PageDown => view.scroll = view.scroll.saturating_add(5),
-                        KeyCode::Char(' ') => {
-                            view.accepted[view.selected] = !view.accepted[view.selected];
-                        }
-                        KeyCode::Enter => break,
-                        KeyCode::Esc => {
-                            view.accepted.fill(false);
-                            break;
-                        }
-                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            view.accepted.fill(false);
-                            break;
-                        }
-                        _ => {}
-                    }
-                    drop(state);
-                    self.renderer.draw_picker()?;
-                }
-                Event::Resize(_, _) => self.renderer.draw_picker()?,
-                _ => {}
-            }
-        }
-
-        let accepted = {
-            let state = self.renderer.state.lock().unwrap();
-            let view = state.memory_suggest.as_ref().expect("记忆建议视图存在");
-            view.suggestions
-                .iter()
-                .zip(view.accepted.iter())
-                .filter_map(|(suggestion, accepted)| accepted.then_some(suggestion.clone()))
-                .collect::<Vec<_>>()
-        };
-        {
-            let mut state = self.renderer.state.lock().unwrap();
-            state.memory_suggest = None;
-            state.input_active = true;
-        }
-        self.router.set_focus(InputFocus::Composer);
-        self.renderer.restore_viewport()?;
-        self.renderer.draw_dynamic()?;
-        Ok(accepted)
-    }
-
     pub(crate) async fn review_plan(&self, plan: &Plan) -> io::Result<Option<PlanReviewChoice>> {
         let _focus_guard = self.router.acquire_focus(InputFocus::Picker);
         {
@@ -948,6 +859,7 @@ impl TuiRenderer {
         let mut stdout = io::stdout();
         {
             let mut state = self.state.lock().unwrap();
+            state.intro_active = false;
             let scroll_bottom = scroll_bottom_of(&state, columns, rows);
             let end_row = state.content_end_row.min(scroll_bottom);
             queue_scroll_region(&mut stdout, scroll_bottom)?;
@@ -997,6 +909,9 @@ impl TuiRenderer {
             return Ok(());
         }
         let mut stdout = io::stdout();
+        if state.intro_active {
+            draw_intro(&mut stdout, &mut state, columns, rows, self.color)?;
+        }
         let body_width = usize::from(columns.saturating_sub(4)).max(10);
         let input_width = usize::from(columns.saturating_sub(3)).max(10);
 
@@ -1337,101 +1252,12 @@ impl TuiRenderer {
         stdout.flush()
     }
 
-    /// 启动横幅：打印一次进入滚动区，随内容增长自然上滚。
+    /// 启动横幅：会话尚无内容时随终端尺寸变化重新布局。
     fn print_intro(&self) -> io::Result<()> {
-        let (provider, model, version, cwd, permission, tool_count, skills_empty) = {
-            let state = self.state.lock().unwrap();
-            (
-                state.provider.clone(),
-                state.model.clone(),
-                state.version,
-                state.cwd.clone(),
-                state.permission.clone(),
-                state.available_tools.len(),
-                state.skills.is_empty(),
-            )
-        };
         let (columns, rows) = size().unwrap_or((80, 24));
+        let mut state = self.state.lock().unwrap();
         let mut stdout = io::stdout();
-        if rows < 14 || columns < 42 {
-            set_color(&mut stdout, self.color, PRIMARY)?;
-            queue!(
-                stdout,
-                SetAttribute(Attribute::Bold),
-                Print(">_ XDUDU"),
-                SetAttribute(Attribute::Reset),
-                Print("\r\n")
-            )?;
-            reset_color(&mut stdout, self.color)?;
-            set_color(&mut stdout, self.color, MUTED)?;
-            queue!(
-                stdout,
-                Print(format!(
-                    "{} · {}\r\n",
-                    model_display_name(&provider, &model),
-                    provider
-                )),
-                Print(format!(
-                    "{} tools · Skills {}\r\n",
-                    tool_count,
-                    if skills_empty {
-                        "尚未启用"
-                    } else {
-                        "已启用"
-                    }
-                ))
-            )?;
-            reset_color(&mut stdout, self.color)?;
-            {
-                let mut state = self.state.lock().unwrap();
-                state.printed_lines = 3;
-                state.content_end_row = 3;
-            }
-            return stdout.flush();
-        }
-
-        let icon = [
-            "   ▗▄▄▄▄▄▄▄▖",
-            "▗▄▐  ▪   ▪  ▌▄▖",
-            "  ▀▀▌  ▿  ▐▀▀",
-            "    ▀   ▀",
-        ];
-        // Claude Code 式横幅：图标整体居中，版本信息单行居中在图标下方。
-        let width_icon_max = icon.iter().map(|line| line.width()).max().unwrap_or(20);
-        let pad = usize::from(columns).saturating_sub(width_icon_max) / 2;
-        for (row, icon_line) in icon.iter().enumerate() {
-            set_color(&mut stdout, self.color, PRIMARY)?;
-            queue!(stdout, MoveTo(pad as u16, row as u16), Print(icon_line))?;
-            reset_color(&mut stdout, self.color)?;
-            queue!(stdout, Print("\r\n"))?;
-        }
-        let info = format!(
-            "{} v{} · {} · {} tools · {}",
-            model_display_name(&provider, &model),
-            version,
-            cwd.display(),
-            tool_count,
-            permission
-        );
-        let info_width = info.width();
-        let info_pad = usize::from(columns).saturating_sub(info_width) / 2;
-        set_color(&mut stdout, self.color, MUTED)?;
-        queue!(
-            stdout,
-            MoveTo(info_pad as u16, icon.len() as u16),
-            Print(truncate_to_width(
-                &info,
-                usize::from(columns).saturating_sub(4).max(4)
-            ))
-        )?;
-        reset_color(&mut stdout, self.color)?;
-        queue!(stdout, Print("\r\n"))?;
-        // 记录内容行数：图标 4 行 + 信息 1 行 = 5。
-        {
-            let mut state = self.state.lock().unwrap();
-            state.printed_lines = 5;
-            state.content_end_row = 5;
-        }
+        draw_intro(&mut stdout, &mut state, columns, rows, self.color)?;
         stdout.flush()
     }
 
@@ -1448,9 +1274,6 @@ impl TuiRenderer {
         }
         if state.model_picker.is_some() {
             draw_model_picker(&mut stdout, &state, columns, rows, self.color)?;
-        }
-        if state.memory_suggest.is_some() {
-            draw_memory_suggest(&mut stdout, &state, columns, rows, self.color)?;
         }
         Ok(())
     }
@@ -1603,6 +1426,53 @@ impl EventSink for TuiRenderer {
                     };
                     push_block(&mut state, Role::Tool, line.clone());
                     commits.push((Role::Tool, line));
+                }
+                AgentEvent::SubagentGraphStarted {
+                    total,
+                    max_concurrency,
+                    ..
+                } => {
+                    state.status = format!("任务图 · {total} 节点 · 并发 {max_concurrency}");
+                }
+                AgentEvent::SubagentGraphNodeStarted {
+                    node_id, agent_id, ..
+                } => {
+                    state.status = format!("任务图节点 {node_id} · {agent_id}");
+                }
+                AgentEvent::SubagentGraphNodeFinished {
+                    node_id,
+                    status,
+                    duration_ms,
+                    ..
+                } => {
+                    let line = format!("任务图节点 {node_id}：{status} · {duration_ms} ms");
+                    let role = if status == "succeeded" {
+                        Role::Tool
+                    } else {
+                        Role::Warning
+                    };
+                    push_block(&mut state, role, line.clone());
+                    commits.push((role, line));
+                }
+                AgentEvent::SubagentGraphFinished {
+                    success,
+                    succeeded,
+                    failed,
+                    blocked,
+                    cancelled,
+                    ..
+                } => {
+                    state.status = if success {
+                        "任务图完成".into()
+                    } else {
+                        "任务图未全部完成".into()
+                    };
+                    let line = format!(
+                        "任务图汇总：成功 {succeeded} · 失败 {failed} · 阻塞 {blocked} · 取消 {cancelled}"
+                    );
+                    let role = if success { Role::Tool } else { Role::Warning };
+                    push_block(&mut state, role, line.clone());
+                    commits.push((role, line));
                 }
             }
             if self.router.focus() == InputFocus::Composer {
@@ -2493,79 +2363,90 @@ fn draw_plan_review(
     reset_color(writer, color)
 }
 
-fn draw_memory_suggest(
+/// 绘制仍处于空闲态的启动页。它只覆盖启动页自己占用的前五行，因此终端
+/// Resize 时可以重新计算水平位置，而不会改写已经进入滚动历史的对话。
+fn draw_intro(
     writer: &mut impl Write,
-    state: &TuiState,
+    state: &mut TuiState,
     columns: u16,
     rows: u16,
     color: bool,
 ) -> io::Result<()> {
-    let Some(view) = &state.memory_suggest else {
-        return Ok(());
-    };
-    for row in 0..rows {
+    for row in 0..rows.min(5) {
         queue!(writer, MoveTo(0, row), Clear(ClearType::CurrentLine))?;
     }
-    let width = usize::from(columns.saturating_sub(4)).max(20);
-    set_color(writer, color, PRIMARY)?;
-    queue!(
-        writer,
-        MoveTo(2, 0),
-        SetAttribute(Attribute::Bold),
-        Print("建议保存的记忆"),
-        SetAttribute(Attribute::Reset)
-    )?;
+
+    if rows < 14 || columns < 42 {
+        let lines = [
+            ">_ XDUDU".to_owned(),
+            format!(
+                "{} · {}",
+                model_display_name(&state.provider, &state.model),
+                state.provider
+            ),
+            format!(
+                "{} tools · Skills {}",
+                state.available_tools.len(),
+                if state.skills.is_empty() {
+                    "尚未启用"
+                } else {
+                    "已启用"
+                }
+            ),
+        ];
+        for (row, line) in lines.iter().enumerate() {
+            let visible = truncate_to_width(line, usize::from(columns).saturating_sub(2).max(1));
+            let column = centered_column(columns, &visible);
+            set_color(writer, color, if row == 0 { PRIMARY } else { MUTED })?;
+            queue!(writer, MoveTo(column, row as u16))?;
+            if row == 0 {
+                queue!(writer, SetAttribute(Attribute::Bold))?;
+            }
+            queue!(writer, Print(visible), SetAttribute(Attribute::Reset))?;
+        }
+        reset_color(writer, color)?;
+        state.printed_lines = 3;
+        state.content_end_row = 3;
+        return Ok(());
+    }
+
+    let icon = [
+        "   ▗▄▄▄▄▄▄▄▖",
+        "▗▄▐  ▪   ▪  ▌▄▖",
+        "  ▀▀▌  ▿  ▐▀▀",
+        "    ▀   ▀",
+    ];
+    for (row, icon_line) in icon.iter().enumerate() {
+        set_color(writer, color, PRIMARY)?;
+        queue!(
+            writer,
+            MoveTo(centered_column(columns, icon_line), row as u16),
+            Print(icon_line)
+        )?;
+    }
+    let info = format!(
+        "{} v{} · {} · {} tools · {}",
+        model_display_name(&state.provider, &state.model),
+        state.version,
+        state.cwd.display(),
+        state.available_tools.len(),
+        state.permission
+    );
+    let info = truncate_to_width(&info, usize::from(columns).saturating_sub(4).max(4));
     set_color(writer, color, MUTED)?;
     queue!(
         writer,
-        MoveTo(2, 1),
-        Print("↑↓ 选择 · 空格 标记 · Enter 保存 · Esc 全部拒绝")
+        MoveTo(centered_column(columns, &info), icon.len() as u16),
+        Print(info)
     )?;
-
-    let content_height = usize::from(rows.saturating_sub(7)).max(3);
-    let max_scroll = view.suggestions.len().saturating_sub(content_height);
-    let start = view.scroll.min(max_scroll);
-    for (offset, (suggestion, accepted)) in view
-        .suggestions
-        .iter()
-        .zip(view.accepted.iter())
-        .skip(start)
-        .take(content_height)
-        .enumerate()
-    {
-        let row = 3 + offset as u16;
-        let selected = start + offset == view.selected;
-        set_color(writer, color, if selected { PRIMARY } else { TEXT })?;
-        if selected {
-            queue!(writer, SetAttribute(Attribute::Bold))?;
-        }
-        queue!(
-            writer,
-            MoveTo(2, row),
-            Print(if *accepted { "[✓] " } else { "[ ] " }),
-            Print(if selected { "›" } else { " " }),
-            SetAttribute(Attribute::Reset)
-        )?;
-        set_color(writer, color, TEXT)?;
-        queue!(
-            writer,
-            Print(truncate_to_width(
-                &suggestion.content,
-                width.saturating_sub(6)
-            ))
-        )?;
-        set_color(writer, color, MUTED)?;
-        queue!(
-            writer,
-            MoveTo(4, row + 1),
-            Print(truncate_to_width(
-                &suggestion.reason,
-                width.saturating_sub(4)
-            ))
-        )?;
-        reset_color(writer, color)?;
-    }
+    reset_color(writer, color)?;
+    state.printed_lines = 5;
+    state.content_end_row = 5;
     Ok(())
+}
+
+fn centered_column(columns: u16, text: &str) -> u16 {
+    columns.saturating_sub(text.width().min(usize::from(u16::MAX)) as u16) / 2
 }
 
 /// 活动区完整高度：chrome 4 行 + 输入块 + 折叠提示 + 建议 + 工具 + 流式尾巴，
@@ -2872,6 +2753,7 @@ mod tests {
             printed_lines: 0,
             content_end_row: 0,
             dynamic_top: 0,
+            intro_active: true,
             transcript: VecDeque::new(),
             streaming: String::new(),
             assistant_received_delta: false,
@@ -2894,7 +2776,6 @@ mod tests {
             session_picker: None,
             plan_review: None,
             model_picker: None,
-            memory_suggest: None,
             debug_trace: false,
         }
     }
@@ -2916,6 +2797,13 @@ mod tests {
         );
         assert_eq!(handle_input_key(&mut state, key(KeyCode::Up)), None);
         assert_eq!(state.input.iter().collect::<String>(), "abc");
+    }
+
+    #[test]
+    fn 启动页居中位置随终端宽度变化() {
+        assert_eq!(centered_column(80, "1234567890"), 35);
+        assert_eq!(centered_column(120, "1234567890"), 55);
+        assert_eq!(centered_column(4, "1234567890"), 0);
     }
 
     #[test]

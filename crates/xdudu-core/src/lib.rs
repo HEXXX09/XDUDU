@@ -28,6 +28,7 @@ pub mod skills;
 pub mod sqlite_session;
 pub mod stall;
 pub mod subagent;
+pub mod subagent_graph;
 pub mod tools;
 
 pub use agent::{AgentRunConfig, AgentRunResult, run_agent};
@@ -59,9 +60,13 @@ pub use mcp::{
     McpTransportKind, load_mcp_config, mcp_config_path, register_configured_mcp_tools,
     save_mcp_config,
 };
-pub use memories::{MAX_MEMORY_BYTES, MemoryRecord, MemoryStore};
+pub use memories::{
+    MAX_MEMORY_BYTES, MAX_MEMORY_DOCUMENT_BYTES, MEMORY_DOCUMENT_PATH, MemoryRecord, MemoryStore,
+    memory_document_path, read_memory_document, write_memory_document,
+};
 pub use memory_suggestion::{
-    MemorySuggestion, MemorySuggestionConfig, build_suggestion_prompt, suggest_memories,
+    MemoryConsolidationConfig, MemorySuggestion, MemorySuggestionConfig, build_suggestion_prompt,
+    consolidate_memory_document, suggest_memories,
 };
 pub use permission::{PermissionLevel, PermissionMode};
 pub use plan::{
@@ -96,4 +101,5 @@ pub use subagent::{
     AgentProfile, ProfileMode, SubagentContext, SubagentOutcome, builtin_profiles, find_profile,
     merge_profiles, run_subagent, task_tool_definition, validate_profile,
 };
+pub use subagent_graph::{run_subagent_graph, task_graph_tool_definition};
 pub use tools::{SkillTool, ToolRegistry, WebReadTool, register_builtins};

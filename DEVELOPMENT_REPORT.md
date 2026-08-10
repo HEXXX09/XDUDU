@@ -57,6 +57,7 @@ Provider，Anthropic 适配继续保留，并新增 OpenAI-compatible Provider�
 | Skills 技能系统（六级发现、frontmatter、`skill` 工具、三档策略） | 已完成 |
 | `terminal_exec` 三档前缀白名单（deny > allow > ask） | 已完成 |
 | 子代理体系（`AgentProfile`、`task` 工具、并行委派、审计持久化） | 已完成 |
+| 子代理任务图（DAG、依赖解锁、受控并发、失败传播与取消） | 本地验收通过 |
 | 只读工具并行执行（批次 `join_all`、单进度通道按 call_id 分发） | 已完成 |
 | 停滞检测与 auto/ask/off 恢复策略 | 已完成 |
 | LLM 分级上下文压缩（`submit_context_summary` + 确定性回退） | 已完成 |
@@ -130,6 +131,8 @@ cargo install --path crates/xdudu-cli --locked --force
 - 默认输出不包含 Provider 原始思维链；高级 `--debug-trace` 仅输出脱敏后的状态机与执行元数据，Plan 完成时逐条显示验证证据；
 - 子代理内部工具以审计记录随父会话持久化，不写入父会话消息历史（隔离上下文）；
 - 子代理运行时再次校验档案工具白名单，不能通过异常 Provider 响应绕过；
+- `task_graph` 只并行显式只读档案；任何非只读节点独占执行，避免审批与文件事务并发；
+- 图节点失败时依赖后继进入 blocked，独立分支按策略继续；崩溃后整图结果未知且不会自动重放；
 - Skills 正文只注入后续 Provider system 提示词，工具结果只保留加载元数据；
 - `web_read` 单次响应最多读取 1 MiB、单次调用最多提炼 8 个文本块，并复用 SSRF 边界；
 - 停滞恢复不重放结果未知的工具调用；恢复后若仍连续失败，恢复尝试次数持续累计直至阈值；

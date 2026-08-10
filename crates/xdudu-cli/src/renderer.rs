@@ -208,6 +208,51 @@ impl EventSink for ConsoleRenderer {
             AgentEvent::PlanCompleted { .. } => {
                 eprintln!("  {} 计划全部完成", theme.success("✓"));
             }
+            AgentEvent::SubagentGraphStarted {
+                total,
+                max_concurrency,
+                ..
+            } => {
+                eprintln!(
+                    "  {} 子代理任务图：{total} 个节点，并发上限 {max_concurrency}",
+                    theme.accent("◆")
+                );
+            }
+            AgentEvent::SubagentGraphNodeStarted {
+                node_id, agent_id, ..
+            } => {
+                eprintln!("  {} {node_id} · {agent_id}", theme.accent("→"));
+            }
+            AgentEvent::SubagentGraphNodeFinished {
+                node_id,
+                status,
+                duration_ms,
+                ..
+            } => {
+                let marker = if status == "succeeded" {
+                    theme.success("✓")
+                } else {
+                    theme.warning("•")
+                };
+                eprintln!("  {marker} {node_id} · {status} · {duration_ms} ms");
+            }
+            AgentEvent::SubagentGraphFinished {
+                success,
+                succeeded,
+                failed,
+                blocked,
+                cancelled,
+                ..
+            } => {
+                let marker = if success {
+                    theme.success("✓")
+                } else {
+                    theme.warning("Ⅱ")
+                };
+                eprintln!(
+                    "  {marker} 任务图：成功 {succeeded} · 失败 {failed} · 阻塞 {blocked} · 取消 {cancelled}"
+                );
+            }
             _ => {}
         }
     }

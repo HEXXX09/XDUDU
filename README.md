@@ -32,10 +32,11 @@ XDUDU 是一个使用 Rust 实现的终端 AI 编程助手。它把自然语言�
 - 只声明 MCP Server 的隔离插件清单，以及 `mcp`、`plugin` 管理和诊断命令；
 - 密钥、Bearer Token、私钥和敏感结构字段的统一输出及会话脱敏；
 - 用户级与项目级自定义指令（`~/.config/xdudu/instructions/*.md` 与 `.xdudu/instructions/*.md`）与仓库约定（`AGENTS.md`、`CLAUDE.md`、`.claude/CLAUDE.md`）注入系统提示词，`/instructions` 与 doctor 输出加载摘要，项目指令视为不可信输入且不改变权限边界；
-- 可审查记忆：任务完成后模型生成脱敏建议，TUI 逐条确认后写入；`memory list/add/remove` 管理，SQLite FTS5 本地全文检索注入相关记忆，默认不自动写入；注入管线按查询词精排、去重并受 Token 预算约束；
+- Codex 式两阶段长期记忆：SQLite 保存每次会话的原始提炼记录作为审计层，后台整理器将其合并、去重为 `.xdudu/memories/MEMORY.md`；运行时优先注入这份有界汇总，`/memory` 查看，`xdudu memory edit` 直接编辑；
 - Skills 技能系统：六级目录发现 `SKILL.md`（.xdudu/.claude/.opencode 项目级与用户级，兼容 Claude Code / opencode 生态），frontmatter 校验与优先级去重；`skill` 工具按需加载并注入当前轮系统提示词；`agent.skills` 三档（allow/ask/deny）；`/skills` 命令；
 - `terminal_exec` 三档前缀白名单：deny > allow > ask（默认内置 allow 覆盖 pwd/echo/ls、只读 git、cargo/npm/python/go 常见检查命令；项目配置只能追加 deny/ask）；
 - 子代理体系：`task` 工具把只读调研或独立子任务委派给隔离上下文（explore/general/reviewer/build 内置档案 + `[agent.profiles]` 自定义），同批可并行执行多个子代理；子代理不获得父会话没有的权限，审计记录随父会话持久化；`/agent` 命令；
+- 子代理任务图：`task_graph` 支持最多 24 个节点的 DAG、依赖结果传递、只读节点受控并发、非只读节点串行、失败向下游传播及 continue-independent/fail-fast 策略；
 - 只读工具并行执行：同批无副作用工具 `join_all` 并发，副作用工具保持串行，共享进度通道按 call_id 分发；
 - LLM 分级上下文压缩：低于 3× 预算走确定性截断，达到 3× 预算触发 `submit_context_summary` 结构化压缩，失败静默回退；`/compact` 强制触发；Token 估算改字符加权；
 - `web_read` 工具：有界分段读取大型网页 + LLM 提炼（复用 web_fetch 的 SSRF/DNS 边界，单次响应最多 1 MiB、单次调用最多提炼 8 块，失败回退纯文本并返回续读锚点）；
@@ -349,6 +350,7 @@ xdudu-core
 - [M11 Skills、指令与命令白名单设计](docs/M11_SKILLS_DESIGN.md)
 - [M11 Provider 生态与思考路径设计](docs/M11_PROVIDER_DESIGN.md)
 - [M11 上下文、记忆与 Web 阅读设计](docs/M11_CONTEXT_WEBMEM_DESIGN.md)
+- [XDUDU Agent 原理与源码学习指南](docs/AGENT_LEARNING_GUIDE.md)
 - [产品需求](docs/PRD.md)
 - [任务路线图](docs/TASKS.md)
 - [Rust 迁移记录](docs/RUST_MIGRATION.md)

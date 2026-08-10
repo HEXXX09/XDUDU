@@ -145,8 +145,8 @@ M2 已由 `main` 的 macOS、Linux 和 Windows CI 矩阵确认。
 M9 在 M5 长上下文数据完成后重新评审，避免过早引入向量数据库。
 
 - [x] M9-T01：实现用户级与项目级指令加载；
-- [x] M9-T02：定义可审查的记忆建议和确认流程；
-- [x] M9-T03：实现 memory list/add/remove；
+- [x] M9-T02：定义 Agent 自主原始记忆提炼与 Codex 式 MEMORY.md 合并协议；
+- [x] M9-T03：实现 `/memory`、memory list/edit/path 用户审查入口；
 - [x] M9-T04：实现相关性检索和上下文注入；
 - [ ] M9-T05：评估本地全文检索是否已满足需求（待三平台验收后评审）；
 - [ ] M9-T06：仅在有真实语料和评测集时增加向量 RAG；
@@ -179,6 +179,9 @@ M11 四份设计文档（`M11_EXECUTION_DESIGN.md`、`M11_SKILLS_DESIGN.md`、
 - [x] M11-E03：只读工具并行执行（`side_effect == None` 批次内 `join_all`，副作用工具串行，
   单进度通道按 call_id 分发）；`/agent` 命令与 `[agent.profiles]` 自定义档案
   （项目档案仅只读）；
+- [x] M11-E04：子代理任务图——`task_graph` 严格 DAG Schema、依赖解锁与结果传递、最多
+  24 节点/4 并发、只读并行与非只读独占、失败下游阻塞、独立分支继续或 fail-fast、
+  图/节点事件、Token 汇总及带 graph/node 前缀的工具审计；
 - [x] M11-S01：Skills 技能系统——六级目录发现（.xdudu/.claude/.opencode 项目级与用户级）、
   YAML frontmatter 校验、优先级去重、`skill` 工具按需加载注入当前轮 system；
   `agent.skills` 三档（allow/ask/deny）；`/skills` 命令；`SkillLoaded` 事件；

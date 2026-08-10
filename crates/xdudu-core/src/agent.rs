@@ -36,8 +36,10 @@ use crate::{
         StalledRecoveryMode,
     },
     subagent::{
-        AgentProfile, SubagentContext, SubagentOutcome, run_subagent, task_tool_definition,
+        AgentProfile, SubagentContext, SubagentOutcome, find_profile, run_subagent,
+        task_tool_definition,
     },
+    subagent_graph::{run_subagent_graph, task_graph_tool_definition},
     tools::{ToolProgressUpdate, ToolRegistry, ToolResult},
 };
 
@@ -74,7 +76,7 @@ pub struct AgentRunConfig<'a> {
     pub skills: Vec<Skill>,
     /// 强制压缩标志：CLI `/compact` 置位后，下一轮请求前触发一次上下文压缩。
     pub force_compact: Arc<AtomicBool>,
-    /// 可用 Agent 档案（内置 + 自定义；`task` 工具据此委派子代理）。
+    /// 可用 Agent 档案（内置 + 自定义；`task` / `task_graph` 据此委派子代理）。
     pub profiles: Vec<AgentProfile>,
 }
 
@@ -598,7 +600,36 @@ type BatchItem<'a> = &'a (ToolCall, usize, DateTime<Utc>);
 /// 分类后的（只读组，副作用组）。
 type BatchGroups<'a> = (Vec<(usize, BatchItem<'a>)>, Vec<(usize, BatchItem<'a>)>);
 
-/// 执行批次内的单个调用；`task` 走子代理隔离循环，其余走统一工具链。
+/// 子代理协议不在 ToolRegistry 中，需根据档案权限显式判断能否进入并行只读组。
+/// 任一节点不是 ReadOnly 时整张图串行，避免两个图同时触发审批或写事务。
+fn delegated_call_requires_serial(call: &ToolCall, profiles: &[AgentProfile]) -> bool {
+    let profile_is_not_readonly = |agent_id: &str| {
+        find_profile(profiles, agent_id)
+            .is_none_or(|profile| profile.permission != PermissionMode::ReadOnly)
+    };
+    match call.name.as_str() {
+        "task" => call
+            .input
+            .get("agent")
+            .and_then(Value::as_str)
+            .is_none_or(profile_is_not_readonly),
+        "task_graph" => call
+            .input
+            .get("tasks")
+            .and_then(Value::as_array)
+            .is_none_or(|tasks| {
+                tasks.iter().any(|task| {
+                    task.get("agent")
+                        .and_then(Value::as_str)
+                        .is_none_or(profile_is_not_readonly)
+                })
+            }),
+        _ => false,
+    }
+}
+
+/// 执行批次内的单个调用；`task` / `task_graph` 走子代理隔离循环，
+/// 其余走统一工具链。
 async fn execute_batch_call(
     config: &AgentRunConfig<'_>,
     session_id: Uuid,
@@ -607,16 +638,20 @@ async fn execute_batch_call(
     subagent: Option<&SubagentContext<'_>>,
     started_at: DateTime<Utc>,
 ) -> BatchCallOutcome {
-    if call.name == "task" {
+    if matches!(call.name.as_str(), "task" | "task_graph") {
         let Some(context) = subagent else {
             return BatchCallOutcome::Tool(ToolResult::failure(
                 "TOOL_NOT_FOUND",
                 "子代理上下文不可用。",
                 started_at,
-                json!({ "toolName": "task" }),
+                json!({ "toolName": call.name }),
             ));
         };
-        let outcome: SubagentOutcome = run_subagent(context, call.input.clone(), started_at).await;
+        let outcome: SubagentOutcome = if call.name == "task_graph" {
+            run_subagent_graph(context, call.input.clone(), started_at).await
+        } else {
+            run_subagent(context, call.input.clone(), started_at).await
+        };
         BatchCallOutcome::Subagent {
             result: outcome.result,
             audit: outcome.audit,
@@ -690,8 +725,9 @@ pub async fn run_agent(config: AgentRunConfig<'_>) -> XduduResult<AgentRunResult
         .iter()
         .map(|definition| definition.provider_definition())
         .collect();
-    // 注入 task 委派工具（子代理档案），不注册进 ToolRegistry（由本循环特判执行）。
+    // 注入子代理委派协议，不注册进 ToolRegistry（由本循环特判执行）。
     provider_tools.push(task_tool_definition(&config.profiles));
+    provider_tools.push(task_graph_tool_definition(&config.profiles));
     let mut system = build_system_prompt(&definitions, Path::new(&config.cwd));
     let (instruction_files, instruction_warnings) = load_instructions(Path::new(&config.cwd));
     for warning in &instruction_warnings {
@@ -1012,15 +1048,13 @@ pub async fn run_agent(config: AgentRunConfig<'_>) -> XduduResult<AgentRunResult
                 if !batch_aborted {
                     // 2. 分类：无副作用（side_effect == None）并行执行，
                     //    有副作用工具保持串行，不改变账本单写者与审批顺序。
-                    //    `task` 视为无本地副作用，多个子代理可并行。
-                    // 2. 分类：无副作用（side_effect == None）并行执行，
-                    //    有副作用工具保持串行，不改变账本单写者与审批顺序。
-                    //    `task` 视为无本地副作用，多个子代理可并行。
+                    //    子代理协议自身负责图内只读并发与副作用节点串行。
                     let (readonly, side_effect): BatchGroups<'_> =
                         batch.iter().enumerate().partition(|(_, (call, _, _))| {
-                            config.tool_registry.get(&call.name).is_none_or(|tool| {
-                                !tool.definition().side_effect.requires_approval()
-                            })
+                            !delegated_call_requires_serial(call, &config.profiles)
+                                && config.tool_registry.get(&call.name).is_none_or(|tool| {
+                                    !tool.definition().side_effect.requires_approval()
+                                })
                         });
                     // 子代理上下文：权限在批次启动时快照，隔离消息循环执行。
                     let subagent_instructions = if rendered_instructions.is_empty() {
@@ -1196,6 +1230,20 @@ pub async fn run_agent(config: AgentRunConfig<'_>) -> XduduResult<AgentRunResult
                         record.approval = result.approval.as_deref().cloned();
                         let content = if result.success {
                             serde_json::to_string(&result.output.unwrap_or(Value::Null))?
+                        } else if call.name == "task_graph" {
+                            let error = result.error.as_ref();
+                            let details = error
+                                .and_then(|error| serde_json::to_string(&error.details).ok())
+                                .unwrap_or_else(|| "{}".into());
+                            format!(
+                                "Error [{}]: {}\nGraph report: {details}",
+                                error
+                                    .map(|error| error.code.as_str())
+                                    .unwrap_or("UNKNOWN_ERROR"),
+                                error
+                                    .map(|error| error.message.as_str())
+                                    .unwrap_or("未知错误")
+                            )
                         } else {
                             format!(
                                 "Error [{}]: {}",
@@ -1363,7 +1411,13 @@ pub async fn run_agent(config: AgentRunConfig<'_>) -> XduduResult<AgentRunResult
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, sync::Mutex};
+    use std::{
+        collections::VecDeque,
+        sync::{
+            Mutex,
+            atomic::{AtomicBool as TestAtomicBool, Ordering as TestOrdering},
+        },
+    };
 
     use async_trait::async_trait;
     use serde_json::json;
@@ -1384,6 +1438,30 @@ mod tests {
     struct MockProvider {
         responses: Mutex<VecDeque<ProviderResponse>>,
         systems: Mutex<Vec<String>>,
+    }
+
+    struct CatalogProvider {
+        saw_task: TestAtomicBool,
+        saw_task_graph: TestAtomicBool,
+    }
+
+    #[async_trait]
+    impl Provider for CatalogProvider {
+        fn name(&self) -> &'static str {
+            "catalog-mock"
+        }
+
+        async fn chat(&self, request: ProviderRequest) -> XduduResult<ProviderResponse> {
+            self.saw_task.store(
+                request.tools.iter().any(|tool| tool.name == "task"),
+                TestOrdering::SeqCst,
+            );
+            self.saw_task_graph.store(
+                request.tools.iter().any(|tool| tool.name == "task_graph"),
+                TestOrdering::SeqCst,
+            );
+            Ok(text_response("完成"))
+        }
     }
 
     #[derive(Default)]
@@ -1519,6 +1597,24 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[tokio::test]
+    async fn 主循环向provider同时提供单任务与任务图协议() {
+        let dir = tempdir().unwrap();
+        let provider = CatalogProvider {
+            saw_task: TestAtomicBool::new(false),
+            saw_task_graph: TestAtomicBool::new(false),
+        };
+        let mut registry = ToolRegistry::new();
+        register_builtins(&mut registry).unwrap();
+        let store = JsonSessionStore::new(dir.path());
+        let result = run_agent(config(dir.path(), &provider, &registry, &store))
+            .await
+            .unwrap();
+        assert_eq!(result.status, SessionStatus::Completed);
+        assert!(provider.saw_task.load(TestOrdering::SeqCst));
+        assert!(provider.saw_task_graph.load(TestOrdering::SeqCst));
     }
 
     #[tokio::test]
@@ -2300,5 +2396,29 @@ mod tests {
         .unwrap();
         // 窗口内有成功工具调用时，短输出不会累计为无进展停滞。
         assert_eq!(result.status, SessionStatus::Completed);
+    }
+
+    #[test]
+    fn 子代理批次只并行纯只读档案() {
+        let profiles = crate::subagent::builtin_profiles();
+        let read_graph = ToolCall {
+            id: "graph-read".into(),
+            name: "task_graph".into(),
+            input: json!({"tasks":[
+                {"id":"a","agent":"explore","prompt":"调查"},
+                {"id":"b","agent":"reviewer","prompt":"审查"}
+            ]}),
+        };
+        assert!(!delegated_call_requires_serial(&read_graph, &profiles));
+
+        let write_graph = ToolCall {
+            id: "graph-write".into(),
+            name: "task_graph".into(),
+            input: json!({"tasks":[
+                {"id":"a","agent":"explore","prompt":"调查"},
+                {"id":"b","agent":"general","prompt":"修改"}
+            ]}),
+        };
+        assert!(delegated_call_requires_serial(&write_graph, &profiles));
     }
 }

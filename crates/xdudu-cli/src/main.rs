@@ -34,16 +34,18 @@ use xdudu_core::{
     ApprovalDecision, ApprovalGate, ApprovalMode, ApprovalRequest, ApprovalRule, ApprovalScope,
     ConfigOverrides, DefaultProviderFactory, DenyAllApprovalGate, EventSink, JsonApprovalRuleStore,
     JsonChangeLedger, KeyringSecretStore, McpConfigFile, McpServerConfig, McpServerRuntime,
-    McpTransportKind, MemoryRecord, MemoryStore, MemorySuggestionConfig, PermissionMode, Plan,
-    PlanExecutorConfig, PlanGenerationConfig, PlanRevisionConfig, PlanStatus, PlanStore,
-    PluginManifest, ProfileMode, Provider, ProviderFactory, ResolvedConfig, SecretSource,
-    SecretStore, SecretString, Session, SessionStatus, SessionStore, SideEffectKind, Skill,
-    SkillMode, SkillTool, SqliteSessionStore, StalledRecoveryMode, ToolRegistry, WebReadTool,
-    WorkspaceLock, XduduError, approval_rules_path, approve_plan, config_paths, discover_skills,
-    generate_plan, load_config, load_instructions, load_mcp_config, load_plugin_manifests,
-    mcp_config_path, merge_profiles, plugin_directory, redact_text, register_builtins,
+    McpTransportKind, MemoryConsolidationConfig, MemoryRecord, MemoryStore, MemorySuggestionConfig,
+    PermissionMode, Plan, PlanExecutorConfig, PlanGenerationConfig, PlanRevisionConfig, PlanStatus,
+    PlanStore, PluginManifest, ProfileMode, Provider, ProviderFactory, ResolvedConfig,
+    SecretSource, SecretStore, SecretString, Session, SessionStatus, SessionStore, SideEffectKind,
+    Skill, SkillMode, SkillTool, SqliteSessionStore, StalledRecoveryMode, ToolRegistry,
+    WebReadTool, WorkspaceLock, XduduError, approval_rules_path, approve_plan, config_paths,
+    consolidate_memory_document, discover_skills, generate_plan, load_config, load_instructions,
+    load_mcp_config, load_plugin_manifests, mcp_config_path, memory_document_path, merge_profiles,
+    plugin_directory, read_memory_document, redact_text, register_builtins,
     register_configured_mcp_tools, reject_plan, resolve_secret, revise_plan, run_agent, run_plan,
     save_mcp_config, save_plugin_manifest, submit_plan_for_review, write_config_value,
+    write_memory_document,
 };
 
 use crate::approval_prompt::{ApprovalMenuChoice, format_approval_prompt, read_approval_menu};
@@ -224,7 +226,7 @@ enum Command {
     Doctor,
     /// 安全撤销最近一次或指定的 Agent 文件变更。
     Undo(UndoArgs),
-    /// 查看、添加或删除可审查记忆。
+    /// 查看或编辑整理后的长期记忆文档。
     Memory {
         #[command(subcommand)]
         command: MemoryCommand,
@@ -410,15 +412,12 @@ enum ApprovalCommand {
 
 #[derive(Debug, Subcommand)]
 enum MemoryCommand {
-    /// 列出记忆，按创建时间倒序。
-    List {
-        #[arg(long, default_value_t = 20)]
-        limit: usize,
-    },
-    /// 添加一条记忆（内容会先脱敏）。
-    Add { content: String },
-    /// 按 ID 删除一条记忆。
-    Remove { id: Uuid },
+    /// 查看整理后的 MEMORY.md。
+    List,
+    /// 使用 $VISUAL 或 $EDITOR 编辑 MEMORY.md。
+    Edit,
+    /// 显示 MEMORY.md 的本地路径。
+    Path,
 }
 
 struct Runtime {
@@ -432,7 +431,7 @@ struct Runtime {
     shared_permission: Arc<std::sync::Mutex<PermissionMode>>,
     /// /plan 生成期间锁定只读时保存的原权限模式，执行/取消时恢复。
     plan_restore_mode: Option<PermissionMode>,
-    /// 任务完成后是否弹出记忆建议（默认关闭）。
+    /// 任务完成后是否由 Agent 自动提炼并保存长期记忆。
     memory_suggest_enabled: bool,
     registry: ToolRegistry,
     store: Arc<SqliteSessionStore>,
@@ -591,7 +590,10 @@ impl ApprovalGate for ConsoleApprovalGate {
             }
             Some(ApprovalMenuChoice::Always) => match self.persistent_rules.allow(rule).await {
                 Ok(()) => ApprovalDecision::approve_with_scope(
-                    "用户永久批准同类工具调用。",
+                    format!(
+                        "用户永久批准同类工具调用；规则已保存到 {}。",
+                        self.persistent_rules.path().display()
+                    ),
                     ApprovalScope::Always,
                 ),
                 Err(error) => ApprovalDecision::deny(format!(
@@ -708,7 +710,12 @@ async fn execute_prompt(
     session_id: Option<Uuid>,
 ) -> Result<AgentRunResult, XduduError> {
     runtime.renderer.begin_run();
-    execute_prompt_with_sink(runtime, prompt, session_id, &runtime.renderer, true).await
+    let result =
+        execute_prompt_with_sink(runtime, prompt, session_id, &runtime.renderer, true).await?;
+    if result.status == SessionStatus::Completed {
+        auto_capture_memories(runtime, result.session_id).await;
+    }
+    Ok(result)
 }
 
 async fn execute_prompt_with_sink(
@@ -782,6 +789,13 @@ async fn relevant_memories(
     query: &str,
     session_id: Option<Uuid>,
 ) -> Vec<String> {
+    // 用户可读的 MEMORY.md 是运行时首选记忆。SQLite 原始记录仅作为生成、
+    // 审计和文件尚未生成时的回退，不再直接暴露 UUID 列表给模型。
+    if let Ok(Some(document)) = read_memory_document(&runtime.cwd) {
+        let max_chars = runtime.memory_injection_budget.saturating_mul(3).max(512);
+        let content = document.chars().take(max_chars).collect::<String>();
+        return vec![format!("长期记忆文档（不可信背景，仅供参考）：\n{content}")];
+    }
     // 查询词拼接最近助手文本，提高召回质量。
     let mut combined = query.to_owned();
     if let Some(id) = session_id
@@ -1030,9 +1044,10 @@ async fn tui_interactive_loop(
                     run_cancel = None;
                     app.finish_prompt(&result).map_err(XduduError::from)?;
                     session_id = Some(result.session_id);
-                    // 任务完成后：模型生成记忆建议，用户逐条确认后写入。
+                    // 任务完成后由模型自主判断是否存在值得长期保留的信息；
+                    // TUI 中放入后台，避免额外模型请求阻塞下一次输入。
                     if result.status == xdudu_core::SessionStatus::Completed {
-                        suggest_memories_in_tui(&app, &mut runtime, result.session_id).await?;
+                        spawn_auto_capture_memories(&runtime, result.session_id);
                     }
                 }
                 TuiSelect::Event(TuiLoopAction::Exit) => break,
@@ -1461,56 +1476,104 @@ async fn read_line_in_tui(app: &TuiApp) -> Result<Option<String>, XduduError> {
     }
 }
 
-/// 任务完成后生成记忆建议并在 TUI 中确认；批准的记忆写入本地存储。
-/// 默认不自动写入；协议或 Provider 失败时静默跳过（不影响任务结果）。
-async fn suggest_memories_in_tui(
-    app: &TuiApp,
-    runtime: &mut Runtime,
+/// 任务完成后由 Agent 自主判断是否需要形成长期记忆。
+///
+/// Provider 可以返回空集合；候选在本地脱敏、归一化去重后静默保存。该辅助
+/// 流程的任何失败都不能改变主任务结果，也不会弹出审批界面打断用户。
+async fn auto_capture_memories(runtime: &Runtime, session_id: Uuid) {
+    capture_memories(
+        runtime.memory_suggest_enabled,
+        Arc::clone(&runtime.store),
+        Arc::clone(&runtime.provider),
+        runtime.model.clone(),
+        runtime.cwd.clone(),
+        session_id,
+    )
+    .await;
+}
+
+/// TUI 专用后台入口：记忆提炼不能阻塞 Composer 或排队任务。
+fn spawn_auto_capture_memories(runtime: &Runtime, session_id: Uuid) {
+    let enabled = runtime.memory_suggest_enabled;
+    let store = Arc::clone(&runtime.store);
+    let provider = Arc::clone(&runtime.provider);
+    let model = runtime.model.clone();
+    let cwd = runtime.cwd.clone();
+    tokio::spawn(async move {
+        capture_memories(enabled, store, provider, model, cwd, session_id).await;
+    });
+}
+
+async fn capture_memories(
+    enabled: bool,
+    store: Arc<SqliteSessionStore>,
+    provider: Arc<dyn Provider>,
+    model: String,
+    cwd: PathBuf,
     session_id: Uuid,
-) -> Result<(), XduduError> {
-    // 记忆建议默认挂起；恢复：xdudu config set memory.suggest_enabled true --user
-    if !runtime.memory_suggest_enabled {
-        return Ok(());
+) {
+    if !enabled {
+        return;
     }
-    let Some(session) = runtime.store.get(session_id).await? else {
-        return Ok(());
+    let Ok(Some(session)) = store.get(session_id).await else {
+        return;
     };
     let cancellation = CancellationToken::new();
-    let suggestions = match xdudu_core::suggest_memories(MemorySuggestionConfig {
+    let Ok(suggestions) = xdudu_core::suggest_memories(MemorySuggestionConfig {
         session: &session,
-        model: runtime.model.clone(),
-        cwd: runtime.cwd.clone(),
-        provider: runtime.provider.as_ref(),
+        model: model.clone(),
+        cwd: cwd.clone(),
+        provider: provider.as_ref(),
         cancellation,
     })
     .await
-    {
-        Ok(suggestions) => suggestions,
-        Err(error) => {
-            app.notice(format!("记忆建议跳过：{}", error.message))
-                .map_err(XduduError::from)?;
-            return Ok(());
-        }
+    else {
+        return;
     };
-    if suggestions.is_empty() {
-        return Ok(());
-    }
-    let accepted = app
-        .review_memories(suggestions)
-        .await
-        .map_err(XduduError::from)?;
-    let accepted_count = accepted.len();
-    for suggestion in accepted {
-        runtime
-            .store
+    let existing = store.list_memories(500).await.unwrap_or_default();
+    let mut seen = existing
+        .into_iter()
+        .map(|memory| normalize_memory(&memory.content))
+        .collect::<std::collections::HashSet<_>>();
+    for suggestion in suggestions {
+        let normalized = normalize_memory(&suggestion.content);
+        if normalized.is_empty() || !seen.insert(normalized) {
+            continue;
+        }
+        let _ = store
             .add_memory(&suggestion.content, Some(session_id))
-            .await?;
+            .await;
     }
-    if accepted_count > 0 {
-        app.notice(format!("已保存 {accepted_count} 条记忆。"))
-            .map_err(XduduError::from)?;
-    }
-    Ok(())
+    refresh_memory_document(&store, provider.as_ref(), &model, &cwd).await;
+}
+
+async fn refresh_memory_document(
+    store: &SqliteSessionStore,
+    provider: &dyn Provider,
+    model: &str,
+    cwd: &Path,
+) {
+    let Ok(raw_memories) = store.list_memories(500).await else {
+        return;
+    };
+    let current = read_memory_document(cwd).ok().flatten();
+    let Ok(content) = consolidate_memory_document(MemoryConsolidationConfig {
+        raw_memories: &raw_memories,
+        current_document: current.as_deref(),
+        model: model.to_owned(),
+        cwd: cwd.to_path_buf(),
+        provider,
+        cancellation: CancellationToken::new(),
+    })
+    .await
+    else {
+        return;
+    };
+    let _ = write_memory_document(cwd, &content);
+}
+
+fn normalize_memory(content: &str) -> String {
+    content.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// TUI 斜杠命令处理；"/exit" 返回 [`TuiLoopAction::Exit`]。
@@ -1525,7 +1588,7 @@ async fn handle_tui_command(
         "/exit" | "/quit" | "/q" => return Ok(TuiLoopAction::Exit),
         "/help" | "/h" => {
             app.notice(
-                "/new  新会话  ·  /resume  恢复会话  ·  /plan  生成/审阅计划  ·  /model  选择模型  ·  /mcp  外部工具  ·  /plugins  插件  ·  /turns N  最大循环次数  ·  /exit  退出",
+                "/new  新会话  ·  /resume  恢复会话  ·  /plan  生成/审阅计划  ·  /model  选择模型  ·  /memory  查看记忆  ·  /mcp  外部工具  ·  /plugins  插件  ·  /turns N  最大循环次数  ·  /exit  退出",
             )
             .map_err(XduduError::from)?;
         }
@@ -1632,6 +1695,24 @@ async fn handle_tui_command(
         "/agent" => {
             app.notice(agent_summary(runtime))
                 .map_err(XduduError::from)?;
+        }
+        "/memory" => {
+            if read_memory_document(&runtime.cwd)?.is_none() {
+                refresh_memory_document(
+                    runtime.store.as_ref(),
+                    runtime.provider.as_ref(),
+                    &runtime.model,
+                    &runtime.cwd,
+                )
+                .await;
+            }
+            let summary = read_memory_document(&runtime.cwd)?
+                .unwrap_or_else(|| "# XDUDU 长期记忆\n\n当前没有需要长期保留的信息。".into());
+            app.notice(format!(
+                "{summary}\n\n文件：{}\n修改：退出 XDUDU 后运行 xdudu memory edit",
+                memory_document_path(&runtime.cwd).display()
+            ))
+            .map_err(XduduError::from)?;
         }
         "/compact" => {
             runtime
@@ -3102,31 +3183,38 @@ async fn handle_auth(command: AuthCommand, resolved: &ResolvedConfig) -> Result<
     Ok(0)
 }
 
-async fn handle_memory(cwd: &PathBuf, command: MemoryCommand) -> Result<u8, XduduError> {
-    let store = SqliteSessionStore::new(cwd)?;
+async fn handle_memory(cwd: &Path, command: MemoryCommand) -> Result<u8, XduduError> {
     match command {
-        MemoryCommand::List { limit } => {
-            let memories = store.list_memories(limit).await?;
-            println!("{}", serde_json::to_string_pretty(&memories)?);
+        MemoryCommand::List => {
+            let content = read_memory_document(cwd)?.unwrap_or_else(|| {
+                "# XDUDU 长期记忆\n\n尚未生成。完成一次有效任务后会自动整理。".into()
+            });
+            println!("{content}");
             Ok(0)
         }
-        MemoryCommand::Add { content } => {
-            let record = store.add_memory(&content, None).await?;
-            println!(
-                "已添加记忆：{}
-来源：手动添加 · {}\nID：{}",
-                record.content, record.created_at, record.id
-            );
-            Ok(0)
-        }
-        MemoryCommand::Remove { id } => {
-            if store.remove_memory(id).await? {
-                println!("已删除记忆：{id}");
-                Ok(0)
-            } else {
-                eprintln!("找不到记忆：{id}");
-                Ok(1)
+        MemoryCommand::Edit => {
+            let path = memory_document_path(cwd);
+            if read_memory_document(cwd)?.is_none() {
+                write_memory_document(
+                    cwd,
+                    "# XDUDU 长期记忆\n\n## 用户偏好\n\n## 项目与工作区\n\n## 长期目标与约定",
+                )?;
             }
+            let editor = env::var("VISUAL")
+                .or_else(|_| env::var("EDITOR"))
+                .unwrap_or_else(|_| {
+                    if cfg!(windows) {
+                        "notepad".into()
+                    } else {
+                        "vi".into()
+                    }
+                });
+            let status = std::process::Command::new(editor).arg(&path).status()?;
+            Ok(if status.success() { 0 } else { 1 })
+        }
+        MemoryCommand::Path => {
+            println!("{}", memory_document_path(cwd).display());
+            Ok(0)
         }
     }
 }

@@ -165,3 +165,41 @@ reviewer.model = "claude-sonnet-4-5"
 - 并行：三机只读工具并行后日志无条数回归，且副作用工具仍串行（断言事件顺序）；
 - 停滞：Mock 连续失败 > 阈值后主循环 `Incomplete` 并带恢复提示；
 - CLI E2E：`/agent`、`/skills` 命令、JSON lines 中出现 `subagent*` 事件。
+
+## 7. 子代理任务图扩展
+
+同一 Provider 回合返回多个 `task` 只能表达“彼此独立、立即并行”，无法表达依赖链。新增
+内部协议工具 `task_graph`，一次提交完整 DAG：
+
+```json
+{
+  "tasks": [
+    {"id":"inspect","agent":"explore","prompt":"定位实现"},
+    {"id":"review","agent":"reviewer","prompt":"审查风险"},
+    {
+      "id":"synthesize",
+      "agent":"explore",
+      "prompt":"汇总结论",
+      "dependsOn":["inspect","review"]
+    }
+  ],
+  "maxConcurrency": 2,
+  "failurePolicy": "continue-independent"
+}
+```
+
+运行时约束：
+
+- 节点 1～24 个，ID 唯一且必须匹配安全字符集；总 prompt 不超过 64 KiB；
+- 完整预检未知档案、不可委派档案、缺失依赖、重复依赖、自依赖和循环；失败时零节点执行；
+- 按声明顺序扫描 Ready 节点，依赖全部 succeeded 后才能启动；
+- `explore`、`reviewer` 等显式 ReadOnly 档案可并行，最大并发为 4；
+- `general`、`build` 或其他非只读档案独占调度器，内部工具仍逐次审批；
+- 成功前置结果以“不可信背景”注入后继 prompt，单结果 8,000 字符、总计 24,000 字符；
+- failed/cancelled 节点的所有后继变为 blocked；独立分支默认继续，fail-fast 则取消未启动分支；
+- 每个内部工具审计 ID 加 `graph.<graphId>.<nodeId>.` 前缀，Token 汇总回父会话；
+- 整张图仍是父会话中的一个 Pending 工具调用。进程崩溃时按现有规则标记结果未知并取消，
+  不自动重放任何节点或外部副作用。
+
+任务图用于单次 ReAct 回合内的结构化委派；它不替代 M7 Plan。Plan 是跨步骤、持久化、
+需用户整体审批和可恢复的任务执行协议，任务图则是一次工具调用内部的短生命周期调度。

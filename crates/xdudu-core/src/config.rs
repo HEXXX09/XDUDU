@@ -220,7 +220,7 @@ pub struct AppConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MemoryConfig {
-    /// 任务完成后是否弹出记忆建议并请求确认；默认关闭（挂起）。
+    /// 任务完成后是否由 Agent 自动提炼长期记忆；默认开启，可由用户关闭。
     pub suggest_enabled: bool,
     /// 记忆注入的最大条数（召回后排序去重，默认 8）。
     pub top_k: usize,
@@ -1031,7 +1031,7 @@ fn load_config_from_paths(
         },
         telemetry: TelemetryConfig { enabled: false },
         memory: MemoryConfig {
-            suggest_enabled: false,
+            suggest_enabled: true,
             top_k: 8,
             injection_token_budget: 1500,
         },

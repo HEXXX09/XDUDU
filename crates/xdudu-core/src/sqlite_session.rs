@@ -1294,6 +1294,71 @@ impl MemoryStore for SqliteSessionStore {
         .await
     }
 
+    async fn update_memory(&self, id: Uuid, content: &str) -> XduduResult<Option<MemoryRecord>> {
+        let content = sanitize_memory_content(content).ok_or_else(|| {
+            XduduError::validation(format!(
+                "记忆内容不能为空且不超过 {MAX_MEMORY_BYTES} 字节。"
+            ))
+        })?;
+        let id_text = id.to_string();
+        let updated_at = Utc::now();
+        let updated = updated_at.to_rfc3339();
+        self.run_blocking(move |mut connection| {
+            let transaction = connection
+                .transaction()
+                .map_err(|error| XduduError::tool(format!("开始更新记忆事务失败：{error}")))?;
+            let existing: Option<(i64, Option<String>, String)> = transaction
+                .query_row(
+                    "SELECT rowid, source_session_id, created_at FROM memories WHERE id = ?1",
+                    rusqlite::params![id_text],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()
+                .map_err(|error| XduduError::tool(format!("查询待更新记忆失败：{error}")))?;
+            let Some((rowid, source, created)) = existing else {
+                return Ok(None);
+            };
+            transaction
+                .execute(
+                    "UPDATE memories SET content = ?1, updated_at = ?2 WHERE id = ?3",
+                    rusqlite::params![content, updated, id_text],
+                )
+                .map_err(|error| XduduError::tool(format!("更新记忆失败：{error}")))?;
+            transaction
+                .execute(
+                    "DELETE FROM memories_fts WHERE rowid = ?1",
+                    rusqlite::params![rowid],
+                )
+                .map_err(|error| XduduError::tool(format!("删除旧记忆索引失败：{error}")))?;
+            transaction
+                .execute(
+                    "INSERT INTO memories_fts(rowid, content) VALUES (?1, ?2)",
+                    rusqlite::params![rowid, content],
+                )
+                .map_err(|error| XduduError::tool(format!("更新记忆全文索引失败：{error}")))?;
+            transaction
+                .commit()
+                .map_err(|error| XduduError::tool(format!("提交更新记忆事务失败：{error}")))?;
+
+            Ok(Some(MemoryRecord {
+                id,
+                content,
+                source_session_id: source
+                    .map(|value| {
+                        Uuid::parse_str(&value).map_err(|error| {
+                            XduduError::tool(format!("记忆来源会话 ID 无效：{error}"))
+                        })
+                    })
+                    .transpose()?,
+                created_at: DateTime::parse_from_rfc3339(&created)
+                    .map_err(|error| XduduError::tool(format!("记忆时间无效：{error}")))?
+                    .with_timezone(&Utc),
+                updated_at,
+            }))
+        })
+        .await
+    }
+
     async fn remove_memory(&self, id: Uuid) -> XduduResult<bool> {
         let id_text = id.to_string();
         self.run_blocking(move |mut connection| {
@@ -1459,6 +1524,28 @@ mod tests {
         let found = store.search_memories("命令执行前", 5).await.unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].id, second.id);
+
+        // 修改与 FTS 索引在同一事务中更新，ID、来源与创建时间保持不变。
+        let updated = store
+            .update_memory(second.id, "项目约定：测试完成后再提交")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.id, second.id);
+        assert_eq!(updated.source_session_id, second.source_session_id);
+        assert_eq!(updated.created_at, second.created_at);
+        assert!(updated.updated_at >= second.updated_at);
+        assert!(
+            store
+                .search_memories("命令执行前", 5)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store.search_memories("测试完成", 5).await.unwrap()[0].id,
+            second.id
+        );
         // 不相关查询无结果。
         assert!(
             store

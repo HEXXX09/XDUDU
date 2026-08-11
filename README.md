@@ -351,6 +351,7 @@ xdudu-core
 - [M11 Provider 生态与思考路径设计](docs/M11_PROVIDER_DESIGN.md)
 - [M11 上下文、记忆与 Web 阅读设计](docs/M11_CONTEXT_WEBMEM_DESIGN.md)
 - [XDUDU Agent 原理与源码学习指南](docs/AGENT_LEARNING_GUIDE.md)
+- [XDUDU 完整面试题与答案手册（150 题）](docs/XDUDU_INTERVIEW_GUIDE.md)
 - [产品需求](docs/PRD.md)
 - [任务路线图](docs/TASKS.md)
 - [Rust 迁移记录](docs/RUST_MIGRATION.md)

@@ -1,8 +1,1692 @@
-# XDUDU 完整面试题与答案手册
+# XDUDU 从零学习与完整面试手册
 
 > 适用基线：`main@671d983`。本手册以当前源码为事实来源；源码映射使用文件和稳定符号，不绑定行号。
 
-## 使用方法
+## 先看这里：这份文档里有三种完全不同的知识
+
+如果你刚开始学习，不要直接从 150 道题往下背。XDUDU 同时使用了 Rust、Agent 原理和软件工程设计，名字经常出现在同一段代码里，但它们不是一回事。
+
+| 标记 | 它是什么 | 典型内容 | 你要回答的问题 |
+|---|---|---|---|
+| **【Rust】** | 编程语言知识 | 所有权、借用、trait、Result、Arc、async | 这段 Rust 语法为什么能编译、数据由谁管理？ |
+| **【Agent】** | AI Agent 原理 | Tool Calling、ReAct、上下文、Memory、Plan | 模型怎样决定行动，又怎样观察真实结果？ |
+| **【XDUDU 工程】** | 本项目自己的实现 | ToolRegistry、SessionStore、ApprovalGate | XDUDU 怎样把 Agent 原理做成安全程序？ |
+| **【通用工程】** | 不只属于 Rust/Agent | SQLite、事务、SSRF、CI、状态机 | 系统怎样在失败、并发和攻击下保持可靠？ |
+
+例如：
+
+```text
+trait                  是 Rust 知识
+Tool trait             是 XDUDU 使用 Rust 定义的工具接口
+Tool Calling           是 Agent/模型协议
+ToolRegistry           是 XDUDU 连接 Tool Calling 与真实工具的工程组件
+Permission/Approval    是 XDUDU 的安全设计
+```
+
+所以不要把 `ToolRegistry` 当成 Rust 官方功能，也不要把 `trait` 当成 Agent 专用技术。正确关系是：
+
+```text
+Agent 原理提出需求：模型需要调用工具
+             │
+             ▼
+XDUDU 工程设计：所有工具必须经过 ToolRegistry
+             │
+             ▼
+Rust 提供实现手段：trait + HashMap + Arc + async
+```
+
+## 第零部分：先把项目里的关键词翻译成人话
+
+这一部分不要求你看源码。目标是先知道每个词在系统里扮演什么角色。以后遇到陌生名词，先问四件事：
+
+1. 它是一个人、数据、动作，还是规则？
+2. 它位于模型侧、XDUDU 程序内部，还是操作系统侧？
+3. 谁创建它，谁调用它？
+4. 它失败以后，错误交给谁处理？
+
+### 0.1 一张“公司岗位表”理解全部组件
+
+可以把 XDUDU 想成一家接受自然语言委托的软件公司：
+
+| XDUDU 名词 | 公司类比 | 实际职责 | 它不负责什么 |
+|---|---|---|---|
+| User | 客户 | 提出目标、确认审批 | 不需要提供每个实现步骤 |
+| Model / LLM | 会分析问题的工程师 | 阅读上下文，生成回复或提出工具调用 | 不能直接读硬盘、运行命令 |
+| Agent Runtime | 项目经理 | 反复协调模型和工具，判断任务是否结束 | 不实现具体模型 HTTP 协议 |
+| Provider | 翻译员/供应商适配器 | 把 XDUDU 统一请求翻译成 DeepSeek 等厂商协议 | 不批准文件写入 |
+| Tool | 具体执行人员 | 读取文件、搜索、运行 Git 或命令 | 不决定整个任务下一步 |
+| ToolRegistry | 工具调度与安保中心 | 查找工具，并统一做权限、校验、审批、超时 | 不负责生成自然语言答案 |
+| Session | 项目档案 | 保存消息、工具调用和运行状态 | 不是模型的上下文窗口本身 |
+| SessionStore | 档案室 | 把 Session 存入 SQLite 并恢复 | 不决定模型该回答什么 |
+| EventSink | 广播接口 | 接收状态、文本、工具进度等事件 | 不直接执行工具 |
+| TUI | 用户看到的工作台 | 把事件渲染成终端界面并接收键盘输入 | 不应绕过 Registry 修改文件 |
+| Plan | 经审批的施工方案 | 保存步骤、依赖、完成条件和状态 | 批准 Plan 不等于批准所有副作用 |
+| MCP | 外部能力接入标准 | 让其他进程或服务向 XDUDU 暴露工具 | 不是另一个聊天模型 |
+
+把它们连起来：
+
+```text
+用户
+  │ 自然语言
+  ▼
+Agent Runtime ──统一请求──► Provider ──厂商请求──► DeepSeek API
+  ▲                                      │
+  │              文本或 ToolCall         │
+  └──────────────────────────────────────┘
+  │
+  ├─ ToolCall ─► ToolRegistry ─► Tool ─► 文件/进程/网络
+  │                  │
+  │                  └─ 权限、审批、超时、审计
+  │
+  ├─ 状态写入 ─► SessionStore ─► SQLite
+  │
+  └─ 事件发送 ─► EventSink ─► TUI
+```
+
+### 0.2 Model、LLM、API 和 Provider 到底有什么区别
+
+这四个词最容易混在一起。
+
+#### Model / LLM
+
+模型是负责“根据输入生成输出”的算法服务，例如 DeepSeek 某个具体模型。它本质上只看见请求中的文本、消息和工具定义。它看不见你的终端，也不能自己打开 `README.md`。
+
+#### API
+
+API 是调用模型服务时遵守的网络协议。它规定：
+
+- 请求发到哪个 URL；
+- HTTP Header 如何携带密钥；
+- JSON 用哪些字段；
+- 流式响应如何分段；
+- Tool Call 如何编码；
+- 错误和限流如何表达。
+
+DeepSeek 和 Anthropic 的字段并不完全相同。即使两个模型都能回答问题，它们的 API 也可能不同。
+
+#### Provider
+
+Provider 是 XDUDU 内部的“厂商协议适配层”。它让 Agent 不必理解每一家 API。
+
+假设 Agent 构造统一数据：
+
+```rust
+ProviderRequest {
+    model: "deepseek-chat",
+    messages: [...],
+    tools: [...],
+}
+```
+
+DeepSeek Provider 会把它翻译成 DeepSeek 接受的 HTTP JSON；Anthropic Provider 会翻译成 Anthropic Messages API。响应回来后，Provider 再把厂商字段翻译回统一的：
+
+```rust
+ProviderResponse {
+    message,
+    tool_calls,
+    finish_reason,
+    usage,
+}
+```
+
+因此可以记住：
+
+```text
+模型       = 真正生成内容的能力
+API        = 访问该能力的网络合同
+Provider   = XDUDU 对不同 API 的翻译器
+Agent      = 使用翻译器完成任务的控制循环
+```
+
+#### 为什么不在 Agent 里直接写 DeepSeek HTTP 请求
+
+如果直接写，Agent 主循环会同时承担：
+
+- 任务状态机；
+- DeepSeek 鉴权；
+- SSE 解码；
+- Anthropic 字段差异；
+- 重试和限流；
+- 工具参数拼接。
+
+这样更换模型时就必须修改 Agent 主循环。现在 Agent 只依赖 `Provider trait`，所以测试可以注入 `MockProvider`，未来增加兼容 Provider 也主要改适配层。
+
+#### Provider 一次调用的实际数据流
+
+```text
+agent.rs
+  │ 构造 ProviderRequest
+  ▼
+dyn Provider
+  │ 根据运行时真实类型调用 DeepSeekProvider
+  ▼
+reqwest::Client
+  │ HTTPS POST + Authorization + JSON
+  ▼
+DeepSeek
+  │ SSE: data: {...}
+  ▼
+Provider 流解析器
+  │ 拼接文本 delta / 工具参数 delta
+  ▼
+统一 ProviderResponse
+  │
+  └─ 返回 agent.rs
+```
+
+对应源码：
+
+- `crates/xdudu-core/src/provider/mod.rs::Provider`：统一接口和请求/响应类型；
+- `crates/xdudu-core/src/provider/deepseek.rs`：DeepSeek 协议转换；
+- `crates/xdudu-core/src/provider/anthropic.rs`：Anthropic 协议转换；
+- `crates/xdudu-core/src/provider/stream.rs`：流式事件接口；
+- `crates/xdudu-core/src/provider/retry.rs`：可重试错误和退避；
+- `crates/xdudu-core/src/provider/factory.rs`：根据配置创建具体 Provider。
+
+### 0.3 Agent 和 Agent Runtime 是什么
+
+普通聊天程序通常只做一次：
+
+```text
+用户问题 → 调用模型 → 展示答案
+```
+
+Agent Runtime 需要维持循环：
+
+```text
+用户目标
+  ↓
+调用模型
+  ↓
+模型是否要求工具？
+  ├─ 是：执行工具 → 把真实结果放回上下文 → 再调用模型
+  └─ 否：检查失败和完成条件 → 结束或标记未完成
+```
+
+“Runtime”强调它不是一段 Prompt，而是一套正在运行的控制程序。它负责：
+
+- 保存当前轮次；
+- 保证工具结果回到正确 call ID；
+- 区分 Planning、Acting、Observing、Reflecting；
+- 处理取消和最大轮次；
+- 记录未解决的工具错误；
+- 压缩过长上下文；
+- 把过程持久化；
+- 只在满足终态条件后报告完成。
+
+XDUDU 的核心入口是 `crates/xdudu-core/src/agent.rs::run_agent`。
+
+### 0.4 Prompt、Message、Context 和 Token
+
+#### Prompt
+
+Prompt 是发给模型的指令文本。System Prompt 定义身份和规则，User Prompt 表示用户本轮目标。Prompt 是软约束：模型可能理解错误，所以安全限制还必须由代码执行。
+
+#### Message
+
+Message 是有角色的会话单元：
+
+```text
+system     系统规则
+user       用户要求
+assistant  模型回复或工具调用
+tool       工具真实结果
+```
+
+Tool Call 和 Tool Result 必须通过 call ID 对应，否则模型无法知道结果属于哪一次调用。
+
+#### Context
+
+Context 是“本次真正发送给模型的全部可见信息”，通常包含系统 Prompt、近期消息、摘要、记忆和工具定义。SQLite 中可以有上千条消息，但不代表每轮都全部发送。
+
+#### Token
+
+Token 是模型处理文本时的计量单位，不完全等于一个汉字或一个英文单词。上下文窗口有 Token 上限，因此 XDUDU 必须选择近期消息并压缩早期内容。
+
+### 0.5 Tool Calling、Tool 和 ToolResult
+
+Tool Calling 是模型表达“我希望程序执行某个能力”的结构化协议，而不是模型直接运行函数。
+
+```json
+{
+  "id": "call_123",
+  "name": "file_read",
+  "arguments": {"path": "README.md"}
+}
+```
+
+XDUDU 找到名为 `file_read` 的 Tool，执行后得到：
+
+```json
+{
+  "callId": "call_123",
+  "ok": true,
+  "output": {"content": "# XDUDU ..."}
+}
+```
+
+模型下一轮看到这个结果，才可能基于真实文件内容继续工作。这里的关键不是 JSON 长什么样，而是：
+
+1. 模型只能提出意图；
+2. 程序决定是否允许；
+3. 结果必须反馈给模型；
+4. 失败也必须反馈，不能伪装成功。
+
+### 0.6 ToolRegistry、Schema、validate 和 preflight
+
+ToolRegistry 可以拆成两个词：
+
+- Registry：注册表，保存“工具名 → 工具对象”的映射；
+- Tool executor：统一执行入口，所有工具必须经过相同策略链。
+
+Schema 是工具输入的说明书。例如 `file_read` 要求 `path` 是字符串。Schema 会发给模型，帮助模型生成正确参数。
+
+但模型输出不能被信任，所以程序还要 `validate`：
+
+```text
+Schema      告诉模型应该怎样写
+validate    在执行端阻止错误输入
+```
+
+`preflight` 是正式产生副作用前的试运行。例如补丁工具先在内存解析所有 hunk、校验所有路径并计算结果；如果补丁本来就不成立，就不弹出审批。
+
+完整链路：
+
+```text
+查找工具
+ → 权限上限
+ → 输入校验
+ → 取消检查
+ → 无副作用预检
+ → 用户审批
+ → 超时包裹
+ → 真正执行
+ → 脱敏、审计、返回结果
+```
+
+### 0.7 Permission、Approval 和 Side Effect
+
+- Permission：本次运行允许达到的能力上限；
+- Approval：用户是否授权这一次具体操作；
+- Side Effect：操作会不会改变外部世界。
+
+例如 `file_read` 通常只读，`file_write` 会改变工作区，`terminal_exec` 会启动进程，`web_fetch` 会访问网络。
+
+```text
+read-only 模式 + 用户点击允许写文件
+              ↓
+仍然拒绝，因为 Approval 不能突破 Permission 上限
+```
+
+这种分层避免一次误点击把整个程序提升为无限权限。
+
+### 0.8 Session、SessionStore、SQLite 和 Checkpoint
+
+Session 是一次对话/任务的领域数据；SessionStore 是保存和读取这些数据的接口；SQLite 是当前具体存储实现。
+
+Checkpoint 是执行过程中的稳定保存点。例如工具调用前先保存 `Pending`：
+
+```text
+写入 Pending
+  ↓
+执行工具
+  ↓
+写入 Succeeded / Failed
+```
+
+如果程序在中间崩溃，重启后看见 Pending，只能判断“结果未知”。对文件写入、网络请求等副作用，不能自动重放，否则可能执行两次。
+
+### 0.9 Event、EventSink 和 TUI
+
+Agent 核心不直接打印终端，而是发语义事件：
+
+```text
+AssistantDelta
+ToolStarted
+ToolProgress
+ToolFinished
+PlanPaused
+```
+
+EventSink 是接收事件的接口。TUI、JSON Lines 和测试记录器可以用不同方式消费同一个事件。这就是为什么核心逻辑不依赖彩色终端。
+
+### 0.10 async、Tokio、SSE 和“流式输出”
+
+- `async/.await`：Rust 描述异步工作的语法；
+- Tokio：负责调度异步任务的运行时；
+- Reqwest：发送 HTTP 请求的客户端库；
+- SSE：服务器持续推送文本事件的一种 HTTP 流格式。
+
+模型可能这样返回：
+
+```text
+data: {"delta":"你"}
+data: {"delta":"好"}
+data: {"finish_reason":"stop"}
+```
+
+Provider 必须逐段解析并将文本 delta 发给 UI，同时在内部聚合完整回复。工具参数也可能被拆成多段，但参数没拼完整前绝不能执行。
+
+### 0.11 Trait、依赖注入和“解耦”
+
+Trait 是 Rust 定义能力接口的语言机制。依赖注入是一种组装方式：对象需要什么，由外部创建后传入，而不是对象内部写死。
+
+```rust
+pub struct AgentRunConfig<'a> {
+    pub provider: &'a dyn Provider,
+    pub tool_registry: &'a ToolRegistry,
+    pub session_store: &'a dyn SessionStore,
+}
+```
+
+这表示 Agent 只知道“有一个 Provider 可以调用”，不知道它是 DeepSeek 还是假实现。所谓解耦，就是修改其中一个组件时，其他组件尽量不需要修改。
+
+依赖注入不一定要 Spring 或专门框架。XDUDU 由 CLI 的 Runtime 装配代码手动创建对象并传入。
+
+### 0.12 Transaction、Hash、Atomic Write 和 Undo
+
+- Transaction：多个修改整体成功或整体失败；
+- Hash：文件内容的数字指纹，内容改变后 SHA-256 基本会改变；
+- Atomic Write：先写临时文件，再用原子替换切换成新版本；
+- Undo：依据账本恢复到修改前镜像。
+
+这四个概念解决不同问题：
+
+```text
+Hash          防止覆盖用户刚刚修改的新内容
+Transaction   防止多文件只改成功一半
+Atomic Write  防止单文件只写入半截
+Undo          允许成功修改之后安全恢复
+```
+
+### 0.13 Plan、Step、DAG、Revision 和 Evidence
+
+Plan 是可持久化的结构化计划；Step 是其中一个步骤；DAG 是“有方向且无环”的依赖图。
+
+```text
+读取架构 ─┐
+          ├─► 设计修改 ─► 编码 ─► 测试
+读取测试 ─┘
+```
+
+- revision：计划内容修改了第几版；
+- execution_version：执行状态更新了第几次；
+- evidence：证明完成条件确实满足的证据；
+- attempt：某一步第几次尝试。
+
+Plan 审批只表示认可施工方案。执行时的文件写入和命令仍要走 ToolRegistry。
+
+### 0.14 MCP、Skill 和 Plugin
+
+- MCP 是外部工具通信协议；
+- Skill 是给模型看的工作流程知识；
+- Plugin 是 XDUDU 中声明一组 MCP Server 的配置载体；
+- Tool 是最终可以被 Agent 结构化调用的能力。
+
+例如 Python 编写一个静态扫描服务，通过 MCP 暴露 `semgrep_scan`。XDUDU 把它包装成普通 Tool，仍然执行权限、审批、超时和脱敏。Skill 可以告诉模型“做 code review 时先调用 semgrep_scan，再解释结果”，但 Skill 自己不执行扫描。
+
+### 0.15 一页术语速查表
+
+| 术语 | 一句话解释 | 所属知识 |
+|---|---|---|
+| LLM / Model | 根据上下文生成内容的模型 | AI |
+| Provider | 模型厂商 API 适配器 | XDUDU 架构 |
+| Agent Runtime | 驱动模型和工具循环的程序 | Agent 工程 |
+| ReAct | 行动后观察结果再继续判断的循环 | Agent |
+| Tool Calling | 模型输出结构化工具意图的协议 | Agent |
+| ToolRegistry | 工具目录和统一安全执行入口 | XDUDU 工程 |
+| Schema | 工具参数的数据结构说明 | 数据协议 |
+| Session | 一次任务的消息与状态档案 | Agent 工程 |
+| Context | 某一轮真正发送给模型的信息 | Agent |
+| Memory | 跨会话保留的稳定信息 | Agent |
+| SSE | HTTP 流式事件格式 | 网络 |
+| Tokio | Rust 异步运行时 | Rust |
+| Reqwest | Rust HTTP 客户端 | Rust |
+| Crossterm | 跨平台终端控制库 | Rust/TUI |
+| Trait | Rust 的能力接口 | Rust |
+| 依赖注入 | 从外部把依赖传给组件 | 架构 |
+| SQLite | 嵌入式关系数据库 | 存储 |
+| Transaction | 一组操作整体提交或回滚 | 可靠性 |
+| SHA-256 | 内容指纹算法 | 完整性 |
+| DAG | 有方向、无环的依赖图 | 算法/编排 |
+| MCP | 外部服务提供 Agent 工具的协议 | 扩展 |
+| SSRF | 服务端被诱导访问危险地址的攻击 | 网络安全 |
+
+## 第一部分：从零理解 Rust、Agent 和 XDUDU
+
+这一部分是教学内容。读完以后，再进入后面的面试题。每个知识点都明确标注属于哪一层。
+
+### 1. 先建立完整心智模型【Agent + XDUDU 工程】
+
+用户在终端输入：
+
+```text
+分析项目并修改 README，最后运行测试
+```
+
+这句话不会直接变成 Shell 命令。完整过程是：
+
+```text
+用户输入
+   │
+   ▼
+CLI 创建/恢复 Session
+   │
+   ▼
+Agent 构建 ProviderRequest
+   │  系统 Prompt、历史消息、工具定义、记忆
+   ▼
+模型返回文本或 ToolCall
+   │
+   ├─ 文本 ───────────────► 继续检查是否真正完成
+   │
+   └─ ToolCall
+          │
+          ▼
+      ToolRegistry
+          │  权限、校验、预检、审批、超时
+          ▼
+      真实工具执行
+          │
+          ▼
+      ToolResult 写回 Session
+          │
+          └───────────────► 再次请求模型
+```
+
+这里至少包含四类角色：
+
+- **模型**：根据上下文选择下一步，但不能直接操作电脑。
+- **Agent Loop**：反复调用模型和工具，维护运行状态。
+- **ToolRegistry**：决定某个工具调用是否允许、是否合法、如何执行。
+- **SessionStore**：保存消息、工具调用和状态，让崩溃后仍能解释现场。
+
+### 2. 什么是“值”和“变量”【Rust】
+
+先看最简单的 Rust：
+
+```rust
+fn main() {
+    let count = 3;
+    let name = String::from("XDUDU");
+    println!("{name}: {count}");
+}
+```
+
+逐行理解：
+
+- `fn main()`：程序入口函数。
+- `let count = 3`：创建变量 `count`，保存整数值。
+- `String::from(...)`：在堆上创建可以增长的字符串。
+- `println!`：宏，编译器会展开它生成输出代码。
+
+Rust 变量默认不可变：
+
+```rust
+let count = 3;
+// count = 4; // 编译错误
+
+let mut editable = 3;
+editable = 4; // 合法
+```
+
+这首先是 **Rust 语言知识**，跟 Agent 没有直接关系。XDUDU 只是用这门语言编写。
+
+### 3. 栈、堆与所有权【Rust】
+
+整数大小固定，通常可以直接复制：
+
+```rust
+let a = 10;
+let b = a;
+println!("{a} {b}");
+```
+
+`String` 包含堆内存指针、长度和容量。如果赋值时只复制指针，两个变量离开作用域都会释放同一内存，产生 double free。因此 Rust 默认转移所有权：
+
+```rust
+let a = String::from("hello");
+let b = a;
+
+// println!("{a}"); // 编译错误：a 的所有权已移动给 b
+println!("{b}");
+```
+
+可以把所有权理解为“谁负责最终清理这个值”。规则是：
+
+1. 每个值都有一个所有者；
+2. 同一时刻只有一个所有者；
+3. 所有者离开作用域时，值被释放。
+
+这能帮助 XDUDU 管理 HTTP Client、MCP 子进程和终端状态，但它不会自动撤销已经写入磁盘的文件。文件事务仍属于 **通用工程知识**。
+
+### 4. 借用：使用数据，但不拿走所有权【Rust】
+
+下面的函数拿走 `String`：
+
+```rust
+fn print_name(name: String) {
+    println!("{name}");
+}
+
+let name = String::from("XDUDU");
+print_name(name);
+// println!("{name}"); // 所有权已经移动
+```
+
+如果函数只想临时读取，应传引用：
+
+```rust
+fn print_name(name: &String) {
+    println!("{name}");
+}
+
+let name = String::from("XDUDU");
+print_name(&name);
+println!("{name}"); // 仍然可用
+```
+
+`&String` 是不可变借用。可变借用写成 `&mut String`：
+
+```rust
+fn append_agent(name: &mut String) {
+    name.push_str(" Agent");
+}
+
+let mut name = String::from("XDUDU");
+append_agent(&mut name);
+```
+
+核心规则：可以同时有多个不可变借用，或者只有一个可变借用；二者不能在同一有效范围重叠。它在编译期阻止“一个任务读取时另一个任务随意修改同一内存”。
+
+### 5. 生命周期不是运行时间【Rust】
+
+生命周期描述“引用至少要有效多久”，由编译器检查：
+
+```rust
+pub struct AgentRunConfig<'a> {
+    pub provider: &'a dyn Provider,
+    pub tools: &'a ToolRegistry,
+    pub event_sink: &'a dyn EventSink,
+}
+```
+
+逐项解释：
+
+- `'a` 是生命周期参数，不是一个数值；
+- `&'a dyn Provider` 表示借用一个 Provider；
+- `AgentRunConfig` 不能比它借用的 Provider、Registry 和 Sink 活得更久；
+- 因此 Agent 不会持有已经被释放的依赖。
+
+这是 **Rust 实现手段**。Agent 原理只要求“运行时能访问模型和工具”，并不规定必须用生命周期。
+
+### 6. struct：把相关数据组成一个对象【Rust】
+
+```rust
+struct ToolCall {
+    id: String,
+    name: String,
+    arguments: serde_json::Value,
+}
+```
+
+`struct` 把一组字段组成一个明确类型。XDUDU 中常见例子：
+
+- `ProviderRequest`：一次模型请求所需信息；
+- `ToolContext`：一次工具执行的 Session、工作区、取消令牌；
+- `Session`：一次会话的持久化状态；
+- `Plan`：可审批、可恢复的长期计划。
+
+“struct 是什么”属于 Rust；“ToolCall 应包含哪些字段”属于 Agent 协议和 XDUDU 工程设计。
+
+### 7. enum：有限状态的集合【Rust + 通用工程】
+
+```rust
+enum FinishReason {
+    Stop,
+    ToolCalls,
+    Length,
+    Error,
+}
+```
+
+相比随意字符串，enum 让编译器检查是否处理了全部情况：
+
+```rust
+match reason {
+    FinishReason::Stop => { /* 检查能否完成 */ }
+    FinishReason::ToolCalls => { /* 执行工具 */ }
+    FinishReason::Length => { /* 标记未完成 */ }
+    FinishReason::Error => { /* 处理错误 */ }
+}
+```
+
+`enum` 是 Rust；把 Agent 运行设计为 Planning、Acting、Observing、Reflecting 状态机是通用工程与 Agent 设计。
+
+### 8. trait：定义“能做什么”【Rust】
+
+`trait` 类似接口：
+
+```rust
+trait Speak {
+    fn speak(&self) -> String;
+}
+
+struct Dog;
+
+impl Speak for Dog {
+    fn speak(&self) -> String {
+        "汪".to_owned()
+    }
+}
+```
+
+XDUDU 的 Provider：
+
+```rust
+#[async_trait]
+pub trait Provider: Send + Sync {
+    fn name(&self) -> &str;
+    async fn chat(&self, request: ProviderRequest)
+        -> XduduResult<ProviderResponse>;
+}
+```
+
+这里要分清：
+
+- `trait`、`impl`、`&self` 是 Rust；
+- `Provider` 是 XDUDU 定义的接口；
+- DeepSeek/Anthropic/OpenAI-compatible 是不同实现；
+- “把厂商协议统一起来”是架构设计。
+
+### 9. `dyn Trait` 和动态分派【Rust】
+
+运行前无法确定用户会选择哪个模型，所以 Agent 使用 trait object：
+
+```rust
+let provider: Box<dyn Provider> = factory.create(config, secret)?;
+```
+
+`dyn Provider` 表示“任何实现 Provider 的具体类型”。运行时通过虚函数表找到真实方法。网络请求的耗时远大于这次间接调用，因此这里优先获得可替换性和测试能力。
+
+### 10. Result 和 `?`【Rust + 通用工程】
+
+Rust 不用异常表示普通失败：
+
+```rust
+fn parse_port(text: &str) -> Result<u16, String> {
+    text.parse::<u16>()
+        .map_err(|_| "端口格式错误".to_owned())
+}
+```
+
+`?` 的意思是：成功就取出值；失败就提前把错误返回给调用者。
+
+```rust
+fn load() -> Result<Config, XduduError> {
+    let text = std::fs::read_to_string("config.toml")?;
+    parse_config(&text)
+}
+```
+
+XDUDU 再把错误分成：
+
+- `XduduError`：core/CLI 级错误；
+- `ToolResult.error.code`：模型和 JSON 能识别的工具错误；
+- 退出码：Shell 脚本能识别的最终状态。
+
+### 11. Arc、Send 和 Sync【Rust 并发】
+
+`Arc<T>` 是线程安全的引用计数智能指针：
+
+```rust
+let tool: Arc<dyn Tool> = Arc::new(FileReadTool);
+let another = Arc::clone(&tool);
+```
+
+它没有复制 `FileReadTool` 的真实资源，只增加共享所有者计数。
+
+- `Send`：值可以安全移动到另一线程；
+- `Sync`：`&T` 可以安全被多线程共享；
+- `Arc`：解决共享所有权；
+- `Mutex`：解决共享可变状态。
+
+它们只能防内存数据竞争，不能证明两个文件写入在业务上不冲突。因此 XDUDU 仍规定只读工具可并行、副作用工具有序执行。
+
+### 12. async、Future 和 Tokio【Rust 异步】
+
+`async fn` 调用后不会立刻把所有工作做完，而是返回一个 `Future`：
+
+```rust
+async fn fetch() -> Result<String, XduduError> {
+    // 等待网络期间，执行器可以运行其他任务
+    Ok("result".to_owned())
+}
+```
+
+`.await` 表示当前任务在这里等待结果，但线程可以去轮询其他 Future。
+
+```rust
+let response = provider.chat(request).await?;
+```
+
+异步不等于自动并行。只有同时保存并轮询多个 Future，或者 `spawn` 新任务，才形成并发。
+
+### 13. `tokio::select!` 和取消【Rust 异步 + XDUDU 工程】
+
+XDUDU 经常需要同时等待“操作完成”和“用户取消”：
+
+```rust
+tokio::select! {
+    result = provider.chat(request) => result,
+    _ = cancellation.cancelled() => {
+        return Err(XduduError::interrupted("用户已取消"));
+    }
+}
+```
+
+`CancellationToken` 是协作式取消：调用 `cancel()` 只改变共享状态，执行中的代码必须在 `select!` 或循环里主动检查。这样能先保存 Interrupted/Paused 状态，再安全退出。
+
+### 14. 什么是 LLM、Provider 和消息【Agent】
+
+LLM 只接收输入并生成输出。Provider 是 XDUDU 对模型厂商协议的统一抽象：
+
+```text
+XDUDU ProviderRequest
+          │
+          ├─► DeepSeek JSON/SSE
+          ├─► Anthropic Messages/SSE
+          └─► OpenAI-compatible JSON/SSE
+```
+
+一次请求通常包含：
+
+- system：系统规则；
+- user：用户消息；
+- assistant：模型之前的回复和 ToolCall；
+- tool：真实工具结果；
+- tools：当前可用工具及 JSON Schema。
+
+Provider 只负责协议翻译，不负责决定文件能不能写。权限由 ToolRegistry 负责。
+
+### 15. 什么是 Tool Calling【Agent】
+
+模型不会直接调用 Rust 函数。它返回结构化意图：
+
+```json
+{
+  "id": "call_123",
+  "name": "file_read",
+  "arguments": {
+    "path": "README.md"
+  }
+}
+```
+
+Agent 收到后：
+
+1. 保存这个调用；
+2. 交给 ToolRegistry；
+3. 执行真实工具；
+4. 得到 `ToolResult`；
+5. 以相同 call ID 交回模型。
+
+Tool Calling 是 Agent/模型协议；`Tool` trait 是 Rust 接口；`ToolRegistry` 是 XDUDU 工程组件。
+
+### 16. 什么是 ReAct【Agent】
+
+ReAct 可理解为 Reason + Act + Observe 的循环，但 XDUDU 不向用户输出原始思维链：
+
+```text
+理解目标（Planning）
+    ↓
+调用工具（Acting）
+    ↓
+接收真实结果（Observing）
+    ↓
+根据结果再次判断（Reflecting）
+    ├─► 继续调用工具
+    └─► 检查完成条件
+```
+
+重要的是：模型每次都要根据真实结果继续判断。工具失败后不能假设成功，`FinishReason::Stop` 也不能单独证明任务完成。
+
+### 17. ToolRegistry 到底是什么【Agent + XDUDU 工程 + Rust】
+
+ToolRegistry 不是 Rust 标准库，也不是所有 Agent 必须使用的固定类。它是 XDUDU 的“工具目录 + 安全执行总管”。
+
+核心结构：
+
+```rust
+pub struct ToolRegistry {
+    tools: HashMap<String, Arc<dyn Tool>>,
+    approval_gate: Arc<dyn ApprovalGate>,
+    change_ledger: Arc<dyn ChangeLedger>,
+    command_rules: CommandRules,
+}
+```
+
+逐字段解释：
+
+- `HashMap<String, ...>`：用工具名找到工具；这是 Rust 集合。
+- `Arc<dyn Tool>`：保存任意 Tool 实现并允许共享；这是 Rust。
+- `ApprovalGate`：收集和判断审批；这是 XDUDU 安全设计。
+- `ChangeLedger`：记录文件事务；这是 XDUDU 可靠性设计。
+- `CommandRules`：控制 terminal_exec 前缀；这是 XDUDU 安全设计。
+
+注册工具：
+
+```rust
+registry.register(FileReadTool)?;
+registry.register(FileWriteTool)?;
+registry.register(ApplyPatchTool)?;
+```
+
+执行工具时固定经过：
+
+```text
+查找 → Permission → validate → cancellation → preflight
+    → ApprovalGate → timeout(execute) → ToolResult
+```
+
+如果没有 ToolRegistry，每个工具都可能自己忘记做审批、超时或路径检查，MCP 还可能形成第二套越权入口。
+
+### 18. Tool trait 每个方法做什么【Rust + XDUDU 工程】
+
+```rust
+#[async_trait]
+pub trait Tool: Send + Sync {
+    fn definition(&self) -> ToolDefinition;
+    fn validate(&self, input: &Value) -> Result<(), Vec<String>>;
+    async fn preflight(&self, input: &Value, context: &ToolContext)
+        -> Option<ToolResult>;
+    async fn needs_approval(&self, input: &Value, context: &ToolContext)
+        -> bool;
+    async fn execute(&self, input: Value, context: ToolContext)
+        -> ToolResult;
+}
+```
+
+- `definition`：告诉模型名称、描述、Schema，也告诉系统权限和副作用。
+- `validate`：不相信模型 JSON，检查类型、范围和未知字段。
+- `preflight`：执行无副作用预检，例如在内存应用补丁。
+- `needs_approval`：根据本次输入决定是否审批。
+- `execute`：真正访问文件、进程或网络。
+
+`trait` 是 Rust；为什么要拆成这五步属于 XDUDU 工程设计。
+
+### 19. Permission 和 Approval 不一样【XDUDU 工程】
+
+```text
+PermissionMode：这次运行最多允许什么
+Approval：用户是否批准这一项具体副作用
+```
+
+例如当前模式为 read-only：
+
+```text
+file_write 需要 WriteFiles
+        ↓
+Permission 直接拒绝
+        ↓
+不会出现“是否批准”窗口
+```
+
+用户审批不能把 read-only 升级为 full-access。这样“程序能力上限”和“具体授权”分开，减少一次点击获得无限权限的风险。
+
+### 20. 为什么 validate 之后才审批【XDUDU 工程】
+
+模型返回的 JSON 不是可信数据。先 validate 可以拒绝：
+
+- 缺少必填字段；
+- 类型错误；
+- 长度超限；
+- 未知字段；
+- 非法枚举值。
+
+`apply_patch` 还会在 preflight 中完整解析补丁。如果预检失败，不应该让用户批准一个根本无法执行的操作。
+
+### 21. 什么是 Session【Agent + 通用工程】
+
+Session 不只是聊天记录。它还保存：
+
+```text
+用户/助手消息
+工具调用 ID、输入、结果和状态
+模型与工作区
+Agent 终态
+上下文摘要
+Plan 关联
+用量和时间
+```
+
+工具调用先写 `Pending` 再执行。如果进程崩溃，系统知道“这个调用可能已经发生，但结果未知”，因此不会自动重放副作用。
+
+### 22. 为什么使用 SQLite【通用工程】
+
+JSON 文件适合最小原型，但多条记录的原子更新、查询、迁移和并发很困难。SQLite 提供：
+
+- transaction：一组更新一起成功或回滚；
+- index：按时间、状态快速查询；
+- WAL：改善读写并发；
+- migration：从旧 Schema 升级；
+- FTS5：全文检索记忆。
+
+SQLite 不是 Agent 理论，也不是 Rust 特有；它是本地应用的存储方案。
+
+### 23. 什么是文件事务【通用工程 + XDUDU 工程】
+
+多文件补丁不能写一个算一个。XDUDU 的思路是：
+
+```text
+读取全部前镜像
+    ↓
+内存应用全部补丁
+    ↓
+再次检查哈希
+    ↓
+写 Prepared 账本
+    ↓
+逐项原子替换
+    ↓
+全部成功标 Applied
+```
+
+任何一步失败就根据前镜像回滚全部文件。Rust 所有权只负责内存对象，不会替你实现这个事务。
+
+### 24. expectedSha256 为什么重要【通用工程】
+
+Agent 读取文件到写回之间，用户可能刚好修改它：
+
+```text
+Agent 读取版本 A
+用户改成版本 B
+Agent 按版本 A 生成修改
+```
+
+写入前重新计算哈希，如果当前不是 A，就返回 `HASH_MISMATCH`，要求重新读取。它是文件级乐观并发控制，避免覆盖用户修改。
+
+### 25. EventSink 与 TUI【XDUDU 工程】
+
+Agent 不直接 `println!`，而是发事件：
+
+```rust
+AgentEvent::StateChanged { ... }
+AgentEvent::AssistantDelta { ... }
+AgentEvent::ToolStarted { ... }
+AgentEvent::ToolProgress { ... }
+AgentEvent::ToolFinished { ... }
+```
+
+不同消费者可以产生不同输出：
+
+```text
+TUI Renderer       → 彩色终端和活动区
+Console Renderer   → 普通顺序文本
+JSON Renderer      → 每行一个机器事件
+Test EventSink     → 保存 Vec 供断言
+```
+
+`enum` 和 trait 是 Rust；事件驱动解耦是通用架构；具体 `AgentEvent` 是 XDUDU 设计。
+
+### 26. Context、Summary 和 Memory 的区别【Agent】
+
+| 概念 | 生命周期 | 内容 |
+|---|---|---|
+| 最近消息 | 当前会话短期 | 原始用户、助手和工具消息 |
+| Context Summary | 当前会话中期 | 被压缩历史的结构化摘要 |
+| Long-term Memory | 跨会话长期 | 稳定偏好和可复用项目事实 |
+
+上下文窗口不是数据库容量。SQLite 可以保存全部消息，但每次发给模型只能选择预算内内容。
+
+XDUDU 长期记忆分两阶段：
+
+```text
+会话结束自动提炼 → SQLite 原始记忆记录
+                        ↓
+                   合并、去重、压缩
+                        ↓
+                 MEMORY.md（用户可编辑）
+```
+
+### 27. Plan 和普通任务列表的区别【Agent + XDUDU 工程】
+
+模型回复中的 Markdown 列表只是文本。XDUDU Plan 是数据库中的领域对象：
+
+- 有稳定 Plan ID；
+- 有 revision；
+- 有依赖 DAG；
+- 有完成条件；
+- 有审批历史；
+- 有 execution_version；
+- 有 attempt、证据和失败原因；
+- 可以 Paused、retry、cancel 和跨进程恢复。
+
+Plan 审批表示“用户认可方案”，不表示“所有文件写入自动批准”。
+
+### 28. 子代理和任务图【Agent】
+
+子代理是一个隔离的小型 Agent：它有自己的 Profile、工具范围、权限上限和轮次限制，最后只返回有界报告。
+
+任务图解决依赖和并发：
+
+```text
+探索配置 ─┐
+          ├─► 汇总架构 ─► 审阅报告
+探索工具 ─┘
+```
+
+Kahn 算法负责检查环；`FuturesUnordered` 负责收集动态并发任务；这些是算法/Rust 实现。为什么只读节点并行、副作用节点独占属于 XDUDU 安全设计。
+
+### 29. MCP、Skill 和 Tool 不一样【Agent + 扩展工程】
+
+| 名称 | 本质 | 是否直接执行能力 |
+|---|---|---|
+| Tool | 模型可调用的结构化能力 | 是，但必须经过 Registry |
+| Skill | 按需加载的工作流知识 | 否，最终仍调用 Tool |
+| MCP | 外部进程/服务提供工具的协议 | 通过适配成 Tool 执行 |
+| Plugin | 声明和组合 MCP Server | 不加载进程内动态代码 |
+
+Python 能力更适合作为独立 MCP Server 接入，不需要重写 Rust 核心。
+
+### 30. 一次真实任务如何穿过全部代码【综合】
+
+以“修改 README 并运行测试”为例：
+
+```text
+1. main.rs 接收用户输入
+2. SessionStore 保存用户消息
+3. agent.rs 构造 ProviderRequest
+4. Provider 返回 file_read ToolCall
+5. Agent 先保存 Pending 调用
+6. ToolRegistry 查找 FileReadTool
+7. Permission/validate/preflight/approval
+8. FileReadTool 返回文件内容
+9. ToolResult 写入 Session 并回传模型
+10. 模型生成 apply_patch ToolCall
+11. preflight 在内存验证补丁
+12. 用户批准 workspace-write
+13. 账本 + 临时文件 + 原子替换完成写入
+14. 模型调用 terminal_exec 运行测试
+15. 测试失败则 unresolved_tool_failures 保留
+16. 测试成功并无待处理失败，Agent 才能 Completed
+17. EventSink 把全过程展示给 TUI
+```
+
+这条链路中：
+
+- `trait`、`Arc`、async、Result 是 Rust；
+- Tool Calling、ReAct、上下文是 Agent；
+- Registry、审批、事务、Session 是 XDUDU 工程；
+- 哈希、SQLite、状态机是通用工程。
+
+### 31. 推荐源码阅读顺序【学习方法】
+
+不要从 4000 行的 `main.rs` 开始逐行读。推荐顺序：
+
+1. `provider/mod.rs`：先认识模型消息和 ToolCall；
+2. `tools/mod.rs`：理解 Tool trait 和 Registry；
+3. `tools/file_read.rs`：看最简单只读工具；
+4. `agent.rs`：带着工具概念读 ReAct 循环；
+5. `session.rs`：理解保存了什么；
+6. `sqlite_session.rs`：再看持久化；
+7. `apply_patch.rs` + `changes.rs`：学习文件事务；
+8. `plan.rs` + `plan_executor.rs`：学习长期任务；
+9. `subagent.rs` + `subagent_graph.rs`：学习短期编排；
+10. `main.rs` + `tui.rs`：最后看装配和界面。
+
+每次只回答四个问题：
+
+```text
+这个类型保存什么？
+谁创建它？
+谁调用它？
+失败后状态落在哪里？
+```
+
+## 第二部分：把简历上的 XDUDU 真正讲明白
+
+这一部分不是让你背简历，而是保证简历上的每句话都能用自己的话解释。面试时如果某个词说不清，就先删掉或降级描述，不要堆名词。
+
+### 32. 项目标题逐词解释
+
+简历标题：
+
+> XDUDU - Rust 本地 AI 编程 Agent
+
+逐词解释：
+
+- **Rust**：主体代码使用 Rust，不是 Python/LangGraph 项目；Rust 负责内存安全、类型约束、异步并发和单二进制分发。
+- **本地**：程序运行在用户电脑上，文件、命令、SQLite 会话和审批都发生在本机；模型推理由远程 API 提供。
+- **AI 编程 Agent**：它不只是聊天窗口。模型可以提出文件读取、代码搜索、补丁、Git、测试和网络工具调用，程序执行后把真实结果反馈给模型，直到任务完成或被中断。
+
+#### 不能怎样说
+
+不要说“这是我训练的大模型”。XDUDU 没有训练基础模型，它构建的是模型之上的 Agent Runtime。
+
+不要说“本地 Agent 所以模型也在本地”。当前主要调用 DeepSeek API，“本地”描述运行时、数据与工具所在位置。
+
+#### 30 秒项目介绍
+
+> XDUDU 是我用 Rust 从零实现的本地终端编程 Agent。它通过 Provider 适配 DeepSeek 等模型，通过 ReAct 循环让模型提出工具调用，再由 ToolRegistry 在权限、参数校验和用户审批之后执行文件、Git、命令或网络工具。会话和计划保存到 SQLite，长任务支持上下文压缩、Plan/DAG、暂停恢复和 MCP 外部工具接入。
+
+### 33. 技术栈不是装饰：每个库解决什么
+
+简历写了：
+
+> Rust + Tokio + SQLite + Reqwest + Crossterm + SSE + MCP
+
+面试时至少要讲清下面这张表：
+
+| 技术 | XDUDU 为什么需要 | 在项目中做什么 | 它不是 |
+|---|---|---|---|
+| Rust | 构建本地 CLI 核心 | 类型、所有权、trait、错误处理、编译为二进制 | Agent 框架 |
+| Tokio | 网络、进程、UI 事件都要异步等待 | 调度 Future、channel、timeout、select、取消 | HTTP Client |
+| SQLite | 会话和计划必须跨进程保存 | 消息、工具调用、Plan、Memory、迁移和恢复 | 向量数据库 |
+| Reqwest | 调用模型和受限网页 | HTTPS、Header、JSON、流式响应 | Provider 本身 |
+| Crossterm | 控制跨平台终端 | 键盘、光标、颜色、屏幕尺寸、原始模式 | Agent Runtime |
+| SSE | 接收模型逐段输出 | 文本 delta、结束原因、工具参数分片 | WebSocket |
+| MCP | 接入外部工具 | stdio/HTTP 握手、发现工具、调用工具 | 模型 Provider |
+
+源码入口：
+
+- Tokio：`agent.rs`、`main.rs`、`mcp.rs` 中的异步任务和 `select!`；
+- SQLite：`sqlite_session.rs`；
+- Reqwest/SSE：`provider/*`、`web_fetch.rs`；
+- Crossterm：`tui.rs`、`input_editor.rs`；
+- MCP：`mcp.rs`。
+
+### 34. 第一条简历描述逐句拆解
+
+原文：
+
+> Agent Runtime：从零实现 ReAct 模型-工具闭环，以 Trait 与依赖注入解耦 Provider、Agent、ToolRegistry、SessionStore 和终端 UI；支持流式响应、多轮观察、取消、超时、失败反馈与上下文压缩。
+
+#### “从零实现 Agent Runtime”
+
+含义：没有把任务交给 LangGraph 等图框架驱动，而是在 `run_agent` 中自己维护：
+
+```text
+创建/恢复 Session
+ → 构造上下文
+ → 请求 Provider
+ → 解析文本或工具调用
+ → 执行工具
+ → 保存 ToolResult
+ → 再请求 Provider
+ → 判断 Completed / Incomplete / Interrupted / Error
+```
+
+“从零”不表示所有依赖都自己写。HTTP 使用 Reqwest、异步使用 Tokio、数据库使用 SQLite；自己实现的是 Agent 控制逻辑和工程边界。
+
+#### “ReAct 模型-工具闭环”
+
+“闭环”表示工具结果会返回模型：
+
+```text
+模型：我要读取 Cargo.toml
+程序：执行 file_read
+程序：把真实内容作为 tool message 返回
+模型：根据内容决定继续搜索还是回答
+```
+
+如果工具执行后直接把结果只显示给用户、没有放回模型上下文，就不是完整闭环。
+
+#### “Trait 与依赖注入解耦”
+
+Trait 定义接口，依赖注入负责把具体实现传进去：
+
+```text
+Provider trait        ← DeepSeekProvider / MockProvider
+SessionStore trait    ← SqliteSessionStore / 测试 Store
+EventSink trait       ← TUI / JSON / 测试事件收集器
+```
+
+Agent 调用的是接口，所以：
+
+- 换模型不必重写 Agent Loop；
+- 测试不需要真实 API；
+- 换 UI 不必把文件工具复制一遍；
+- 存储实现可以独立演进。
+
+#### “流式响应”
+
+Provider 不等整个答案生成完再返回，而是解析 SSE delta，通过事件逐步交给 TUI。最终完整消息仍要聚合并写入 Session。
+
+#### “多轮观察”
+
+每次工具执行结果都会形成新观察。模型可能连续经历“搜索 → 读取 → 修改 → 测试 → 修复 → 再测试”，而不是只能调用一次工具。
+
+#### “取消”
+
+Ctrl+C 触发 `CancellationToken`。Provider、工具和 Plan 执行器需要协作检查取消状态，并将会话或步骤保存为 Interrupted/Paused，而不是粗暴退出且丢失现场。
+
+#### “超时”
+
+网络、MCP 和命令可能永远不返回。Registry 或调用层使用 `tokio::time::timeout` 设置上限，超时后返回稳定错误，而不是永久卡住 Agent。
+
+#### “失败反馈”
+
+工具失败不是只在终端打印。错误结果要写入 Session 并返回模型，模型才有机会修正参数或选择替代方案；仍未解决时不能声称完成。
+
+#### “上下文压缩”
+
+SQLite 保存完整历史，但模型上下文有 Token 上限。XDUDU 保留近期消息，把较早信息压缩成结构化摘要；压缩只改变“发给模型的视图”，不删除原始会话。
+
+#### 这一条的面试口述版本
+
+> 我把 Agent 主循环放在 core 中。Agent 每一轮通过统一 Provider 请求模型；如果模型返回 ToolCall，就先持久化调用，再通过 ToolRegistry 执行，把 ToolResult 写回会话并进入下一轮。Provider、存储和 UI 都通过 trait 注入，所以可以用 MockProvider 离线测试。运行中还处理 SSE 增量、取消令牌、超时、未解决失败和上下文预算，避免模型一次 Stop 就被误判为任务完成。
+
+### 35. 第二条简历描述逐句拆解
+
+原文：
+
+> 工具安全与事务：设计权限检查、Schema 校验、预检、用户审批、执行、脱敏和审计策略链；实现多文件事务补丁、前后镜像哈希、原子回滚与整批 Undo，防止部分写入和并发覆盖。
+
+#### 为什么需要“策略链”
+
+模型生成的参数可能错误，仓库内容也可能诱导模型越权。不能让每个 Tool 自己随意决定安全步骤，否则新工具容易漏掉审批或超时。
+
+```text
+Permission  检查当前模式是否允许这种能力
+Schema      说明并验证参数结构
+Preflight   无副作用地确认操作可行
+Approval    让用户授权具体副作用
+Execute     真正访问文件/进程/网络
+Redaction   输出和落盘前隐藏密钥
+Audit       保存调用、结果、耗时和状态
+```
+
+顺序很重要。例如无效 JSON 应在审批前拒绝，避免用户批准一个根本不能执行的操作。
+
+#### “多文件事务补丁”
+
+假设一个补丁同时修改三个文件。天真的实现可能前两个写成功，第三个失败，仓库进入不一致状态。XDUDU 会先读取全部前镜像，在内存应用全部 hunk，通过预检后再提交。
+
+#### “前后镜像”
+
+- pre-image：修改前完整内容；
+- post-image：预计修改后完整内容。
+
+账本保存镜像或恢复所需信息，因此失败时能恢复，成功后也能 Undo。
+
+#### “哈希”
+
+读取文件后计算 SHA-256。正式写入前再次计算当前文件哈希：
+
+```text
+当前哈希 == 读取时哈希  → 可以继续
+当前哈希 != 读取时哈希  → 用户或其他进程改过，拒绝覆盖
+```
+
+这叫乐观并发控制。
+
+#### “原子回滚”
+
+单文件先写临时文件再替换；多文件中任一提交失败，就用前镜像恢复已经修改的文件。账本状态区分 Prepared、Applying、Applied、RolledBack 和 Conflict。
+
+严格来说，普通文件系统很难提供数据库那样真正的跨文件原子提交。XDUDU 实现的是“预检 + 逐文件原子替换 + 失败补偿回滚 + 崩溃恢复”的事务语义。面试时应主动说明这个边界。
+
+#### “整批 Undo”
+
+一个 ToolCall 产生一个事务 ID。默认 Undo 撤销整个事务，不把多文件变更拆散。撤销前再次校验所有当前文件是否仍等于 post-image；任何冲突都会停止整批撤销，避免覆盖用户后续修改。
+
+#### 这一条的面试口述版本
+
+> 我没有直接执行模型给出的工具参数，而是在 ToolRegistry 建立固定策略链。文件修改方面，一个 apply_patch 对应一个事务：先解析所有文件和 hunk，读取前镜像并计算哈希，在内存生成后镜像；审批后先写 Prepared 账本，再用临时文件和原子替换提交。失败时按前镜像补偿回滚，Undo 前校验后镜像哈希，因此既防止半成功，也防止覆盖用户并发修改。
+
+### 36. 第三条简历描述逐句拆解
+
+原文：
+
+> 可靠执行与扩展：基于 SQLite 持久化会话、工具调用及检查点；实现可审批、可暂停恢复的 Plan/DAG 执行器，并将 MCP stdio/HTTP 动态工具纳入统一安全边界。
+
+#### “SQLite 持久化会话”
+
+用户消息、助手消息、工具调用、状态和摘要不能只放在内存。SQLite 让程序重启后仍能 `resume`，并支持事务、索引、Schema migration 和状态查询。
+
+#### “工具调用检查点”
+
+工具执行前先记 Pending，执行后再记成功或失败。崩溃发生在两者之间时，系统将结果视为未知，不能自动重放可能有副作用的操作。
+
+#### “Plan”
+
+Plan 不是 Markdown 待办列表，而是数据库对象，包含目标、步骤、依赖、完成条件、revision、审批历史和执行状态。
+
+#### “DAG”
+
+步骤之间可以有依赖，但不能形成环。只有所有依赖 Completed 的步骤才 Ready。XDUDU 当前按图和原始顺序受控执行，子代理任务图可以对满足条件的只读节点进行并发。
+
+#### “可审批”
+
+用户先审阅整个 Plan 是否符合目标。但这只是认可方案，步骤执行中的文件、命令和网络仍分别走 ToolRegistry 审批。
+
+#### “可暂停恢复”
+
+Provider 错误、用户拒绝工具、Ctrl+C、证据不完整或崩溃都会保存现场并 Paused。重试会创建新的 StepAttempt，已经完成的步骤不会重新执行。
+
+#### “MCP stdio/HTTP”
+
+- stdio：XDUDU 启动外部进程，通过标准输入输出发送 JSON-RPC；
+- HTTP：连接远程 Streamable HTTP MCP Server；
+- 动态工具：启动时从 Server 查询工具列表，不是编译时写死。
+
+MCP 工具会适配成普通 `Tool`，因此仍经过 Permission、Approval、timeout、cancellation、redaction 和 audit。MCP 不是安全沙箱，安全来自 XDUDU 外层的统一策略。
+
+#### 这一条的面试口述版本
+
+> 我使用 SQLite 保存 Session、ToolCall 和 Plan 状态，并在副作用前后写检查点，崩溃恢复时对结果未知的调用只标记中断而不自动重放。长任务使用结构化 Plan 和 DAG，计划内容用 revision 做审批并发控制，执行进度用 execution_version 做检查点；步骤通过完成条件和 evidence 验收。外部 MCP 工具在发现后包装成普通 Tool，复用同一套权限和审计链。
+
+### 37. 面试官最可能继续追问什么
+
+#### 为什么不用 LangGraph
+
+推荐回答：
+
+> XDUDU 的目标之一是学习和控制 Agent Runtime 的底层语义，并且核心使用 Rust。当前 ReAct、Plan 和工具安全边界都需要与本地文件事务、SQLite 恢复和 TUI 深度集成，自研可以明确终态和副作用语义。代价是开发成本和维护成本更高。如果未来业务主要是快速组合大量 Python 节点、已有 LangGraph 生态工具，框架会更合适。
+
+#### Rust 相比 Python 的收益是什么
+
+推荐回答：
+
+> Rust 便于生成单二进制，类型系统能约束状态和接口，所有权有利于管理终端、子进程和网络资源，Tokio 适合统一异步事件。代价是开发速度较慢、异步 trait 和生命周期学习成本高。模型效果本身不会因为 Rust 自动变好。
+
+#### 最难的部分是什么
+
+可以选择你真正理解的一项回答：
+
+1. ToolRegistry 的权限与审批边界；
+2. 多文件事务和崩溃恢复；
+3. Agent 终态与工具失败闭环；
+4. Plan revision/execution_version 并发控制；
+5. TUI 中输入、流式输出、审批和取消的统一事件循环。
+
+回答结构固定为：
+
+```text
+问题场景 → 天真实现为什么错 → 我的状态/数据设计
+        → 失败时怎样恢复 → 如何测试 → 当前边界
+```
+
+### 38. 简历关键词自测清单
+
+在保留简历当前写法前，应能不看文档回答：
+
+- Provider 与 Model 有什么区别？
+- Agent Runtime 为什么不是一段 Prompt？
+- Tool Call 为什么不能直接执行？
+- Trait 和依赖注入分别解决什么？
+- SSE 文本 delta 与工具参数 delta 有什么区别？
+- Stop 为什么不一定表示任务完成？
+- Permission 和 Approval 为什么要分开？
+- Schema 与 validate 为什么都需要？
+- preflight 为什么放在审批之前？
+- 文件哈希怎样防并发覆盖？
+- 原子替换为什么仍不能直接等于跨文件事务？
+- Prepared 账本如何帮助崩溃恢复？
+- Plan 审批为什么不能放行后续所有工具？
+- revision 和 execution_version 分别保护什么？
+- MCP 工具为什么仍然不可信？
+
+如果其中超过五个答不上来，先使用下面的基础题训练，不要直接背 150 道进阶题。
+
+## 第三部分：零基础面试训练题
+
+这一组题故意比正式题库更慢、更具体。每题先给一句话答案，再解释数据流、源码和误区。
+
+### BASIC-001：XDUDU 到底是什么，和普通聊天程序有什么区别？
+
+**一句话答案：** XDUDU 是一个在本机运行的控制程序，它让模型可以通过受控工具观察和修改代码，而普通聊天程序通常只展示一次模型回复。
+
+**从输入到输出：**
+
+1. CLI 接收用户目标并保存到 Session；
+2. Agent 把消息和工具定义交给 Provider；
+3. 模型可能返回文字，也可能返回 ToolCall；
+4. ToolRegistry 校验并执行工具；
+5. ToolResult 回到模型；
+6. 模型根据真实结果继续行动或给出最终答案。
+
+**为什么重要：** Agent 的能力来自“循环 + 工具 + 状态”，不是来自更长的 Prompt。
+
+**源码入口：** `agent.rs::run_agent`、`tools/mod.rs::ToolRegistry`。
+
+**常见错误：** “Agent 就是能聊天的大模型。”这忽略了程序侧的工具执行和状态控制。
+
+**追问：** 模型能直接读取文件吗？不能；模型只能生成 `file_read` 意图，由本地程序执行。
+
+### BASIC-002：Provider 是什么？为什么不是直接叫 DeepSeek？
+
+**一句话答案：** Provider 是统一的模型 API 适配接口，DeepSeek 只是其中一个具体实现。
+
+**详细解释：** Agent 只理解 `ProviderRequest` 和 `ProviderResponse`。具体 Provider 负责 URL、鉴权 Header、请求 JSON、SSE 事件和错误码转换。这样 Agent 不出现大量 `if provider == "deepseek"`。
+
+**数据流：**
+
+```text
+Agent 的统一消息
+ → DeepSeekProvider 转成 DeepSeek JSON
+ → Reqwest 发 HTTPS
+ → 解析 DeepSeek SSE
+ → 转回统一 ToolCall/文本/FinishReason
+```
+
+**源码入口：** `provider/mod.rs::Provider`、`provider/deepseek.rs`、`provider/factory.rs`。
+
+**常见错误：**
+
+- Provider 是模型：错误，Provider 是访问模型的适配代码；
+- Provider 决定文件权限：错误，权限属于 ToolRegistry；
+- Reqwest 就是 Provider：错误，Reqwest 只是 Provider 使用的 HTTP 库。
+
+**追问：** 如何测试 Agent 而不花 API 费用？注入返回固定响应的 `MockProvider`。
+
+### BASIC-003：Trait 是什么？它在 Provider 中怎样工作？
+
+**一句话答案：** Trait 是 Rust 的能力合同，规定实现者必须提供哪些方法。
+
+```rust
+pub trait Provider {
+    async fn chat(&self, request: ProviderRequest)
+        -> XduduResult<ProviderResponse>;
+}
+```
+
+`DeepSeekProvider` 实现这个方法；`MockProvider` 也可以实现。Agent 持有 `&dyn Provider`，运行时才决定调用哪个实现。
+
+**为什么需要：** 如果 Agent 直接持有 `DeepSeekProvider`，测试和切换协议都会与 Agent 耦合。
+
+**Trait 与依赖注入的区别：**
+
+- Trait 定义“必须能做什么”；
+- 依赖注入决定“把哪个实现交给谁”；
+- Factory 根据配置创建具体实现；
+- CLI Runtime 负责最终组装。
+
+**常见错误：** “使用 trait 就自动完成依赖注入。”Trait 只定义接口，仍需要创建对象并传进去。
+
+### BASIC-004：一次 Tool Calling 为什么需要 call ID？
+
+**一句话答案：** call ID 把模型提出的调用与程序返回的结果一一对应。
+
+模型可能同一轮提出多个调用：
+
+```text
+call_1 → read Cargo.toml
+call_2 → read README.md
+```
+
+结果顺序可能不同，因此返回结果必须携带原始 ID。Agent 还用 ID 持久化 Pending、Running 和 Succeeded/Failed 状态。
+
+**没有 ID 的问题：** 模型无法判断哪段内容属于哪个工具，崩溃恢复也无法区分哪些调用已执行。
+
+**源码入口：** `provider/mod.rs::ToolCall`、`session.rs` 中工具调用记录。
+
+### BASIC-005：为什么 ToolRegistry 不是一个简单 HashMap？
+
+**一句话答案：** HashMap 只负责找到工具，ToolRegistry 还负责所有工具都必须遵守的安全执行流程。
+
+```text
+HashMap.get(name)       只是找到 Arc<dyn Tool>
+Permission              检查能力上限
+validate                检查模型输入
+preflight               提前发现不可执行操作
+ApprovalGate            取得具体授权
+timeout + cancellation  防止永久阻塞
+execute                 真正执行
+redaction + audit       安全记录结果
+```
+
+**为什么集中处理：** 如果审批散落在每个工具中，新 MCP Tool 可能忘记实现某个检查。统一入口使内置和外部工具共享硬边界。
+
+**源码入口：** `tools/mod.rs::ToolRegistry::execute_with_progress`。
+
+### BASIC-006：Schema 是什么？为什么模型已经看到 Schema 还要 validate？
+
+**一句话答案：** Schema 是输入说明书，validate 是执行端的门卫。
+
+模型可能因为能力限制、上下文污染或协议错误生成：
+
+```json
+{"path": 123, "unexpected": true}
+```
+
+即使 Schema 说 `path` 应是字符串，程序也不能假设模型必然遵守。因此：
+
+- Schema 提升生成正确率；
+- validate 阻止非法数据抵达文件系统；
+- 路径规范化等运行时条件还要在 execute/preflight 再检查。
+
+**常见错误：** “JSON 能反序列化就安全。”类型正确不代表路径位于工作区，也不代表长度合理。
+
+### BASIC-007：ReAct 为什么叫闭环？
+
+**一句话答案：** 每次行动的真实结果都会成为下一次判断的输入。
+
+```text
+模型猜测 Cargo 项目入口
+ → search_text 返回真实位置
+ → 模型读取相关文件
+ → 模型生成补丁
+ → 测试失败
+ → 模型观察错误并修复
+```
+
+如果测试失败后程序仍结束并说“已经完成”，闭环就断了。XDUDU 跟踪未解决工具失败，并把 Stop 与“满足完成条件”分开。
+
+**源码入口：** `agent.rs::run_agent` 的轮次循环和终态分支。
+
+### BASIC-008：流式响应是怎样从网络显示到终端的？
+
+**一句话答案：** Provider 解析 SSE 增量，转换成事件，经 EventSink 送到 TUI，同时聚合完整消息落盘。
+
+```text
+DeepSeek SSE bytes
+ → 按事件边界解码
+ → 提取 text delta
+ → ProviderStreamSink
+ → AgentEvent::AssistantDelta
+ → TUI 活动区域
+```
+
+结束时，完整 AssistantMessage 写入 Session。只保存 delta 会难以恢复；每个 delta 都插数据库又会产生大量写入，所以展示流与最终持久化需要区分。
+
+**工具参数的区别：** 工具 arguments delta 必须先按 call index/ID 拼成完整 JSON，校验通过后才执行，不能边收到边执行。
+
+### BASIC-009：为什么需要 CancellationToken，直接杀进程不行吗？
+
+**一句话答案：** 协作式取消允许各层停止工作并保存可恢复状态。
+
+直接杀进程可能发生在：
+
+- 文件已写一半；
+- ToolCall 仍为 Running；
+- Plan Step 没有结束时间；
+- TUI 尚未恢复终端模式。
+
+`CancellationToken` 让 Provider、工具、MCP、Plan 和 UI 观察同一取消信号。它不保证任何代码自动停止，每个长循环和等待点仍需主动检查。
+
+**源码入口：** `agent.rs`、`tools/mod.rs`、`plan_executor.rs`。
+
+### BASIC-010：上下文压缩和长期记忆有什么不同？
+
+**一句话答案：** 上下文压缩服务当前会话 Token 预算，长期记忆保存跨会话仍有价值的稳定事实。
+
+| 项目 | 上下文摘要 | 长期记忆 |
+|---|---|---|
+| 范围 | 当前 Session | 多个 Session |
+| 内容 | 目标、进度、关键工具结果、未决问题 | 稳定偏好和项目事实 |
+| 目的 | 让长会话继续 | 下次会话仍可复用 |
+| 原始数据 | 消息仍在 SQLite | 原始提炼记录仍可审计 |
+
+错误做法是把聊天中的每个话题都永久记忆，最终造成噪声和错误偏好。XDUDU 通过提炼、合并、去重形成用户可编辑的 `MEMORY.md`。
+
+### BASIC-011：文件事务为什么比“写文件失败就报错”复杂？
+
+**一句话答案：** 因为多文件修改可能部分成功，且失败、并发修改和进程崩溃发生在不同时间点。
+
+需要分别处理：
+
+1. 补丁内容本身不匹配：预检阶段零写入；
+2. 用户在预检后修改文件：哈希冲突，拒绝覆盖；
+3. 第二个文件写入失败：恢复第一个文件；
+4. 写入中程序崩溃：启动时根据账本和哈希恢复；
+5. 成功后用户要求 Undo：确认所有文件仍等于 post-image 后整批恢复；
+6. 用户成功后又手工修改：标记 Conflict，不覆盖。
+
+**源码入口：** `tools/apply_patch.rs`、`changes.rs`。
+
+### BASIC-012：为什么 Plan 需要 DAG，而不是 Vec 步骤？
+
+**一句话答案：** Vec 只能表示顺序，DAG 还能表示依赖关系和可以并发的分支。
+
+```text
+步骤 A：读 Provider ─┐
+                     ├─► 步骤 C：总结架构
+步骤 B：读 Tools ────┘
+```
+
+C 必须等 A、B 完成。若出现 A 依赖 B、B 又依赖 A，就形成环，永远没有 Ready 节点，因此生成时必须做环检测。
+
+**XDUDU 的可靠性字段：**
+
+- completion criteria：完成条件；
+- attempt：一次执行尝试；
+- evidence：每个条件的证据；
+- revision：计划内容版本；
+- execution_version：执行状态版本。
+
+### BASIC-013：SQLite 为什么适合本地 Agent？
+
+**一句话答案：** 它不需要单独服务器，却提供事务、查询、索引和迁移，比多个 JSON 文件更适合保存关联状态。
+
+XDUDU 需要同时更新 Session、ToolCall、Plan Step 和恢复状态。SQLite transaction 能让这些更新一起提交。WAL 改善读写并发，Schema migration 让旧版本升级，FTS5 可用于文本检索。
+
+**局限：** SQLite 适合单机本地应用，不等于分布式数据库；跨进程仍要考虑锁和 busy timeout。
+
+### BASIC-014：MCP 为什么不能绕过 ToolRegistry？
+
+**一句话答案：** MCP Server 是外部、不完全可信的工具来源，接入越方便，越需要复用统一安全边界。
+
+MCP Server 返回工具名、描述和 Schema。XDUDU 将其包装成 `McpTool` 并注册到 Registry。真正调用仍要检查当前 Permission、SideEffect、Approval、timeout 和 cancellation。
+
+如果 MCP 调用走另一条直接路径，用户会看到“内置 file_write 需要批准，但 MCP filesystem.write 不需要”，安全模型就失效。
+
+### BASIC-015：这个项目最值得讲的工程能力是什么？
+
+**一句话答案：** 不是接入了多少库，而是如何把不确定的模型输出约束成可验证、可审批、可恢复的系统行为。
+
+可以从三个层次回答：
+
+1. **可替换：** Provider、Store、EventSink 用 trait 和依赖注入解耦；
+2. **可控制：** ToolRegistry 把模型意图变成受权限和审批控制的操作；
+3. **可恢复：** Session、事务账本和 Plan checkpoint 保存失败现场。
+
+进一步加分：主动说明当前边界，例如模型仍可能做出错误判断、补偿回滚不等于文件系统真正跨文件 ACID、MCP Server 本身不是沙箱。
+
+## 第四部分：150 道分层面试题
+
+### 题库使用方法
 
 - 初级：先完成 `RUST`、`ARCH`、`LLM` 初级题，再进入 `AGENT`、`TOOL`。
 - 中级：重点掌握 Agent、工具、安全、SQLite、Plan、MCP，并能画出数据流。
@@ -35,6 +1719,8 @@ RUST-005、RUST-010、ARCH-001、ARCH-004、ARCH-009、LLM-003、LLM-006、LLM-0
 ---
 
 ## 第一章：Rust 与 Cargo 基础（15 题）
+
+> **知识类型：Rust。** 先读第一部分第 2～13 节；本章主要考语言和异步基础，Agent 只是应用场景。
 
 ### 知识地图
 
@@ -164,6 +1850,8 @@ RUST-005、RUST-010、ARCH-001、ARCH-004、ARCH-009、LLM-003、LLM-006、LLM-0
 
 ## 第二章：分层架构与依赖设计（12 题）
 
+> **知识类型：XDUDU 工程 + 通用架构。** 先理解 struct、trait、EventSink 和 Runtime 装配。
+
 ### 知识地图
 
 考察模型、工具、持久化、安全与终端如何成为可替换边界，以及软提示和硬策略分别落在哪里。
@@ -267,6 +1955,8 @@ RUST-005、RUST-010、ARCH-001、ARCH-004、ARCH-009、LLM-003、LLM-006、LLM-0
 ---
 
 ## 第三章：LLM 与 Provider（15 题）
+
+> **知识类型：Agent 协议 + XDUDU 工程。** Rust 只用于实现接口；重点是消息、流式响应和厂商适配。
 
 ### 知识地图
 
@@ -396,6 +2086,8 @@ RUST-005、RUST-010、ARCH-001、ARCH-004、ARCH-009、LLM-003、LLM-006、LLM-0
 
 ## 第四章：ReAct 与上下文工程（15 题）
 
+> **知识类型：Agent 原理。** 状态机、压缩和停滞检测属于 Agent 运行逻辑，不是 Rust 语法。
+
 ### 知识地图
 
 解释 Planning—Acting—Observing—Reflecting 循环、上下文压缩、终态治理和停滞恢复。
@@ -523,6 +2215,8 @@ RUST-005、RUST-010、ARCH-001、ARCH-004、ARCH-009、LLM-003、LLM-006、LLM-0
 ---
 
 ## 第五章：工具、安全与文件事务（20 题）
+
+> **知识类型：XDUDU 工程 + 通用安全。** Tool Calling 是 Agent 概念，ToolRegistry 和事务链是项目实现。
 
 ### 知识地图
 
@@ -692,6 +2386,8 @@ ToolRegistry 是模型与操作系统之间的硬边界。重点掌握“查找�
 
 ## 第六章：SQLite、会话与恢复（12 题）
 
+> **知识类型：通用后端工程 + XDUDU 持久化。** SQLite、WAL、事务和 CAS 不属于 Agent 专有知识。
+
 ### 知识地图
 
 本章考察会话为什么既是上下文来源也是审计记录，以及 SQLite 迁移、锁、WAL、CAS 和崩溃恢复如何共同工作。
@@ -795,6 +2491,8 @@ ToolRegistry 是模型与操作系统之间的硬边界。重点掌握“查找�
 ---
 
 ## 第七章：Plan、DAG 与子代理（20 题）
+
+> **知识类型：Agent 编排 + 算法 + XDUDU 工程。** Plan/task_graph 是项目领域模型，Kahn 是通用图算法。
 
 ### 知识地图
 
@@ -964,6 +2662,8 @@ ToolRegistry 是模型与操作系统之间的硬边界。重点掌握“查找�
 
 ## 第八章：Skills、Instructions 与 Memory（12 题）
 
+> **知识类型：Agent 上下文工程。** FTS5 和原子文件写入属于通用工程，Skill/Memory 管线属于 Agent 产品设计。
+
 ### 知识地图
 
 三者都进入模型上下文，但来源、生命周期和信任不同：Instructions 是约定，Skills 是按需工作流，Memory 是 Agent 提炼且用户可审查的长期知识。
@@ -1067,6 +2767,8 @@ ToolRegistry 是模型与操作系统之间的硬边界。重点掌握“查找�
 ---
 
 ## 第九章：MCP、插件与 Web（12 题）
+
+> **知识类型：扩展协议 + 网络安全。** MCP 是开放协议，SSRF/DNS 防护是通用安全，McpTool 是 XDUDU 适配层。
 
 ### 知识地图
 
@@ -1172,6 +2874,8 @@ ToolRegistry 是模型与操作系统之间的硬边界。重点掌握“查找�
 
 ## 第十章：TUI 与事件系统（8 题）
 
+> **知识类型：Rust 异步 + 终端产品工程。** EventSink 是架构边界，ANSI、输入和布局是 CLI/TUI 实现。
+
 ### 知识地图
 
 TUI 不参与业务判断，但必须正确处理增量输出、终端 resize、多行输入、队列、取消和审批。核心原则是已完成历史不可变，活动区可重绘。
@@ -1243,6 +2947,8 @@ TUI 不参与业务判断，但必须正确处理增量输出、终端 resize、
 ---
 
 ## 第十一章：测试、CI、发布与演进（9 题）
+
+> **知识类型：通用软件工程。** 这些方法适用于多数 Rust/后端项目，不是 Agent 独有知识。
 
 ### 知识地图
 
